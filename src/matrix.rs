@@ -11,10 +11,10 @@ const SYS_READY: u32 = 2;
 
 const STATE_FREE: u32 = 0;
 const STATE_ALLOCATED: u32 = 1;
-const STATE_READY: u32 = 2;
+const _STATE_READY: u32 = 2;
 const STATE_ACKED: u32 = 3;
 const STATE_COALESCING: u32 = 4;
-const STATE_CACHED: u32 = 6;
+const _STATE_CACHED: u32 = 6;
 
 
 pub mod core {
@@ -56,6 +56,9 @@ pub mod core {
     /// O(1) time.
     #[repr(C)]
     pub struct AtomicMatrix {
+        /// Public identifier for the SHM segment, stored as a UUID. This allows modules to
+        /// reference the same segment across different processes by using the same identifier.
+        pub id: Uuid,
         /// First-Level Bitmap: Each bit represents a power-of-two size class 
         /// (e.g., bit 10 = 1KB range).
         pub fl_bitmap: AtomicU32,
@@ -88,7 +91,7 @@ pub mod core {
         /// 
         /// This should only be called once per SHM lifecycle (usually by the Master Thread).
         /// It resets all bitmaps and free-list heads to zero (empty).
-        pub fn init(ptr: *mut AtomicMatrix) -> &'static mut Self {
+        pub fn init(ptr: *mut AtomicMatrix, id: Uuid) -> &'static mut Self {
             unsafe {
                 let matrix = &mut *ptr;
                 matrix.fl_bitmap.store(0, Ordering::Relaxed);
@@ -100,6 +103,8 @@ pub mod core {
                         matrix.matrix[i][j].store(0, Ordering::Relaxed);
                     }
                 }
+
+                matrix.id = id;
 
                 matrix
             }
@@ -114,9 +119,9 @@ pub mod core {
         /// 4. Synchronized initialization via an atomic 'init_guard'.
         /// 
         /// Returns a 'MatrixHandler' which acts as the High-Level API for the module.
-        pub fn bootstrap(size: usize) -> Result<MatrixHandler, String> {
-            let id = Uuid::new_v4();
-            let path = format!("/dev/shm/{}", id);
+        pub fn bootstrap(id: Option<Uuid>, size: usize) -> Result<MatrixHandler, String> {
+            let path_id = id.unwrap_or_else(Uuid::new_v4);
+            let path = format!("/dev/shm/{}", path_id);
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -138,7 +143,7 @@ pub mod core {
                 Ordering::SeqCst, 
                 Ordering::Relaxed
             ).is_ok() {
-                let matrix = AtomicMatrix::init(matrix_ptr);
+                let matrix = AtomicMatrix::init(matrix_ptr, path_id);
 
                 matrix.sectorize(base_ptr, 1024, 100, 0).unwrap();
                 init_guard.store(SYS_READY, Ordering::SeqCst);
@@ -164,6 +169,8 @@ pub mod core {
         /// 
         /// This function is a convenience for typical use cases, but the 'bootstrap' method needs to stablish the
         /// total size of the SHM segment on which we will calculate the appropriate sizes for each class.
+        /// 
+        /// Returns a Result indicating success or failure of the sectorization process.
         pub fn sectorize(
             &self,
             base_ptr: *mut u8,
@@ -265,7 +272,7 @@ pub mod core {
                     let next_phys_offset = next_offset + remaining_size;
 
                     let (rem_fl, rem_sl) = Mapping::find_indices(remaining_size);
-                    self.insert_free_block(next_offset, rem_fl, rem_sl);
+                    self.insert_free_block(base_ptr, next_phys_offset, rem_fl, rem_sl);
                 }
 
                 header.state.store(STATE_ALLOCATED, Ordering::Release);
@@ -318,55 +325,60 @@ pub mod core {
             base_ptr: *mut u8,
         ) {
             unsafe {
-                let header = ptr.resolve_mut(base_ptr);
+                let current_offset = ptr.offset();
+                let mut current_header = ptr.resolve_mut(base_ptr);
+                let mut total_size = current_header.size.load(Ordering::Acquire);
 
-                let mut total_size = header.size.load(Ordering::Acquire);
-
-                // For ease, we will coalesce only with previous neigbours. The loop will jump the chain of prev
-                // until no more free blocks are found, or it reaches the beginning of the segment (prev_phys = 0).
-                let mut current_offset = ptr.offset();
-                let mut prev_header: *mut BlockHeader = std::ptr::null_mut();
+                let mut final_offset = current_offset;
 
                 while current_offset > 16 {
-                    let prev_phys_offset = header.prev_phys.load(Ordering::Acquire);
-                    if prev_phys_offset == 0 {
-                        break;
-                    }
+                    let prev_phys_offset = current_header.prev_phys.load(Ordering::Acquire);
 
-                    prev_header = base_ptr.add(prev_phys_offset as usize) as *mut BlockHeader;
-                    let prev_header_ref = &mut *prev_header;
-                    if prev_header_ref.state.load(Ordering::Acquire) != STATE_FREE {
-                        break;
-                    }
+                    if prev_phys_offset == 0 { break; }
 
-                    // Someone swapped the state before we could coalesce with this block, so we stop iterating.
-                    if prev_header_ref.state.compare_exchange(
-                        STATE_FREE, 
-                        STATE_COALESCING, 
-                        Ordering::Acquire, 
-                        Ordering::Relaxed
-                    ).is_ok() {
-                        total_size += prev_header_ref.size.load(Ordering::Acquire);
-                        current_offset = prev_phys_offset;
+                    let prev_header_ptr = base_ptr.add(prev_phys_offset as usize) as *mut BlockHeader;
+                    let prev_header = &mut *prev_header_ptr;
+
+                    let res = prev_header.state.compare_exchange(
+                        STATE_FREE, STATE_COALESCING, Ordering::Acquire, Ordering::Relaxed
+                    );
+
+                    let claimed = if res.is_ok() {
+                        true
+                    } else {
+                        prev_header.state.compare_exchange(
+                            STATE_ACKED, STATE_COALESCING, Ordering::Acquire, Ordering::Relaxed
+                        ).is_ok()
+                    };
+
+                    if claimed {
+                        total_size += prev_header.size.load(Ordering::Acquire);
+                        final_offset = prev_phys_offset;
+                        current_header = prev_header;
                     } else {
                         break;
                     }
                 }
 
-                // Here we start coalescing with the found range. We update the header of the first block in the chain
-                // with the total size, and we add it to the free list corresponding to its new size.
-                if !prev_header.is_null() {
-                    std::ptr::write_bytes(prev_header, 0, (total_size - 32) as usize);
+                std::ptr::write_bytes(base_ptr.add(final_offset as usize + 32), 0, (total_size - 32) as usize);
 
-                    (*prev_header).size.store(total_size, Ordering::Release);
-                    (*prev_header).state.store(STATE_FREE, Ordering::Release);
-                    let (fl, sl) = Mapping::find_indices(total_size);
-                    self.insert_free_block(current_offset, fl, sl);
-                }
+                current_header.size.store(total_size, Ordering::Release);
+                current_header.state.store(STATE_FREE, Ordering::Release);
+
+                let (fl, sl) = Mapping::find_indices(total_size);
+                self.insert_free_block(base_ptr, final_offset, fl, sl);
             }
-            
         }
 
+        /// Creates a new free sector in the SHM segment and inserts it into the appropriate FL/SL free list.
+        /// This function is used during the initial sectorization of the segment to allocate the initial categories
+        /// of blocks.
+        /// 
+        /// The process involvers:
+        /// 1. Writing a 'BlockHeader' at the specified offset with the given size and previous physical offset.
+        /// 2. Setting the block's state to FREE and initializing its free list pointers to zero.
+        /// 3. Updating the FL and SL bitmaps to indicate the presence of a free block in the corresponding class.
+        /// 4. Inserting the new block into the head of the appropriate free list in the matrix.
         fn create_and_insert_sector(
             &self,
             base_ptr: *mut u8,
@@ -392,6 +404,13 @@ pub mod core {
             self.matrix[fl as usize][sl as usize].store(offset, Ordering::Release);
         }
 
+        /// Traverses the FL and SL bitmaps to find a suitable free block for allocation.
+        /// 
+        /// The search process involves:
+        /// 1. Checking the SL bitmap for the requested FL to find a suitable block in the same size class.
+        /// 2. If no block is found in the same SL, check the FL bitmap to find the next available FL with
+        /// free blocks, then check its SL bitmap to find a suitable block.
+        /// 3. If a block is found, returns its FL and SL coordinates. If no block is found, returns None.
         fn find_suitable_block(&self, fl: u32, sl: u32) -> Option<(u32, u32)> {
             let sl_map = self.sl_bitmaps[fl as usize].load(Ordering::Acquire);
             let masked_sl = sl_map & (!0u32 << sl);
@@ -414,6 +433,16 @@ pub mod core {
             None
         }
 
+        /// Atomically removes a free block from the specified FL/SL free list and updates the bitmaps accordingly.
+        /// 
+        /// The removal process involves:
+        /// 1. Atomically loading the head of the free list for the specified FL/SL.
+        /// 2. If the list is empty (offset == 0), return an error indicating that no block is available.
+        /// 3. If a block is found, atomically compare-and-swap the head of the list to the next block in the free
+        /// list. This ensures that the block is removed from the free list without race conditions.
+        /// 4. After successfully removing the block, update the SL bitmap to clear the bit for the SL index.
+        /// If the SL bitmap for that FL becomes zero, also clear the corresponding bit in the FL bitmap.
+        /// 5. Return the offset of the removed block for allocation.
         fn remove_free_block(&self, fl: u32, sl: u32) -> Result<u32, String> {
             let list_head = &self.matrix[fl as usize][sl as usize];
 
@@ -439,18 +468,32 @@ pub mod core {
             }
         }
 
-        fn insert_free_block(&self, offset: u32, fl: u32, sl: u32) {
+        /// Atomically inserts a free block into the specified FL/SL free list and updates the bitmaps accordingly.
+        /// 
+        /// The insertion process involves:
+        /// 1. Writing the block's 'BlockHeader' at the specified offset with the given size and previous physical offset.
+        /// 2. Setting the block's state to FREE and initializing its free list pointers to zero.
+        /// 3. Atomically inserting the block at the head of the appropriate free list in the matrix. This involves:
+        ///   - Loading the current head of the free list for the specified FL/SL.
+        ///  - Setting the new block's 'next_free' pointer to the current head.
+        /// - If the current head is not zero, updating the old head's 'prev_free' pointer to point back to the new block.
+        /// 4. Updating the FL and SL bitmaps to indicate the presence of a free block in the corresponding class.
+        fn insert_free_block(&self, base_ptr: *mut u8, offset: u32, fl: u32, sl: u32) {
             let list_head = &self.matrix[fl as usize][sl as usize];
 
-            let old_head = list_head.swap(offset, Ordering::SeqCst);
+            unsafe {
+                let header = &mut *(base_ptr.add(offset as usize) as *mut BlockHeader);
 
-            if old_head != 0 {
-                let old_header_ptr = list_head.load(Ordering::Acquire) as *mut BlockHeader;
-                let old_header = unsafe { &mut *old_header_ptr };
-                old_header.prev_free.store(offset, Ordering::Release);
-                let new_header_ptr = unsafe { list_head.load(Ordering::Acquire) as *mut BlockHeader };
-                let new_header = unsafe { &mut *new_header_ptr };
-                new_header.next_free.store(old_head, Ordering::Release);
+                let old_head = list_head.swap(offset, Ordering::SeqCst);
+
+                if old_head != 0 {
+                    let old_header = &mut *(base_ptr.add(old_head as usize) as *mut BlockHeader);
+                    header.next_free.store(old_head, Ordering::Release);
+                    old_header.prev_free.store(offset, Ordering::Release);
+                } else {
+                    header.next_free.store(0, Ordering::Release);
+                }
+                header.prev_free.store(0, Ordering::Release);
             }
 
             self.fl_bitmap.fetch_or(1 << fl, Ordering::Release);
