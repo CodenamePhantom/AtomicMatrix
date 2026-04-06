@@ -71,6 +71,10 @@ racing condition with eachother, or having to use OS-level locks.
 Through policy constraints, the structure allows the caller to customize communication between modules as \
 they see fit.
 
+## Roadmap
+
+Official roadmap to be published.
+
 ## Building the Code
 
 To compile the codebase and inspect the memory layout:
