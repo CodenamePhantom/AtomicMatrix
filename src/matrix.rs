@@ -308,11 +308,11 @@ mod tests {
         use std::thread;
         use std::collections::HashSet;
 
-        let size = 32 * 1024 * 1024;
+        let size = 1024 * 1024 * 1024;
         let handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
 
-        let thread_count = 4;
-        let allocs_per_second = 5000;
+        let thread_count = 8;
+        let allocs_per_second = 1000000;
         let barrier = Arc::new(Barrier::new(thread_count));
 
         let mut handles = vec![];
