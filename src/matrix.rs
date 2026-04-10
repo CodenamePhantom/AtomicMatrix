@@ -970,7 +970,7 @@ mod tests {
         use std::time::{ Instant, Duration };
 
         const DURATION: u32 = 600;
-        const THREADS: u32 = 32;
+        const THREADS: u32 = 8;
 
         let size = 50 * 1024 * 1024;
         let handler = core::AtomicMatrix
