@@ -28,7 +28,7 @@ pub mod matrix_handler {
 
     impl<T> HandlerFunctions for AdminHandler<T> {}
 
-    trait HandlerFunctions {
+    pub trait HandlerFunctions {
         fn submit() {}
 
         fn respond() {}
@@ -51,7 +51,7 @@ pub mod profiles {
     pub struct PublicProfile {}
     pub struct RegistrationEndpoint{}
 
-    trait ProfileFunctions {}
+    pub trait ProfileFunctions {}
 }
 
 pub mod public {
