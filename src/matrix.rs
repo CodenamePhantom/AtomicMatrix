@@ -1,3 +1,35 @@
+//! #A Atomic Matrix Core
+//!
+//! This module implements a high-velocity, lock-free memory arena designed for
+//! ultra-low latency IPC (Inter-Process Communication).
+//!
+//! # Theory of Operation: The Propagation Principle of Atomic Coalescence
+//! Unlike traditional allocators that use centralized mutexes or complex
+//! background garbage collection, the **AtomicMatrix** treats memory
+//! fragmentation as a fluid dynamics problem.
+//!
+//! 1. **Kinetic Healing:** Freeing a block triggers a "Ripple" ('coalesce')
+//! that propagates through the sector.
+//! 2. **Monotonicity:** Ripples only move backward (towards the sector origin)
+//! to prevent circular atomic dependencies and deadlocks.
+//! 3. **Permissive Concurrency:** If a thread encounters contention, it skips the
+//! block rather than blocking, relying on the high frequency of future operations
+//! to complete the healing.
+//!
+//! # Memory Topography
+//! The matrix is laid out linearly in a shared memory segment:
+//! ```text
+//! [ Init Guard (16b) ] [ AtomicMatrix Struct ] [ Padding ] [ Sector 0 ] [ Sector 1 ] ...
+//! ```
+//! Each **Sector** acts as a self-contained fault domain with its own boundary,
+//! preventing local fragmentation from "bleeding" into the entire matrix.
+//!
+//! # Safety & Atomicity
+//! All state transitions follow a strict 'STATE_FREE -> STATE_ALLOCATED ->
+//! STATE_ACKED -> STATE_COALESCING' lifecycle. Hardware-level memory fences
+//! (std::sync::atomic::fence) are utilized to ensure visibility across 16+ CPU
+//! cores without locking.
+
 use std::sync::atomic::{ AtomicU32, Ordering, fence };
 use std::marker::PhantomData;
 use std::fs::OpenOptions;
@@ -16,6 +48,10 @@ const STATE_COALESCING: u32 = 4;
 pub mod core {
     use super::*;
 
+    /// Header structure that is written at the beginning of each block/sector
+    ///
+    /// The block is made entirely of atomic primitives to ensure safe reading
+    /// and manipulation across participant modules in the matrix.
     #[derive(Debug)]
     #[repr(C, align(16))]
     pub struct BlockHeader {
@@ -23,9 +59,19 @@ pub mod core {
         pub state: AtomicU32,
         pub prev_phys: AtomicU32,
         pub next_free: AtomicU32,
-        pub prev_free: AtomicU32, // Reserved for future use/alignment
+        pub prev_free: AtomicU32,
     }
 
+    /// The structural core of the matrix.
+    ///
+    /// Its the non-blocking, SHM-backed memory arena, utilizing a segmented **TLSF
+    /// (Two-Level segregated fit)** inspired mapping for O(1) allocation, paired with
+    /// a custom **Kinetic Coalescing** logic.
+    ///
+    /// # Memory Layout
+    /// The matrix is designed to be mapped directly into '/dev/shm". It starts with
+    /// a 16-byte 'init_guard' followed by the struct itself, and then the sectorized
+    /// raw memory blocks.
     #[repr(C)]
     pub struct AtomicMatrix {
         pub id: Uuid,
@@ -39,14 +85,38 @@ pub mod core {
         pub to_be_freed_count: AtomicU32,
     }
 
+    /// A Relative Pointer to the block memory address, relative to the start of the
+    /// matrix inside the process memory scope.
+    ///
+    /// This RelativePointer is used to calculate the accurate address of the block its
+    /// related to. Providing a way for independent process to localize the data inside
+    /// their own mappings of the SHM segment.
+    ///
+    /// It also receives a PhantomData to inform the compiler we safely own whatever
+    /// generic type the caller has passed to this pointer.
     pub struct RelativePtr<T> {
         offset: u32,
         _marker: PhantomData<T>,
     }
 
+    /// A helper struct that provided the O(1) calculations to find the coordinates of
+    /// a block that suits exactly the requested buffer size, or the next available one
+    /// that can fit the message as well.
     pub struct Mapping;
 
     impl AtomicMatrix {
+        /// Initialized the matrix struct and returns it.
+        ///
+        /// This function will initialize both TLSF level flags, the matrix map for free
+        /// blocks, assign all the require metadata and return the ready to use object
+        ///
+        /// ### Params
+        /// @ptr: The pointer to the beginning of the matrix segment
+        /// @id: The ID of this matrix instance
+        /// @size: The total size of the SHM allocation
+        ///
+        /// ### Returns
+        /// A static, lifetime specified, reference to the matrix struct.
         pub fn init(ptr: *mut AtomicMatrix, id: Uuid, size: u32) -> &'static mut Self {
             unsafe {
                 let matrix = &mut *ptr;
@@ -63,9 +133,23 @@ pub mod core {
             }
         }
 
+        /// The entry point of the matrix struct.
+        ///
+        /// It initializes SHM segment, bind to it, executes the initial formatting,
+        /// prepares both the matrix and handler structs and return the High-Level API
+        /// to the caller.
+        ///
+        /// ### Params:
+        /// @id: The ID of a new or existing matrix (if existing, will skip formatting and
+        /// just bind to it)
+        /// @size: The SHM allocation size
+        ///
+        /// ### Returns
+        /// The matrix handler api, or an error to be handled
         pub fn bootstrap(
             id: Option<Uuid>,
-            size: usize
+            size: usize,
+            sector_barriers: (u32, u32)
         ) -> Result<crate::handlers::matrix_handler::MatrixHandler, String> {
             let path_id = id.unwrap_or_else(Uuid::new_v4);
             let path = format!("/dev/shm/{}", path_id);
@@ -95,7 +179,9 @@ pub mod core {
                     .is_ok()
             {
                 let matrix = AtomicMatrix::init(matrix_ptr, path_id, size as u32);
-                matrix.sectorize(base_ptr, size, 100, 0).unwrap();
+                matrix
+                    .sectorize(base_ptr, size, sector_barriers.0 as u8, sector_barriers.1 as u8)
+                    .unwrap();
                 init_guard.store(SYS_READY, Ordering::SeqCst);
             } else {
                 while init_guard.load(Ordering::Acquire) != SYS_READY {
@@ -111,6 +197,36 @@ pub mod core {
             })
         }
 
+        /// Sectorizes the SHM segment into three different zones of allocation. These
+        /// zones are classified as Small, Medium and Large.
+        ///
+        /// - **Small Sector:** For data objects between 32 bytes and 1 KB.
+        /// - **Medium Sector:** For data objects between 1 KB and 1 MB.
+        /// - **Large Sector:** For data objects bigger than 1 MB.
+        ///
+        /// This ensures three main safeties for the matrix:
+        ///
+        /// - **Size integrity:** Blocks with similar sizes are required to stay together,
+        /// ensuring that we don't deal with a huge size variety in coalescing.
+        /// - **Propagation granularity:** The healing propagation only occurs inside the
+        /// block sector, ensuring that high operation sectors dont cause a tide of coalescing
+        /// into lower operation sectors.
+        /// - **Seach optimization:** Since small blocks are always together, it reduces
+        /// the TLSF searching index as the size you need is almost always garanteed to
+        /// exist.
+        ///
+        /// The sectorize also limits sectors based on the choosen size for the matrix to
+        /// ensure that if we have a small matrix (e.g.: 1mb) we don't allocate a unneces-
+        /// sary large sector.
+        ///
+        /// ### Params:
+        /// @base_ptr: The starting offset of the SHM mapping.
+        /// @total_file_size: The total size of SHM segment
+        /// @mut small_percent: The desired size percentage of the small sector
+        /// @mut medium_sector: The desired size percentage of the medium sector
+        ///
+        /// ### Returns:
+        /// Any error that arises from the sectorizing. Otherwise, an Ok flag.
         pub fn sectorize(
             &self,
             base_ptr: *mut u8,
@@ -150,6 +266,22 @@ pub mod core {
             Ok(())
         }
 
+        /// Allocates a block in the matrix for the caller
+        ///
+        /// It acts as a greed allocator, ensuring each call will either get a block allocated
+        /// in the matrix, or it throws a OOM Contention flag. It achieves this by politely
+        /// trying to claim a block for itself. In case the CAS loop fails, it will simply jump
+        /// to the next free block on the chain, granting a lock-free allocation paradigm.
+        ///
+        /// Each allocation is allowed to retry itself 512 times to confirm the matrix is
+        /// indeed out of memory before killing the execution of the function.
+        ///
+        /// ### Params:
+        /// @base_ptr: The starting offset of the SHM mapping.Because ripples are constrained, different threads can be healing different Sectors simultaneously without any risk of their logic overlapping or fighting for the same headers.
+        /// @size: The allocation size of the block
+        ///
+        /// ### Returns:
+        /// Either the relative pointer to the allocated block, or the OOM Contention flag.
         pub fn allocate(&self, base_ptr: *mut u8, size: u32) -> Result<RelativePtr<u8>, String> {
             let size = (size + 15) & !15;
             let size = size.max(32);
@@ -190,6 +322,16 @@ pub mod core {
             Err("OOM: Contention".into())
         }
 
+        /// Acknowledges the freedon of a block and pushes it to the to_be_freed queue.
+        ///
+        /// If the to_be_freed queue is full, it will imediatelly trigger the drainage
+        /// of the queue and coalesce every block present before trying to push the
+        /// newly ack block into the queue. If there is space available, simply push
+        /// it and move on
+        ///
+        /// ### Params:
+        /// @ptr: The relative pointer of the block to acknowledge
+        /// @base_ptr: The offset from the start of the SHM segment.
         pub fn ack(&self, ptr: &RelativePtr<BlockHeader>, base_ptr: *mut u8) {
             unsafe {
                 let header = ptr.resolve_mut(base_ptr);
@@ -208,6 +350,31 @@ pub mod core {
             }
         }
 
+        /// Tries to merge neighbouring blocks to the left until the end of the matrix is
+        /// reached or the neighbour block is not ACKED/FREE.
+        ///
+        /// This is the elegant implementation of the Kinetic Coalescence processes. It
+        /// receives the initial block that will start the ripple, and traverse the matrix
+        /// to the left (monotonicity guard). If any race conditions are met in the middle
+        /// (another coalescing just start, or a module just claimed this block), it will
+        /// stop the coalescing and move on (permissive healing).
+        ///
+        /// Then it tries to update the next neighbour previous physical offset metadata to
+        /// the start of the new free block. If this exchange fails due to end of sector, or
+        /// just claimed blocks, it will skip this marking in hopes that when this block is
+        /// eventually coalesced, it will passivelly merge backwards with the ripple and fix
+        /// the marking on its header by himself (horizon boundary).
+        ///
+        /// This three core implementations together composes the Propagation Principle of
+        /// Atomic Coalescence and enables the matrix to have such high throughput speeds.
+        ///
+        /// ### Params:
+        /// @ptr: The relative pointer of the block to coalesce.
+        /// @base_ptr: The offset from the start of the SHM segment.
+        ///
+        /// ### Throws:
+        /// TidalRippleContentionError: Two coalescing ripples executing simultaneously on
+        /// the same blocks.
         pub fn coalesce(&self, ptr: &RelativePtr<BlockHeader>, base_ptr: *mut u8) {
             unsafe {
                 let current_offset = ptr.offset();
@@ -253,7 +420,7 @@ pub mod core {
 
                     if claimed {
                         let size_to_add = prev_header.size.swap(0, Ordering::Acquire);
-                        if size_to_add == 0  || prev_phys_offset >= current_offset {
+                        if size_to_add == 0 || prev_phys_offset >= current_offset {
                             break;
                         }
 
@@ -263,7 +430,9 @@ pub mod core {
 
                         let (fl, sl) = Mapping::find_indices(size_to_add);
 
-                        total_size = total_size.checked_add(size_to_add).expect("Tsunami detected.");
+                        total_size = total_size
+                            .checked_add(size_to_add)
+                            .expect("TidalRippleCoalescingError.");
                         final_offset = prev_phys_offset;
                         current_header = prev_header;
                         self.remove_free_block(base_ptr, fl, sl).ok();
@@ -288,10 +457,26 @@ pub mod core {
             }
         }
 
+        /// Queries a block offset inside of the matrix.
+        ///
+        /// Not much to say about this, the name is pretty self explanatory.
+        ///
+        /// ### Params:
+        /// @offset: The offset of the block to be queried
+        ///
+        /// ### Returns:
+        /// The Relative Pointer to the queried block
         pub fn query(&self, offset: u32) -> RelativePtr<u8> {
             RelativePtr::new(offset + 32)
         }
 
+        /// Flushes the to_be_freed_queue and coalesce all blocks inside it.
+        ///
+        /// A helper function that assists allocation in case of buffer overflows or
+        /// deallocation in case of queue crowding.
+        ///
+        /// ### Params:
+        /// @base_ptr: The offset from the start of the segment.
         fn drain_and_coalesce(&self, base_ptr: *mut u8) {
             for slot in self.to_be_freed.iter() {
                 let offset = slot.swap(0, Ordering::Acquire);
@@ -303,6 +488,21 @@ pub mod core {
             }
         }
 
+        /// Queries the TLSF bitmaps in search of a block.
+        ///
+        /// It acquires the first most suitable index flag (according to the find
+        /// _indices function) and does a bitwise operation to check if it possesses an
+        /// available block. If it matches, return the coordinates of the FL and the
+        /// CTZ result from the SL. If it doesn't match, performs CTZ on the first level
+        /// to return the first available coordinate.
+        ///
+        /// ### Params:
+        /// @fl: Calculated first level coordinate
+        /// @sl: Calculated second level coordinate
+        ///
+        /// ### Returns:
+        /// A tuple containing the FL/SL coordinates or nothing if there is no space
+        /// available in the matrix.
         fn find_suitable_block(&self, fl: u32, sl: u32) -> Option<(u32, u32)> {
             let sl_map = self.sl_bitmaps[fl as usize].load(Ordering::Acquire);
             let m_sl = sl_map & (!0u32 << sl);
@@ -324,12 +524,29 @@ pub mod core {
             None
         }
 
+        /// Pops a free block from the TLSF bitmap.
+        ///
+        /// It tries atomically claims ownership over the header inside the map. If
+        /// successful, swap the current head to next free head in the chain, or 0 if
+        /// there is none. If it fails, it automatically assumes someone claimed the
+        /// buffer first and calls a hint::spin loop instruction to retry claiming a
+        /// head. If, in one of the interactions, the bucket returs 0, it breaks the
+        /// function with an error.
+        ///
+        /// ### Params:
+        /// @base_ptr: The offset from the start of the SHM segment
+        /// @fl: First level coordinates of the bucket
+        /// @sl: Second level coordinates of the head.
+        ///
+        /// ### Returns
+        /// A result containing either the head of the newly acquired block, or an
+        /// EmptyBitmapError
         fn remove_free_block(&self, base_ptr: *mut u8, fl: u32, sl: u32) -> Result<u32, String> {
             let head = &self.matrix[fl as usize][sl as usize];
             loop {
                 let off = head.load(Ordering::Acquire);
                 if off == 0 {
-                    return Err("Empty".into());
+                    return Err("EmptyBitmapError".into());
                 }
                 let next = unsafe {
                     (*(base_ptr.add(off as usize) as *const BlockHeader)).next_free.load(
@@ -349,6 +566,15 @@ pub mod core {
             }
         }
 
+        /// Stores a new header inside a bucket
+        ///
+        /// It does the exact oposite of the remove_free_block basically.
+        ///
+        /// ### Params:
+        /// @base_ptr: The offset from the beginning of the SHM segment
+        /// @offset: The header offset to be inserted into the bucket
+        /// @fl: The first level insertion coordinates
+        /// @sl: The second level insertion coordinates
         fn insert_free_block(&self, base_ptr: *mut u8, offset: u32, fl: u32, sl: u32) {
             let head = &self.matrix[fl as usize][sl as usize];
             unsafe {
@@ -370,6 +596,15 @@ pub mod core {
             self.sl_bitmaps[fl as usize].fetch_or(1 << sl, Ordering::Release);
         }
 
+        /// Creates and formates the header of the sector, as well as pushing it into its
+        /// corresponding boundary position inside the matrix.
+        ///
+        /// ### Params:
+        /// @base_ptr: The offset from the start of the SHM segment
+        /// @size: The size of the sector
+        /// @prev: The previous sector, if any
+        /// @fl: The first level coordinate based on po2 size scalling
+        /// @sl: The second level coordinate based on 8 steps division size scalling
         fn create_and_insert_sector(
             &self,
             base_ptr: *mut u8,
@@ -389,6 +624,16 @@ pub mod core {
             }
         }
 
+        /// Returns the boundary of the current sector
+        ///
+        /// It queries the boundaries from the metadata and check wheter the block fits or
+        /// not inside this sector.
+        ///
+        /// ### Params:
+        /// @current_offset: The offset to check against the sector.
+        ///
+        /// ### Returns:
+        /// Either the boundary value of the current sector, or the end of the segment.
         fn sector_end_offset(&self, current_offset: u32) -> u32 {
             for i in 0..4 {
                 let boundary = self.sector_boundaries[i].load(Ordering::Acquire);
@@ -405,21 +650,93 @@ pub mod core {
     }
 
     impl<T> RelativePtr<T> {
+        /// Creates a new relative pointer based on the provided offset
+        ///
+        /// This initializes the pointer with the PhantomData ownership over the type we
+        /// are passing the the parameter
+        ///
+        /// ### Params:
+        /// @offset: The offset value to be wrapped in the pointer.
+        ///
+        /// ### Returns:
+        /// A instance of Self.
         pub fn new(offset: u32) -> Self {
             Self { offset, _marker: PhantomData }
         }
+
+        /// Returns the offset value in the pointer
         pub fn offset(&self) -> u32 {
             self.offset
         }
+
+        /// Resolves the header based on the base_ptr of the current caller process.
+        ///
+        /// This ensures that the pointer returned is actually mapped to the process local
+        /// memory scope
+        ///
+        /// ### Params:
+        /// @base_ptr: The offset from the start of the SHM segment.
+        ///
+        /// ### Returns:
+        /// A life time speficied reference to the header of this block
         pub unsafe fn resolve_header<'a>(&self, base_ptr: *const u8) -> &'a BlockHeader {
             unsafe { &*(base_ptr.add((self.offset as usize) - 32) as *const BlockHeader) }
         }
+
+        /// Resolves the block scope based on the base_ptr of the current caller process.
+        ///
+        /// This ensures that the pointer returned is actually mapped to the process local
+        /// memory scope
+        ///
+        /// ### Params:
+        /// @base_ptr: The offset from the start of the SHM segment.
+        ///
+        /// ### Returns:
+        /// A life time specified reference to the block scope.
+        pub unsafe fn resolve<'a>(&self, base_ptr: *const u8) -> &'a T {
+            unsafe { &*(base_ptr.add(self.offset as usize) as *mut T) }
+        }
+
+        /// Resolves the block scope based on the base_ptr of the current caller process.
+        ///
+        /// This ensures that the pointer returned is actually mapped to the process local
+        /// memory scope
+        ///
+        /// ### Params:
+        /// @base_ptr: The offset from the start of the SHM segment.
+        ///
+        /// ### Returns:
+        /// A life time specified mutable reference to the block scope.
         pub unsafe fn resolve_mut<'a>(&self, base_ptr: *const u8) -> &'a mut T {
             unsafe { &mut *(base_ptr.add(self.offset as usize) as *mut T) }
         }
     }
 
     impl Mapping {
+        /// Maps a block size to its corresponding (First-Level, Second-Level) indices.
+        ///
+        /// This function implements a two-level mapping strategy used for O(1) free-block
+        /// lookup, optimized for both high-velocity small allocations and logarithmic
+        /// scaling of large blocks.
+        ///
+        /// ### Mapping Logic:
+        /// - **Linear (Small):** For sizes < 128, it uses a fixed FL (0) and 16-byte SL
+        ///   subdivisions. This minimizes fragmentation for tiny objects.
+        /// - **Logarithmic (Large):** For sizes >= 128, FL is the power of 2 (determined via
+        ///   `leading_zeros`), and SL is a 3-bit subdivider of the range between 2^n and 2^(n+1).
+        ///
+        /// ### Mathematical Transformation:
+        /// - `FL = log2(size)`
+        /// - `SL = (size - 2^FL) / (2^(FL - 3))`
+        ///
+        /// ### Bounds:
+        /// Indices are clamped to `(31, 7)` to prevent overflow in the matrix bitmask.
+        ///
+        /// # Arguments
+        /// * `size` - The total byte size of the memory block.
+        ///
+        /// # Returns
+        /// A tuple of `(fl, sl)` indices.
         pub fn find_indices(size: u32) -> (u32, u32) {
             if size < 128 {
                 (0, (size / 16).min(7))
@@ -438,6 +755,7 @@ mod tests {
 
     use super::*;
 
+    /// Test if the mapping function can return the correct indexes.
     #[test]
     fn test_mapping() {
         assert_eq!(core::Mapping::find_indices(16), (0, 1));
@@ -449,10 +767,14 @@ mod tests {
         assert_eq!(sl, 0);
     }
 
+    /// Test if the bootstrap function actually initializes the matrix, and allocates the
+    /// blocks on the correct bitmaps.
     #[test]
     fn test_initial_bootstrap() {
         let size = 1024 * 1024;
-        let handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
+        let handler = core::AtomicMatrix
+            ::bootstrap(Some(uuid::Uuid::new_v4()), size, (100, 0))
+            .unwrap();
 
         let bitmap = handler.matrix.fl_bitmap.load(Ordering::Acquire);
 
@@ -463,6 +785,7 @@ mod tests {
         );
     }
 
+    /// Test if the matrix can sectorize itself.
     #[test]
     fn test_initialization_integrity() {
         let mut fake_shm = vec![0u8; 1024 * 1024];
@@ -470,7 +793,11 @@ mod tests {
 
         unsafe {
             let matrix_ptr = base_ptr.add(16) as *mut core::AtomicMatrix;
-            let matrix = core::AtomicMatrix::init(matrix_ptr, uuid::Uuid::new_v4(), fake_shm.len() as u32);
+            let matrix = core::AtomicMatrix::init(
+                matrix_ptr,
+                uuid::Uuid::new_v4(),
+                fake_shm.len() as u32
+            );
 
             matrix.sectorize(base_ptr, 1024 * 1024, 10, 20).unwrap();
 
@@ -478,10 +805,13 @@ mod tests {
         }
     }
 
+    /// Test allocation and sppliting logic by comparing the size of our buffer.
     #[test]
     fn test_allocation_and_spliting() {
         let size = 1024 * 1024;
-        let mut handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
+        let mut handler = core::AtomicMatrix
+            ::bootstrap(Some(uuid::Uuid::new_v4()), size, (100, 0))
+            .unwrap();
         let base_ptr = handler.mmap.as_mut_ptr();
         let matrix = &mut *handler.matrix;
 
@@ -495,6 +825,8 @@ mod tests {
         }
     }
 
+    /// Run 8.000.000 allocations in parallel (1.000.000 each) to test if the matrix
+    /// can hold without race conditions.
     #[test]
     fn test_multithreaded_stress() {
         // Quick author note:
@@ -507,7 +839,9 @@ mod tests {
 
         // We use 500MB matrix to allocate all the buffers
         let size = 500 * 1024 * 1024;
-        let handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
+        let handler = core::AtomicMatrix
+            ::bootstrap(Some(uuid::Uuid::new_v4()), size, (40, 30))
+            .unwrap();
 
         let thread_count = 8;
         let allocs_per_second = 1000000;
@@ -580,10 +914,13 @@ mod tests {
         );
     }
 
+    /// Test coalesce logic to see if blocks will merge correctly.
     #[test]
     fn test_ack_and_coalesce() {
         let size = 1024 * 1024;
-        let mut handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
+        let mut handler = core::AtomicMatrix
+            ::bootstrap(Some(uuid::Uuid::new_v4()), size, (100, 0))
+            .unwrap();
         let base_ptr = handler.mmap.as_mut_ptr();
         let matrix = &mut *handler.matrix;
         let block_ext = matrix.query(318288);
@@ -610,9 +947,6 @@ mod tests {
 
             matrix.coalesce(&rel_d, base_ptr);
 
-            println!("Matrix: {:?}", matrix.matrix);
-            println!("Header B: {:?}", ptr_b.offset() - 32);
-
             let h_a = ptr_a.resolve_header(base_ptr);
             println!("Header A: {:?}", ptr_a.offset() - 32);
             assert_eq!(h_a.state.load(Ordering::Acquire), STATE_ALLOCATED);
@@ -622,21 +956,13 @@ mod tests {
             assert_eq!(h_merged.size.load(Ordering::Acquire), 192);
 
             let h_e = ptr_e.resolve_header(base_ptr);
-            println!("Header E: {:?}", ptr_e.offset() - 32);
-            println!("Header E prev: {:?}", h_e.prev_phys);
             assert_eq!(h_e.state.load(Ordering::Acquire), STATE_ALLOCATED);
-
-            let block_ext_1 = matrix.query(5632);
-            let block_ext_2 = matrix.query(318288);
-
-            let h_ext_1 = block_ext_1.resolve_header(base_ptr);
-            let h_ext_2 = block_ext_2.resolve_header(base_ptr);
-
-            println!("Extra blocks: \n {:?} \n {:?}", h_ext_1, h_ext_2);
-            println!("Extra blocks offsets: {:?} {:?}", block_ext_1.offset(), block_ext_2.offset())
         }
     }
 
+    /// The jewlery of the crown. Test if the matrix can hold 10 minutes of 32 threads
+    /// executing allocation and deallocation operations to ensure the Propagation
+    /// Principle of Atomic Coalescence works.
     #[test]
     fn test_long_term_fragmentation_healing() {
         use std::sync::{ Arc, Barrier };
@@ -644,10 +970,12 @@ mod tests {
         use std::time::{ Instant, Duration };
 
         const DURATION: u32 = 600;
-        const THREADS: u32 = 16;
+        const THREADS: u32 = 32;
 
         let size = 50 * 1024 * 1024;
-        let handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
+        let handler = core::AtomicMatrix
+            ::bootstrap(Some(uuid::Uuid::new_v4()), size, (40, 30))
+            .unwrap();
         let handler_arc = Arc::new(handler);
         let barrier = Arc::new(Barrier::new(THREADS as usize));
         let start_time = Instant::now();
