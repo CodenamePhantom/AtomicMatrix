@@ -1045,7 +1045,8 @@ mod tests {
             }
         }
 
-        let entrophy_percentage = ((free_count / total_work) as f64) * 100.0;
+        let entrophy_percentage = (free_count as f64 / total_work as f64) * 100.0;
+        let mops = (total_work as f64) / (DURATION as f64) / 1_000_000.0;
 
         println!("Endurance Results (Duration of {} seconds)", DURATION);
         println!("Num of threads: {}", THREADS);
@@ -1054,6 +1055,7 @@ mod tests {
         println!("Final free fragments: {}", free_count);
         println!("Entrophy percentage: {}%", entrophy_percentage);
 
-        assert!(entrophy_percentage < 0.001, "Excessive Fragmentation")
+        assert!(entrophy_percentage < 0.001, "Excessive Fragmentation");
+        assert!(mops > 1.0, "Throughput regression: {:.2} Mop/s", mops);
     }
 }

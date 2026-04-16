@@ -24,7 +24,7 @@ jobs:
               run: cargo build --verbose
 
             - name: Run Standard Tests
-              run: cargo test --verbose --lib -- --skip test_long_term_framentation_healing --skip test_multithreaded_stress
+              run: cargo test --verbose --lib -- --skip test_long_term_fragmentation_healing --skip test_multithreaded_stress
     
     run_stress_tests:
         runs-on: ubuntu-latest
