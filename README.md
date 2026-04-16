@@ -166,15 +166,6 @@ The allocator has been tested under:
 
 ---
 
-## Theoretical foundation
-
-The design and its formal properties are described in the accompanying paper:
-
-> *Causality as a Physical Limit: Arbitration, Uncertainty, and the Deterministic Distributed Memory Fabric*
-> [ArXiv — coming soon]
-
----
-
 ## Contributing
 
 The high-level API and policy layer are the immediate areas where contributions are welcome. If you want to build on top of the core allocator or have ideas for the message API design, open an issue.

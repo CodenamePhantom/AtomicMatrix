@@ -17,16 +17,7 @@ pub mod matrix_handler {
         // pub claimed_buffers: Vec<u64>,
     }
 
-    pub struct AdminHandler<T> {
-        pub matrix: &'static mut AtomicMatrix,
-        pub mmap: MmapMut,
-        pub message_protocol: T,
-        pub registered_modules: [ModuleProfile; 64],
-    }
-
     impl HandlerFunctions for MatrixHandler {}
-
-    impl<T> HandlerFunctions for AdminHandler<T> {}
 
     pub trait HandlerFunctions {
         fn submit() {}
@@ -42,6 +33,8 @@ pub mod matrix_handler {
         fn notify() {}
 
         fn read() {}
+
+        fn matrix_handler() {}
     }
 }
 
