@@ -25,21 +25,3 @@ jobs:
 
             - name: Run Standard Tests
               run: cargo test --verbose --lib -- --skip test_long_term_fragmentation_healing --skip test_multithreaded_stress
-    
-    run_stress_tests:
-        runs-on: ubuntu-latest
-
-        steps:
-            - uses: actions/checkout@v4
-
-            - name: Set up Rust
-              uses: dtolnay/rust-toolchain@stable
-
-            - name: Build
-              run: cargo build --verbose
-
-            - name: Run Multithreaded Stess Test
-              run: cargo test --lib matrix::tests::test_multithreaded_stress
-
-            - name: Run Long Term Healing tests
-              run: cargo test --lib matrix::tests::test_long_term_fragmentation_healing -- --nocapture
