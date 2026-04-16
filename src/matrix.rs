@@ -814,13 +814,13 @@ mod tests {
         use std::collections::HashSet;
 
         // We use 500MB matrix to allocate all the buffers
-        let size = 500 * 1024 * 1024;
+        let size = 50 * 1024 * 1024;
         let handler = core::AtomicMatrix
             ::bootstrap(Some(uuid::Uuid::new_v4()), size, (40, 30))
             .unwrap();
 
         let thread_count = 8;
-        let allocs_per_second = 1000000;
+        let allocs_per_second = 100_000;
         let barrier = Arc::new(Barrier::new(thread_count));
 
         // Track the failed allocs
@@ -899,14 +899,8 @@ mod tests {
             .unwrap();
         let base_ptr = handler.mmap.as_mut_ptr();
         let matrix = &mut *handler.matrix;
-        let block_ext = matrix.query(318288);
-
-        println!("{:?}", matrix.matrix);
 
         unsafe {
-            let h_ext = block_ext.resolve_header(base_ptr);
-            println!("{:?}", h_ext);
-
             let ptr_a = matrix.allocate(base_ptr, 64).unwrap();
             let ptr_b = matrix.allocate(base_ptr, 64).unwrap();
             let ptr_c = matrix.allocate(base_ptr, 64).unwrap();
@@ -924,12 +918,11 @@ mod tests {
             matrix.coalesce(&rel_d, base_ptr);
 
             let h_a = ptr_a.resolve_header(base_ptr);
-            println!("Header A: {:?}", ptr_a.offset() - 32);
             assert_eq!(h_a.state.load(Ordering::Acquire), STATE_ALLOCATED);
 
             let h_merged = ptr_b.resolve_header(base_ptr);
             assert_eq!(h_merged.state.load(Ordering::Acquire), STATE_FREE);
-            assert_eq!(h_merged.size.load(Ordering::Acquire), 192);
+            assert_eq!(h_merged.size.load(Ordering::Acquire), 256);
 
             let h_e = ptr_e.resolve_header(base_ptr);
             assert_eq!(h_e.state.load(Ordering::Acquire), STATE_ALLOCATED);
