@@ -292,7 +292,7 @@ pub mod core {
                             let header = &mut *(base_ptr.add(offset as usize) as *mut BlockHeader);
                             let total_size = header.size.load(Ordering::Acquire);
 
-                            if total_size >= size + 32 {
+                            if total_size >= size + 32 + 16 {
                                 let rem_size = total_size - size;
                                 let next_off = offset + size;
                                 let next_h = &mut *(
@@ -801,9 +801,56 @@ mod tests {
         }
     }
 
+    /// Test coalesce logic to see if blocks will merge correctly.
+    #[test]
+    fn test_ack_and_coalesce() {
+        let size = 1024 * 1024;
+        let mut handler = core::AtomicMatrix
+            ::bootstrap(Some(uuid::Uuid::new_v4()), size, (100, 0))
+            .unwrap();
+        let base_ptr = handler.mmap.as_mut_ptr();
+        let matrix = &mut *handler.matrix;
+
+        unsafe {
+            let ptr_a = matrix.allocate(base_ptr, 64).unwrap();
+            let ptr_b = matrix.allocate(base_ptr, 64).unwrap();
+            let ptr_c = matrix.allocate(base_ptr, 64).unwrap();
+            let ptr_d = matrix.allocate(base_ptr, 64).unwrap();
+            let ptr_e = matrix.allocate(base_ptr, 64).unwrap();
+
+            let h_b = ptr_b.resolve_header(base_ptr);
+            let rel_c = RelativePtr::<BlockHeader>::new(ptr_c.offset() - 32);
+            let rel_d = RelativePtr::<BlockHeader>::new(ptr_d.offset() - 32);
+
+            h_b.state.store(STATE_FREE, Ordering::Release);
+            matrix.ack(&rel_c, base_ptr);
+            matrix.ack(&rel_d, base_ptr);
+
+            matrix.coalesce(&rel_d, base_ptr);
+
+            let h_a = ptr_a.resolve_header(base_ptr);
+            assert_eq!(h_a.state.load(Ordering::Acquire), STATE_ALLOCATED);
+
+            let h_merged = ptr_b.resolve_header(base_ptr);
+            assert_eq!(h_merged.state.load(Ordering::Acquire), STATE_FREE);
+            assert_eq!(h_merged.size.load(Ordering::Acquire), 256);
+
+            let h_e = ptr_e.resolve_header(base_ptr);
+            assert_eq!(h_e.state.load(Ordering::Acquire), STATE_ALLOCATED);
+        }
+    }
+
+    /// ----------------------------------------------------------------------------
+    /// STRESS TESTS
+    /// 
+    /// These are all ignored from the correctness suite so github doesn't get mad at
+    /// me. Before shipping, running these are explicitly required.
+    /// ----------------------------------------------------------------------------
+
     /// Run 8.000.000 allocations in parallel (1.000.000 each) to test if the matrix
     /// can hold without race conditions.
     #[test]
+    #[ignore]
     fn test_multithreaded_stress() {
         // Quick author note:
         //
@@ -890,49 +937,11 @@ mod tests {
         );
     }
 
-    /// Test coalesce logic to see if blocks will merge correctly.
-    #[test]
-    fn test_ack_and_coalesce() {
-        let size = 1024 * 1024;
-        let mut handler = core::AtomicMatrix
-            ::bootstrap(Some(uuid::Uuid::new_v4()), size, (100, 0))
-            .unwrap();
-        let base_ptr = handler.mmap.as_mut_ptr();
-        let matrix = &mut *handler.matrix;
-
-        unsafe {
-            let ptr_a = matrix.allocate(base_ptr, 64).unwrap();
-            let ptr_b = matrix.allocate(base_ptr, 64).unwrap();
-            let ptr_c = matrix.allocate(base_ptr, 64).unwrap();
-            let ptr_d = matrix.allocate(base_ptr, 64).unwrap();
-            let ptr_e = matrix.allocate(base_ptr, 64).unwrap();
-
-            let h_b = ptr_b.resolve_header(base_ptr);
-            let rel_c = RelativePtr::<BlockHeader>::new(ptr_c.offset() - 32);
-            let rel_d = RelativePtr::<BlockHeader>::new(ptr_d.offset() - 32);
-
-            h_b.state.store(STATE_FREE, Ordering::Release);
-            matrix.ack(&rel_c, base_ptr);
-            matrix.ack(&rel_d, base_ptr);
-
-            matrix.coalesce(&rel_d, base_ptr);
-
-            let h_a = ptr_a.resolve_header(base_ptr);
-            assert_eq!(h_a.state.load(Ordering::Acquire), STATE_ALLOCATED);
-
-            let h_merged = ptr_b.resolve_header(base_ptr);
-            assert_eq!(h_merged.state.load(Ordering::Acquire), STATE_FREE);
-            assert_eq!(h_merged.size.load(Ordering::Acquire), 256);
-
-            let h_e = ptr_e.resolve_header(base_ptr);
-            assert_eq!(h_e.state.load(Ordering::Acquire), STATE_ALLOCATED);
-        }
-    }
-
     /// Test if the matrix can hold 10 minutes of 8 threads executing random alloc
     /// and dealloc operations to ensure the Propagation Principle of Atomic 
     /// Coalescence works.
     #[test]
+    #[ignore]
     fn test_long_term_fragmentation_healing() {
         use std::sync::{ Arc, Barrier };
         use std::thread;

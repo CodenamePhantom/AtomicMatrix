@@ -2,7 +2,19 @@
 name = "atomic-matrix"
 version = "0.1.0"
 edition = "2024"
+authors = ['Dottsss']
+description = "A lock-free, high end allocator primitive for high-performance IPC."
+license = "Apache-2.0"
+repository = "https://github.com/CodenamePhantom/AtomicMatrix"
+keywords = ["allocator", "lock-free", "ipc", "shared-memory", "tlsf"]
+categories = ["memory-management", "concurrency", "os"]
+readme = "README.md"
+
+[features]
+default = []
+server = ["libc"]
 
 [dependencies]
 memmap2 = "0.9.10"
 uuid = { version = "1.23.0", features = ["serde", "v4"] }
+libc = { version = "0.2", optional = true }
