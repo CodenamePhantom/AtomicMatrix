@@ -1,12 +1,16 @@
 # AtomicMatrix
 
-A lock-free, shared-memory-backed memory allocator for high-performance inter-process communication (IPC). Built in Rust on a TLSF-inspired two-level bitmap with a custom kinetic coalescing engine.
+A lock-free, shared-memory-backed memory allocator for high-performance inter-process communication (IPC) operations. Built in Rust on a TLSF-inspired two-level bitmap with a custom kinetic coalescing engine.
 
-**14.77 Mop/s sustained throughput on a 2017 consumer i7. No kernel patches. No specialized hardware.**
+## Stats (60s of random workload - Per Thread scaling)
+| Threads | Total Ops | Throughput (Mop/s) | ns/op | Scaling vs 1T | Efficiency |
+|---------|-----------|-------------------|-------|---------------|------------|
+| 1 | 272,141,174 | 4.54 | 220.3 | 1.00x | 100% |
+| 2 | 431,437,387 | 7.19 | 139.1 | 1.58x | 79% |
+| 4 | 720,029,358 | 12.00 | 83.3 | 2.64x | 66% |
+| 8 | 1,104,515,810 | 18.41 | 54.3 | 4.05x | 51% |
+| 16 | 994,983,604 | 16.58 | 60.3 | 3.65x | 23% |
 
-> **v0.1 — Core allocator layer.** The low-level engine is complete and benchmarked. A high-level message API (`post`, `inquire`, `read`) and a policy trait layer are actively in development and will ship in v0.2.
-
----
 
 ## What it is
 
@@ -34,16 +38,16 @@ AtomicMatrix is a general-purpose allocator - arbitrary sizes, O(1) allocation a
 ### Memory layout
 
 ```
-[ Init Guard (16b) ] [ AtomicMatrix struct ] [ Padding ] [ Sector 0 ] [ Sector 1 ] [ Sector 2 ]
+[ Init Guard (16b) ] [ AtomicMatrix struct ] [ Padding ] [ Allocation Sector ]
 ```
 
-The SHM segment is sectorized into three zones at initialization - small, medium, and large - based on configurable size percentages. Each sector is a self-contained fault domain. Fragmentation in one sector cannot propagate into another.
+All metadata related to the matrix is stored at the very beginning to be globally accessible across modules, acting as a shared state manager coordinating actions between concurrent requests.
 
 ### Allocation: O(1)
 
 Allocation uses a two-level segregated fit (TLSF) inspired bitmap. A first-level bitmap indexes power-of-two size classes. A second-level bitmap subdivides each class into 8 linear steps. Finding a suitable block is two bitmap operations and one CAS - no scanning, no sorting, no locks.
 
-### The Propagation Principle of Atomic Coalescence
+### Memory Healing
 
 Freeing a block triggers a backward **Ripple** - a coalescing traversal that merges the freed block with its left physical neighbours as long as they are free or acknowledged. Three properties make this safe under concurrent access:
 
@@ -71,28 +75,33 @@ STATE_FREE → STATE_ALLOCATED → STATE_ACKED → STATE_COALESCING → STATE_FR
 
 All benchmarks run on a single node with no NUMA tuning, no kernel patches, and no huge pages (default configuration).
 
-**Hardware**: Intel Core i7 7th generation, DDR4
-**OS**: Linux, `/dev/shm` backed
+**Hardware**: Intel Core i7 7th generation, 16GB DDR4
+**OS**: Linux Fedora 43, `/dev/shm` backed
+**Kernel**: 6.19.11-200.fc43.x86_64 (64-bit CPU)
 **Build**: `cargo test --release`
 
 ### Endurance (600 seconds, 8 threads, mixed workload)
 
 ```
-Duration:        600 seconds
-Threads:         8
-Total ops:       8,860,017,740
-Throughput:      14.77 Mop/s
-Free fragments:  118 / 256 cells
-Entropy:         0.000001%
+Total operations: 9,181,958,716
+Throughput: 15.30 Mop/s
+Final free fragments: 140
+Entrophy percentage: 0.0000015247291381962252%
 ```
 
-Workload: randomized allocation sizes (32–544 bytes), 70/30 alloc/free ratio, randomized free ordering to stress the coalescing engine.
+Workload: randomized allocation sizes (32–544 bytes), 70/30 alloc/free ratio, randomized free ordering to stress the coalescing engine. You can check by running:
+
+```bash
+cargo test --lib matrix::tests::test_long_term_fragmentation_healing -- --include_ignored --no-capture
+```
+
+> **Attention**
+> The long term healing test is a stress test that produces a lot of workload in the CPU. It is recommended to adapt the quantity of concurrent threads to the declared number of vThreads provided by your manufacturer.
 
 ---
 
 ## Usage
 
-> **Note**: v0.1 exposes the low-level allocator API directly. A higher-level message API is coming in v0.2. If you want to build your own abstractions on top of the core, this is the right entry point.
 
 ```toml
 [dependencies]
@@ -100,55 +109,41 @@ atomic-matrix = "0.1"
 ```
 
 ```rust
-use atomic_matrix::matrix::core::{AtomicMatrix, RelativePtr, BlockHeader};
+use atomic_matrix::matrix::core::AtomicMatrix;
+use atomic_matrix::handlers::HandlerFunctions;
 
 // Bootstrap a 50MB matrix in /dev/shm
 let handler = AtomicMatrix::bootstrap(
     Some(uuid::Uuid::new_v4()),
     50 * 1024 * 1024,
-    (40, 30)  // 40% small sector, 30% medium sector, 30% large sector
 ).unwrap();
 
-let base_ptr = handler.mmap.as_ptr();
-
 // Allocate a 128-byte block
-let ptr = handler.matrix.allocate(base_ptr, 128).unwrap();
+let mut block = handler.allocate::<[u8; 128]>().unwrap();
+
+// Write the message
+let msg = b"Hello World!";
+let mut payload = [0u8; 128];
+payload[..msg.len()].copy_from_slice(msg);
+
+unsafe { handler.write(&mut block, payload) }
+
+// Read it back
+let data = unsafe { handler.read(&block) }
+println!("{}", std::str::from_utf8(&data[..12]).unwrap());
 
 // Free it
-let header_ptr = RelativePtr::<BlockHeader>::new(ptr.offset() - 32);
-handler.matrix.ack(&header_ptr, base_ptr);
+handler.free(block);
 ```
 
 Multiple processes can map the same segment by passing the same UUID to `bootstrap`. The init guard ensures only one process performs the initial formatting regardless of how many processes call `bootstrap` simultaneously.
 
 ---
 
-## Features
-
-```toml
-[features]
-default = []
-server = ["libc"]   # enables huge page mapping for server deployments
-```
-
-The `server` feature enables `MADV_HUGEPAGE` on the SHM mapping. Recommended for bare-metal server deployments with large matrices. Not recommended for edge or resource-constrained environments.
-
-```bash
-cargo build --features server
-```
-
----
-
 ## Roadmap
 
-### v0.2 — High-level message API
-A typed message layer built on top of the core allocator:
-- `post()` — write a message into the matrix
-- `inquire()` — query for available messages
-- `read()` — consume a message with zero-copy semantics
-
-### v0.3 — Policy trait layer
-A trait-based policy system for typed message enums, allowing callers to define routing, priority, and retention behavior as composable traits attached to message types.
+### v0.3 — Standard Library for the matrix.
+A set of pre-baked data structures and frameworks that can be used with the matrix to execute high-level actions (Iteration, IPC Semantics, etc).
 
 ---
 
@@ -168,10 +163,10 @@ The allocator has been tested under:
 
 ## Contributing
 
-The high-level API and policy layer are the immediate areas where contributions are welcome. If you want to build on top of the core allocator or have ideas for the message API design, open an issue.
+The standard library is the immediate area where contributions are welcome. If you want to build on top of the core allocator or have ideas for the API/Library design, open an issue.
 
 ---
 
 ## License
 
-MIT OR Apache-2.0
+Apache-2.0
