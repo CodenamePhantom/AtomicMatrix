@@ -1,4 +1,4 @@
-//! #A Atomic Matrix Core
+//! # Atomic Matrix Core
 //!
 //! This module implements a high-velocity, lock-free memory arena designed for
 //! ultra-low latency IPC (Inter-Process Communication).
@@ -36,14 +36,59 @@ use std::fs::OpenOptions;
 use memmap2::MmapMut;
 use uuid::Uuid;
 
-const SYS_UNINITIALIZED: u32 = 0;
-const SYS_FORMATTING: u32 = 1;
-const SYS_READY: u32 = 2;
+pub mod helpers {
+    /// System initialization flags
+    pub const SYS_UNINITIALIZED: u32 = 0;
+    pub const SYS_FORMATTING: u32 = 1;
+    pub const SYS_READY: u32 = 2;
 
-const STATE_FREE: u32 = 0;
-const STATE_ALLOCATED: u32 = 1;
-const STATE_ACKED: u32 = 3;
-const STATE_COALESCING: u32 = 4;
+    /// Header lifecycle flags
+    pub const STATE_FREE: u32 = 0;
+    pub const STATE_ALLOCATED: u32 = 1;
+    pub const STATE_ACKED: u32 = 2;
+    pub const STATE_COALESCING: u32 = 3;
+
+    /// A helper struct that provided the O(1) calculations to find the coordinates of
+    /// a block that suits exactly the requested buffer size, or the next available one
+    /// that can fit the message as well.
+    pub struct Mapping;
+
+    impl Mapping {
+        /// Maps a block size to its corresponding (First-Level, Second-Level) indices.
+        ///
+        /// This function implements a two-level mapping strategy used for O(1) free-block
+        /// lookup, optimized for both high-velocity small allocations and logarithmic
+        /// scaling of large blocks.
+        ///
+        /// ### Mapping Logic:
+        /// - **Linear (Small):** For sizes < 128, it uses a fixed FL (0) and 16-byte SL
+        ///   subdivisions. This minimizes fragmentation for tiny objects.
+        /// - **Logarithmic (Large):** For sizes >= 128, FL is the power of 2 (determined via
+        ///   `leading_zeros`), and SL is a 3-bit subdivider of the range between 2^n and 2^(n+1).
+        ///
+        /// ### Mathematical Transformation:
+        /// - `FL = log2(size)`
+        /// - `SL = (size - 2^FL) / (2^(FL - 3))`
+        ///
+        /// ### Bounds:
+        /// Indices are clamped to `(31, 7)` to prevent overflow in the matrix bitmask.
+        ///
+        /// # Arguments
+        /// * `size` - The total byte size of the memory block.
+        ///
+        /// # Returns
+        /// A tuple of `(fl, sl)` indices.
+        pub fn find_indices(size: u32) -> (u32, u32) {
+            if size < 128 {
+                (0, (size / 16).min(7))
+            } else {
+                let fl = 31 - size.leading_zeros();
+                let sl = ((size >> (fl - 3)) & 0x7).min(7);
+                (fl.min(31), sl)
+            }
+        }
+    }
+}
 
 pub mod core {
     use super::*;
@@ -97,10 +142,7 @@ pub mod core {
         _marker: PhantomData<T>,
     }
 
-    /// A helper struct that provided the O(1) calculations to find the coordinates of
-    /// a block that suits exactly the requested buffer size, or the next available one
-    /// that can fit the message as well.
-    pub struct Mapping;
+    
 
     impl AtomicMatrix {
         /// Initialized the matrix struct and returns it.
@@ -115,7 +157,7 @@ pub mod core {
         ///
         /// ### Returns
         /// A static, lifetime specified, reference to the matrix struct.
-        pub fn init(ptr: *mut AtomicMatrix, id: Uuid, size: u32) -> &'static mut Self {
+        fn init(ptr: *mut AtomicMatrix, id: Uuid, size: u32) -> &'static mut Self {
             unsafe {
                 let matrix = &mut *ptr;
                 matrix.fl_bitmap.store(0, Ordering::Release);
@@ -146,9 +188,8 @@ pub mod core {
         /// The matrix handler api, or an error to be handled
         pub fn bootstrap(
             id: Option<Uuid>,
-            size: usize,
-            sector_barriers: (u32, u32)
-        ) -> Result<crate::handlers::matrix_handler::MatrixHandler, String> {
+            size: usize
+        ) -> Result<crate::handlers::MatrixHandler, String> {
             let path_id = id.unwrap_or_else(Uuid::new_v4);
             let path = format!("/dev/shm/{}", path_id);
             let file = OpenOptions::new()
@@ -165,103 +206,51 @@ pub mod core {
 
             let init_guard = unsafe { &*(base_ptr as *const AtomicU32) };
             let matrix_ptr = unsafe { base_ptr.add(16) as *mut AtomicMatrix };
+            let mut current_offset: u32 = 0;
 
             if
                 init_guard
                     .compare_exchange(
-                        SYS_UNINITIALIZED,
-                        SYS_FORMATTING,
+                        helpers::SYS_UNINITIALIZED,
+                        helpers::SYS_FORMATTING,
                         Ordering::SeqCst,
                         Ordering::Relaxed
                     )
                     .is_ok()
             {
                 let matrix = AtomicMatrix::init(matrix_ptr, path_id, size as u32);
-                matrix
-                    .sectorize(base_ptr, size, sector_barriers.0 as u8, sector_barriers.1 as u8)
-                    .unwrap();
-                init_guard.store(SYS_READY, Ordering::SeqCst);
+
+                let matrix_size = std::mem::size_of::<AtomicMatrix>();
+                let remaining_size = size - matrix_size;
+                current_offset = (16 + (matrix_size as u32)+ 15) & !15;
+
+                let (fl, sl) = helpers::Mapping::find_indices(remaining_size as u32);
+
+                let header: &mut BlockHeader;
+                unsafe {
+                    header = &mut *(base_ptr.add(current_offset as usize) as *mut BlockHeader);
+                }
+
+                header.size.store(remaining_size as u32, Ordering::Release);
+                header.state.store(helpers::STATE_FREE, Ordering::Release);
+                header.prev_phys.store(0, Ordering::Release);
+                header.next_free.store(0, Ordering::Release);
+
+                matrix.insert_free_block(base_ptr, current_offset, fl, sl);
+                matrix.sector_boundaries[0].store(size as u32, Ordering::Release);
+
+                init_guard.store(helpers::SYS_READY, Ordering::SeqCst);
             } else {
-                while init_guard.load(Ordering::Acquire) != SYS_READY {
+                while init_guard.load(Ordering::Acquire) != helpers::SYS_READY {
                     std::hint::spin_loop();
                 }
             }
 
-            Ok(crate::handlers::matrix_handler::MatrixHandler {
-                matrix: unsafe {
-                    &mut *matrix_ptr
-                },
-                mmap,
-            })
-        }
-
-        /// Sectorizes the SHM segment into three different zones of allocation. These
-        /// zones are classified as Small, Medium and Large.
-        ///
-        /// - **Small Sector:** For data objects between 32 bytes and 1 KB.
-        /// - **Medium Sector:** For data objects between 1 KB and 1 MB.
-        /// - **Large Sector:** For data objects bigger than 1 MB.
-        ///
-        /// This ensures three main safeties for the matrix:
-        ///
-        /// - **Size integrity:** Blocks with similar sizes are required to stay together,
-        /// ensuring that we don't deal with a huge size variety in coalescing.
-        /// - **Propagation granularity:** The healing propagation only occurs inside the
-        /// block sector, ensuring that high operation sectors dont cause a tide of coalescing
-        /// into lower operation sectors.
-        /// - **Seach optimization:** Since small blocks are always together, it reduces
-        /// the TLSF searching index as the size you need is almost always garanteed to
-        /// exist.
-        ///
-        /// The sectorize also limits sectors based on the choosen size for the matrix to
-        /// ensure that if we have a small matrix (e.g.: 1mb) we don't allocate a unneces-
-        /// sary large sector.
-        ///
-        /// ### Params:
-        /// @base_ptr: The starting offset of the SHM mapping. \
-        /// @total_file_size: The total size of SHM segment \
-        /// @mut small_percent: The desired size percentage of the small sector \
-        /// @mut medium_sector: The desired size percentage of the medium sector
-        ///
-        /// ### Returns:
-        /// Any error that arises from the sectorizing. Otherwise, an Ok flag.
-        pub fn sectorize(
-            &self,
-            base_ptr: *const u8,
-            total_file_size: usize,
-            mut small_percent: u8,
-            mut medium_percent: u8
-        ) -> Result<(), String> {
-            let matrix_size = std::mem::size_of::<AtomicMatrix>();
-            let mut current_offset = (16 + (matrix_size as u32) + 15) & !15;
-            let usable_space = (total_file_size as u32).saturating_sub(current_offset);
-
-            if total_file_size < 5 * 1024 * 1024 {
-                small_percent = 30;
-                medium_percent = 70;
-            }
-
-            let small_size =
-                ((((usable_space as u64) * (small_percent as u64)) / 100) as u32) & !15;
-            let medium_size =
-                ((((usable_space as u64) * (medium_percent as u64)) / 100) as u32) & !15;
-            let large_size = usable_space.saturating_sub(small_size).saturating_sub(medium_size);
-
-            let mut prev_phys = 0u32;
-            let mut sizes = vec![small_size, medium_size, large_size];
-            sizes.retain(|&s| s > 64);
-
-            for (i, size) in sizes.iter().enumerate() {
-                let (fl, sl) = Mapping::find_indices(*size);
-                self.create_and_insert_sector(base_ptr, current_offset, *size, prev_phys, fl, sl);
-                prev_phys = current_offset;
-                current_offset += size;
-
-                if i < 4 {
-                    self.sector_boundaries[i].store(current_offset, Ordering::Release);
-                }
-            }
-            Ok(())
+            Ok(crate::handlers::MatrixHandler::new(
+                unsafe { &mut *matrix_ptr }, 
+                mmap, 
+                current_offset
+            ))
         }
 
         /// Allocates a block in the matrix for the caller
@@ -283,7 +272,7 @@ pub mod core {
         pub fn allocate(&self, base_ptr: *const u8, size: u32) -> Result<RelativePtr<u8>, String> {
             let size = (size + 15) & !15;
             let size = size.max(32);
-            let (fl, sl) = Mapping::find_indices(size);
+            let (fl, sl) = helpers::Mapping::find_indices(size);
 
             for _ in 0..512 {
                 if let Some((f_fl, f_sl)) = self.find_suitable_block(fl, sl) {
@@ -300,17 +289,17 @@ pub mod core {
                                 );
 
                                 next_h.size.store(rem_size, Ordering::Release);
-                                next_h.state.store(STATE_FREE, Ordering::Release);
+                                next_h.state.store(helpers::STATE_FREE, Ordering::Release);
                                 next_h.prev_phys.store(offset, Ordering::Release);
                                 next_h.next_free.store(0, Ordering::Release);
 
                                 header.size.store(size, Ordering::Release);
                                 fence(Ordering::SeqCst);
 
-                                let (r_fl, r_sl) = Mapping::find_indices(rem_size);
+                                let (r_fl, r_sl) = helpers::Mapping::find_indices(rem_size);
                                 self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
                             }
-                            header.state.store(STATE_ALLOCATED, Ordering::Release);
+                            header.state.store(helpers::STATE_ALLOCATED, Ordering::Release);
                             return Ok(RelativePtr::new(offset + 32));
                         }
                     }
@@ -334,7 +323,7 @@ pub mod core {
             unsafe {
                 let header = ptr.resolve_mut(base_ptr);
 
-                header.state.store(STATE_ACKED, Ordering::Release);
+                header.state.store(helpers::STATE_ACKED, Ordering::Release);
             }
 
             self.coalesce(ptr, base_ptr);
@@ -389,8 +378,8 @@ pub mod core {
                     let prev_header = &mut *prev_header_ptr;
 
                     let res = prev_header.state.compare_exchange(
-                        STATE_FREE,
-                        STATE_COALESCING,
+                        helpers::STATE_FREE,
+                        helpers::STATE_COALESCING,
                         Ordering::Acquire,
                         Ordering::Relaxed
                     );
@@ -400,8 +389,8 @@ pub mod core {
                     } else {
                         prev_header.state
                             .compare_exchange(
-                                STATE_ACKED,
-                                STATE_COALESCING,
+                                helpers::STATE_ACKED,
+                                helpers::STATE_COALESCING,
                                 Ordering::Acquire,
                                 Ordering::Relaxed
                             )
@@ -418,7 +407,7 @@ pub mod core {
                             break;
                         }
 
-                        let (fl, sl) = Mapping::find_indices(size_to_add);
+                        let (fl, sl) = helpers::Mapping::find_indices(size_to_add);
 
                         total_size = total_size
                             .checked_add(size_to_add)
@@ -440,9 +429,9 @@ pub mod core {
                 }
 
                 current_header.size.store(total_size, Ordering::Release);
-                current_header.state.store(STATE_FREE, Ordering::Release);
+                current_header.state.store(helpers::STATE_FREE, Ordering::Release);
 
-                let (fl, sl) = Mapping::find_indices(total_size);
+                let (fl, sl) = helpers::Mapping::find_indices(total_size);
                 self.insert_free_block(base_ptr, final_offset, fl, sl);
             }
         }
@@ -475,7 +464,7 @@ pub mod core {
         /// ### Returns:
         /// A tuple containing the FL/SL coordinates or nothing if there is no space
         /// available in the matrix.
-        fn find_suitable_block(&self, fl: u32, sl: u32) -> Option<(u32, u32)> {
+        pub fn find_suitable_block(&self, fl: u32, sl: u32) -> Option<(u32, u32)> {
             let sl_map = self.sl_bitmaps[fl as usize].load(Ordering::Acquire);
             let m_sl = sl_map & (!0u32 << sl);
             if m_sl != 0 {
@@ -513,7 +502,7 @@ pub mod core {
         /// ### Returns
         /// A result containing either the head of the newly acquired block, or an
         /// EmptyBitmapError
-        fn remove_free_block(&self, base_ptr: *const u8, fl: u32, sl: u32) -> Result<u32, String> {
+        pub fn remove_free_block(&self, base_ptr: *const u8, fl: u32, sl: u32) -> Result<u32, String> {
             let head = &self.matrix[fl as usize][sl as usize];
             loop {
                 let off = head.load(Ordering::Acquire);
@@ -547,7 +536,7 @@ pub mod core {
         /// @offset: The header offset to be inserted into the bucket \
         /// @fl: The first level insertion coordinates \
         /// @sl: The second level insertion coordinates
-        fn insert_free_block(&self, base_ptr: *const u8, offset: u32, fl: u32, sl: u32) {
+        pub fn insert_free_block(&self, base_ptr: *const u8, offset: u32, fl: u32, sl: u32) {
             let head = &self.matrix[fl as usize][sl as usize];
             unsafe {
                 let h = &mut *(base_ptr.add(offset as usize) as *mut BlockHeader);
@@ -568,34 +557,6 @@ pub mod core {
             self.sl_bitmaps[fl as usize].fetch_or(1 << sl, Ordering::Release);
         }
 
-        /// Creates and formates the header of the sector, as well as pushing it into its
-        /// corresponding boundary position inside the matrix.
-        ///
-        /// ### Params:
-        /// @base_ptr: The offset from the start of the SHM segment \
-        /// @size: The size of the sector \
-        /// @prev: The previous sector, if any \
-        /// @fl: The first level coordinate based on po2 size scalling \
-        /// @sl: The second level coordinate based on 8 steps division size scalling
-        fn create_and_insert_sector(
-            &self,
-            base_ptr: *const u8,
-            offset: u32,
-            size: u32,
-            prev: u32,
-            fl: u32,
-            sl: u32
-        ) {
-            unsafe {
-                let h = &mut *(base_ptr.add(offset as usize) as *mut BlockHeader);
-                h.size.store(size, Ordering::Release);
-                h.state.store(STATE_FREE, Ordering::Release);
-                h.prev_phys.store(prev, Ordering::Release);
-                h.next_free.store(0, Ordering::Release);
-                self.insert_free_block(base_ptr, offset, fl, sl);
-            }
-        }
-
         /// Returns the boundary of the current sector
         ///
         /// It queries the boundaries from the metadata and check wheter the block fits or
@@ -606,7 +567,7 @@ pub mod core {
         ///
         /// ### Returns:
         /// Either the boundary value of the current sector, or the end of the segment.
-        fn sector_end_offset(&self, current_offset: u32) -> u32 {
+        pub fn sector_end_offset(&self, current_offset: u32) -> u32 {
             for i in 0..4 {
                 let boundary = self.sector_boundaries[i].load(Ordering::Acquire);
                 if boundary == 0 {
@@ -655,6 +616,16 @@ pub mod core {
             unsafe { &*(base_ptr.add((self.offset as usize) - 32) as *mut BlockHeader) }
         }
 
+        /// Resolves the header based on the base_ptr of the current caller process.
+        ///
+        /// This ensures that the pointer returned is actually mapped to the process local
+        /// memory scope
+        ///
+        /// ### Params:
+        /// @base_ptr: The offset from the start of the SHM segment.
+        ///
+        /// ### Returns:
+        /// A life time speficied mutable reference to the header of this block
         pub unsafe fn resolve_header_mut<'a>(&self, base_ptr: *const u8) -> &'a mut BlockHeader {
             unsafe { &mut *(base_ptr.add((self.offset as usize) - 32) as *mut BlockHeader) }
         }
@@ -686,59 +657,30 @@ pub mod core {
         pub unsafe fn resolve_mut<'a>(&self, base_ptr: *const u8) -> &'a mut T {
             unsafe { &mut *(base_ptr.add(self.offset as usize) as *mut T) }
         }
-    }
 
-    impl Mapping {
-        /// Maps a block size to its corresponding (First-Level, Second-Level) indices.
-        ///
-        /// This function implements a two-level mapping strategy used for O(1) free-block
-        /// lookup, optimized for both high-velocity small allocations and logarithmic
-        /// scaling of large blocks.
-        ///
-        /// ### Mapping Logic:
-        /// - **Linear (Small):** For sizes < 128, it uses a fixed FL (0) and 16-byte SL
-        ///   subdivisions. This minimizes fragmentation for tiny objects.
-        /// - **Logarithmic (Large):** For sizes >= 128, FL is the power of 2 (determined via
-        ///   `leading_zeros`), and SL is a 3-bit subdivider of the range between 2^n and 2^(n+1).
-        ///
-        /// ### Mathematical Transformation:
-        /// - `FL = log2(size)`
-        /// - `SL = (size - 2^FL) / (2^(FL - 3))`
-        ///
-        /// ### Bounds:
-        /// Indices are clamped to `(31, 7)` to prevent overflow in the matrix bitmask.
-        ///
-        /// # Arguments
-        /// * `size` - The total byte size of the memory block.
-        ///
-        /// # Returns
-        /// A tuple of `(fl, sl)` indices.
-        pub fn find_indices(size: u32) -> (u32, u32) {
-            if size < 128 {
-                (0, (size / 16).min(7))
-            } else {
-                let fl = 31 - size.leading_zeros();
-                let sl = ((size >> (fl - 3)) & 0x7).min(7);
-                (fl.min(31), sl)
-            }
+        pub unsafe fn write(&self, base_ptr: *const u8, value: T) {
+            unsafe { std::ptr::write(self.resolve_mut(base_ptr), value) }
         }
     }
+
+    
 }
 
 #[cfg(test)]
 mod tests {
     use crate::matrix::core::{ BlockHeader, RelativePtr };
+    use crate::handlers::HandlerFunctions;
 
     use super::*;
 
     /// Test if the mapping function can return the correct indexes.
     #[test]
     fn test_mapping() {
-        assert_eq!(core::Mapping::find_indices(16), (0, 1));
-        assert_eq!(core::Mapping::find_indices(64), (0, 4));
-        assert_eq!(core::Mapping::find_indices(128), (7, 0));
+        assert_eq!(helpers::Mapping::find_indices(16), (0, 1));
+        assert_eq!(helpers::Mapping::find_indices(64), (0, 4));
+        assert_eq!(helpers::Mapping::find_indices(128), (7, 0));
 
-        let (fl, sl) = core::Mapping::find_indices(1024);
+        let (fl, sl) = helpers::Mapping::find_indices(1024);
         assert_eq!(fl, 10);
         assert_eq!(sl, 0);
     }
@@ -748,48 +690,20 @@ mod tests {
     #[test]
     fn test_initial_bootstrap() {
         let size = 1024 * 1024;
-        let handler = core::AtomicMatrix
-            ::bootstrap(Some(uuid::Uuid::new_v4()), size, (100, 0))
-            .unwrap();
+        let handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
 
-        let bitmap = handler.matrix.fl_bitmap.load(Ordering::Acquire);
+        let bitmap = handler.matrix().fl_bitmap.load(Ordering::Acquire);
 
-        assert!(bitmap != 0, "FL bitmap should not be zero after sectorization");
-        assert!(
-            (bitmap & ((1 << 19) | (1 << 18))) != 0,
-            "FL bitmap should have bits set for the expected sectors (19 and 18 for 512KB and 256KB"
-        );
-    }
-
-    /// Test if the matrix can sectorize itself.
-    #[test]
-    fn test_initialization_integrity() {
-        let mut fake_shm = vec![0u8; 1024 * 1024];
-        let base_ptr = fake_shm.as_mut_ptr();
-
-        unsafe {
-            let matrix_ptr = base_ptr.add(16) as *mut core::AtomicMatrix;
-            let matrix = core::AtomicMatrix::init(
-                matrix_ptr,
-                uuid::Uuid::new_v4(),
-                fake_shm.len() as u32
-            );
-
-            matrix.sectorize(base_ptr, 1024 * 1024, 10, 20).unwrap();
-
-            assert!(matrix.fl_bitmap.load(Ordering::Relaxed) != 0);
-        }
+        assert!(bitmap != 0, "FL bitmap should not be zero after bootstrap");
     }
 
     /// Test allocation and sppliting logic by comparing the size of our buffer.
     #[test]
     fn test_allocation_and_spliting() {
         let size = 1024 * 1024;
-        let mut handler = core::AtomicMatrix
-            ::bootstrap(Some(uuid::Uuid::new_v4()), size, (100, 0))
-            .unwrap();
-        let base_ptr = handler.mmap.as_mut_ptr();
-        let matrix = &mut *handler.matrix;
+        let handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
+        let base_ptr = handler.base_ptr();
+        let matrix = handler.matrix();
 
         unsafe {
             let rel_ptr = matrix.allocate(base_ptr, 64).unwrap();
@@ -797,7 +711,7 @@ mod tests {
             let header = rel_ptr.resolve_header(base_ptr);
 
             assert_eq!(header.size.load(Ordering::Acquire), 64);
-            assert_eq!(header.state.load(Ordering::Acquire), STATE_ALLOCATED);
+            assert_eq!(header.state.load(Ordering::Acquire), helpers::STATE_ALLOCATED);
         }
     }
 
@@ -805,11 +719,9 @@ mod tests {
     #[test]
     fn test_ack_and_coalesce() {
         let size = 1024 * 1024;
-        let mut handler = core::AtomicMatrix
-            ::bootstrap(Some(uuid::Uuid::new_v4()), size, (100, 0))
-            .unwrap();
-        let base_ptr = handler.mmap.as_mut_ptr();
-        let matrix = &mut *handler.matrix;
+        let handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
+        let base_ptr = handler.base_ptr();
+        let matrix = handler.matrix();
 
         unsafe {
             let ptr_a = matrix.allocate(base_ptr, 64).unwrap();
@@ -822,27 +734,27 @@ mod tests {
             let rel_c = RelativePtr::<BlockHeader>::new(ptr_c.offset() - 32);
             let rel_d = RelativePtr::<BlockHeader>::new(ptr_d.offset() - 32);
 
-            h_b.state.store(STATE_FREE, Ordering::Release);
+            h_b.state.store(helpers::STATE_FREE, Ordering::Release);
             matrix.ack(&rel_c, base_ptr);
             matrix.ack(&rel_d, base_ptr);
 
             matrix.coalesce(&rel_d, base_ptr);
 
             let h_a = ptr_a.resolve_header(base_ptr);
-            assert_eq!(h_a.state.load(Ordering::Acquire), STATE_ALLOCATED);
+            assert_eq!(h_a.state.load(Ordering::Acquire), helpers::STATE_ALLOCATED);
 
             let h_merged = ptr_b.resolve_header(base_ptr);
-            assert_eq!(h_merged.state.load(Ordering::Acquire), STATE_FREE);
+            assert_eq!(h_merged.state.load(Ordering::Acquire), helpers::STATE_FREE);
             assert_eq!(h_merged.size.load(Ordering::Acquire), 256);
 
             let h_e = ptr_e.resolve_header(base_ptr);
-            assert_eq!(h_e.state.load(Ordering::Acquire), STATE_ALLOCATED);
+            assert_eq!(h_e.state.load(Ordering::Acquire), helpers::STATE_ALLOCATED);
         }
     }
 
     /// ----------------------------------------------------------------------------
     /// STRESS TESTS
-    /// 
+    ///
     /// These are all ignored from the correctness suite so github doesn't get mad at
     /// me. Before shipping, running these are explicitly required.
     /// ----------------------------------------------------------------------------
@@ -862,9 +774,7 @@ mod tests {
 
         // We use 500MB matrix to allocate all the buffers
         let size = 50 * 1024 * 1024;
-        let handler = core::AtomicMatrix
-            ::bootstrap(Some(uuid::Uuid::new_v4()), size, (40, 30))
-            .unwrap();
+        let handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
 
         let thread_count = 8;
         let allocs_per_second = 100_000;
@@ -878,8 +788,8 @@ mod tests {
         // Fuck the matrix! GO GO GO
         for _ in 0..thread_count {
             let b = Arc::clone(&barrier);
-            let base_addr = handler.mmap.as_ptr() as usize;
-            let matrix_addr = handler.matrix as *const core::AtomicMatrix as usize;
+            let base_addr = handler.base_ptr() as usize;
+            let matrix_addr = handler.matrix() as *const core::AtomicMatrix as usize;
             let fail_count_clone = Arc::clone(&fail_count);
 
             handles.push(
@@ -938,11 +848,15 @@ mod tests {
     }
 
     /// Test if the matrix can hold 10 minutes of 8 threads executing random alloc
-    /// and dealloc operations to ensure the Propagation Principle of Atomic 
+    /// and dealloc operations to ensure the Propagation Principle of Atomic
     /// Coalescence works.
     #[test]
     #[ignore]
     fn test_long_term_fragmentation_healing() {
+        // Quick author note:
+        //
+        // May god help your device at this moment
+
         use std::sync::{ Arc, Barrier };
         use std::thread;
         use std::time::{ Instant, Duration };
@@ -951,9 +865,7 @@ mod tests {
         const THREADS: u32 = 8;
 
         let size = 50 * 1024 * 1024;
-        let handler = core::AtomicMatrix
-            ::bootstrap(Some(uuid::Uuid::new_v4()), size, (40, 30))
-            .unwrap();
+        let handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
         let handler_arc = Arc::new(handler);
         let barrier = Arc::new(Barrier::new(THREADS as usize));
         let start_time = Instant::now();
@@ -967,8 +879,8 @@ mod tests {
 
             handles.push(
                 thread::spawn(move || {
-                    let base_ptr = h.mmap.as_ptr() as *mut u8;
-                    let matrix = &h.matrix;
+                    let base_ptr = h.base_ptr() as *mut u8;
+                    let matrix = &h.matrix();
                     let mut my_blocks = Vec::new();
                     let mut rng = t_id + 1;
                     let mut total_ops = 0u64;
@@ -1005,19 +917,19 @@ mod tests {
         for h in handles {
             let (remaining, thread_ops) = h.join().unwrap();
             total_work += thread_ops;
-            let base_ptr = handler_arc.mmap.as_ptr() as *mut u8;
+            let base_ptr = handler_arc.base_ptr() as *mut u8;
 
             for ptr in remaining {
                 let header_ptr = RelativePtr::<BlockHeader>::new(ptr.offset() - 32);
-                handler_arc.matrix.ack(&header_ptr, base_ptr);
-                handler_arc.matrix.coalesce(&header_ptr, base_ptr);
+                handler_arc.matrix().ack(&header_ptr, base_ptr);
+                handler_arc.matrix().coalesce(&header_ptr, base_ptr);
             }
         }
 
         let mut free_count = 0;
         for fl in 0..32 {
             for sl in 0..8 {
-                if handler_arc.matrix.matrix[fl][sl].load(Ordering::Acquire) != 0 {
+                if handler_arc.matrix().matrix[fl][sl].load(Ordering::Acquire) != 0 {
                     free_count += 1;
                 }
             }
