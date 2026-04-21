@@ -1,26 +1,26 @@
-/// # Looper
-///
-/// #### Iterator implementation for the matrix
-///
-/// Looper is a iterator library that implements the Iterator trait from
-/// Rust into AtomicMatrix. It integrates the trait logic into the chaining
-/// system already present into the matrix to enable sequential traversal.
-///
-/// Following the logic of [`MatrixHandler`] This method provides access to
-/// typed data visualization directly into [`IterView`] through the method
-/// `.view_data_as::<T>()`, which returns a life time specified reference T.
-/// As well as providing the ability to read data as raw bytes.
-///
-/// # Thread Sharing
-///
-/// [`IterView`] is [`Send`] and [`Sync`] - once obtained, it can be freely
-/// shared across threads, as it only holds references. Note however that race
-/// conditions on concurrent read/write into the underlying block are still
-/// possible and must be handled by the caller.
-///
-/// [`MatrixIter`] itself is not thread-safe (it holds mutable iteration state).
-/// To iterate from multiple threads, create one iterator per thread or collect
-/// data into a [`vec`] first.
+//! # Looper
+//!
+//! #### Iterator implementation for the matrix
+//!
+//! Looper is a iterator library that implements the Iterator trait from
+//! Rust into AtomicMatrix. It integrates the trait logic into the chaining
+//! system already present into the matrix to enable sequential traversal.
+//!
+//! Following the logic of [`MatrixHandler`] This method provides access to
+//! typed data visualization directly into [`IterView`] through the method
+//! `.view_data_as::<T>()`, which returns a life time specified reference T.
+//! As well as providing the ability to read data as raw bytes.
+//!
+//! # Thread Sharing
+//!
+//! [`IterView`] is [`Send`] and [`Sync`] - once obtained, it can be freely
+//! shared across threads, as it only holds references. Note however that race
+//! conditions on concurrent read/write into the underlying block are still
+//! possible and must be handled by the caller.
+//!
+//! [`MatrixIter`] itself is not thread-safe (it holds mutable iteration state).
+//! To iterate from multiple threads, create one iterator per thread or collect
+//! data into a [`vec`] first.
 use std::sync::atomic::Ordering;
 
 use crate::handlers::*;
