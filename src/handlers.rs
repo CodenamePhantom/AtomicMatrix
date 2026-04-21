@@ -64,7 +64,7 @@ use memmap2::MmapMut;
 pub const USER_STATE_MIN: u32 = 49;
 
 /// Errors produced by [`MatrixHandler`] and [`SharedHandler`] operations.
-#[derive(Debug, PartialEq)]
+#[derive(Debug)]
 pub enum HandlerError {
     /// The allocator could not find a free block. Either OOM or contention.
     AllocationFailed(String),
@@ -75,6 +75,8 @@ pub enum HandlerError {
     TransitionFailed(u32),
     /// The block offset is outside the valid segment range.
     InvalidOffset(u32),
+    /// Failed to unlink the main SHM file for unpredicted reasons.
+    SeppukuFailed { path: String, reason: std::io::Error},
 }
 
 /// A typed handle to an allocated block in the matrix.
@@ -94,9 +96,10 @@ pub enum HandlerError {
 ///
 /// Blocks carry no lifetime parameter. The caller is responsible for not using
 /// a block after freeing it or after the handler is dropped.
+#[derive(Debug)]
 pub struct Block<T> {
     /// Payload offset from SHM base — points past the `BlockHeader`.
-    pointer: RelativePtr<T>,
+    pub pointer: RelativePtr<T>,
 }
 
 /// A lightweight reflection of the original handler that can be safely sent
@@ -162,6 +165,33 @@ impl MatrixHandler {
             first_block_offset: self.first_block_offset,
         }
     }
+
+    /// Removes the SHM file from the system.
+    ///
+    /// Should be called before the application exits to prevent the SHM file
+    /// from persisting in `/dev/shm/` across runs. This is an explicit, opt-
+    /// in cleanup - if omitted, the file survives until the system reboots
+    /// or it's manually removed.
+    ///
+    /// Existing mapping remains valid until the handlers are dropped; this
+    /// only removes the filesystem entry, preventing new attachments.
+    pub fn die(&self) -> Result<(), HandlerError> {
+        let id = self.matrix().id;
+        let path = format!("/dev/shm/{}", id);
+
+        match std::fs::remove_file(&path) {
+            Ok(_) => {},
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Err(e) => {
+                return Err(HandlerError::SeppukuFailed {
+                    path, 
+                    reason: e,
+                });
+            },
+        };
+
+        Ok(())
+    }
 }
 
 impl HandlerFunctions for MatrixHandler {
@@ -225,12 +255,14 @@ pub trait HandlerFunctions {
     /// Returns [`HandlerError::AllocationFailed`] if the matrix is out of
     /// memory or under contention after 512 retries.
     fn allocate<T>(&self) -> Result<Block<T>, HandlerError> {
-        let size = (std::mem::size_of::<T>() as u32).max(16);
+        let size = std::mem::size_of::<T>() as u32;
         self.matrix()
             .allocate(self.base_ptr(), size)
             .map(|ptr| Block::from_offset(ptr.offset()))
             .map_err(HandlerError::AllocationFailed)
     }
+
+
 
     /// Allocates a raw byte block of the given size.
     ///

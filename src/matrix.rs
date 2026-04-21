@@ -32,11 +32,13 @@
 
 use std::sync::atomic::{ AtomicU32, Ordering, fence };
 use std::marker::PhantomData;
-use std::fs::OpenOptions;
+use std::fs::{ OpenOptions };
 use memmap2::MmapMut;
 use uuid::Uuid;
 
 pub mod helpers {
+    use super::*;
+    
     /// System initialization flags
     pub const SYS_UNINITIALIZED: u32 = 0;
     pub const SYS_FORMATTING: u32 = 1;
@@ -47,6 +49,8 @@ pub mod helpers {
     pub const STATE_ALLOCATED: u32 = 1;
     pub const STATE_ACKED: u32 = 2;
     pub const STATE_COALESCING: u32 = 3;
+
+    pub const HEADER_SPACE: u32 = std::mem::size_of::<core::BlockHeader>() as u32 + 16;
 
     /// A helper struct that provided the O(1) calculations to find the coordinates of
     /// a block that suits exactly the requested buffer size, or the next available one
@@ -91,6 +95,8 @@ pub mod helpers {
 }
 
 pub mod core {
+    use crate::matrix::helpers::HEADER_SPACE;
+
     use super::*;
 
     /// Header structure that is written at the beginning of each block/sector
@@ -137,6 +143,7 @@ pub mod core {
     ///
     /// It also receives a PhantomData to inform the compiler we safely own whatever
     /// generic type the caller has passed to this pointer.
+    #[derive(Debug)]
     pub struct RelativePtr<T> {
         offset: u32,
         _marker: PhantomData<T>,
@@ -180,8 +187,8 @@ pub mod core {
         /// to the caller.
         ///
         /// ### Params:
-        /// @id: The ID of a new or existing matrix (if existing, will skip formatting and
-        /// just bind to it) \
+        /// @id: The ID of a new or existing matrix. If one is provided, will skip 
+        /// formatting and just bind to it \
         /// @size: The SHM allocation size
         ///
         /// ### Returns
@@ -221,8 +228,8 @@ pub mod core {
                 let matrix = AtomicMatrix::init(matrix_ptr, path_id, size as u32);
 
                 let matrix_size = std::mem::size_of::<AtomicMatrix>();
-                let remaining_size = size - matrix_size;
                 current_offset = (16 + (matrix_size as u32)+ 15) & !15;
+                let remaining_size = size - (current_offset as usize);
 
                 let (fl, sl) = helpers::Mapping::find_indices(remaining_size as u32);
 
@@ -281,9 +288,9 @@ pub mod core {
                             let header = &mut *(base_ptr.add(offset as usize) as *mut BlockHeader);
                             let total_size = header.size.load(Ordering::Acquire);
 
-                            if total_size >= size + 32 + 16 {
-                                let rem_size = total_size - size;
-                                let next_off = offset + size;
+                            if total_size >= size + helpers::HEADER_SPACE {
+                                let rem_size = total_size - (size + helpers::HEADER_SPACE);
+                                let next_off = offset + size + helpers::HEADER_SPACE;
                                 let next_h = &mut *(
                                     base_ptr.add(next_off as usize) as *mut BlockHeader
                                 );
@@ -293,14 +300,14 @@ pub mod core {
                                 next_h.prev_phys.store(offset, Ordering::Release);
                                 next_h.next_free.store(0, Ordering::Release);
 
-                                header.size.store(size, Ordering::Release);
+                                header.size.store(size + helpers::HEADER_SPACE, Ordering::Release);
                                 fence(Ordering::SeqCst);
 
                                 let (r_fl, r_sl) = helpers::Mapping::find_indices(rem_size);
                                 self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
                             }
                             header.state.store(helpers::STATE_ALLOCATED, Ordering::Release);
-                            return Ok(RelativePtr::new(offset + 32));
+                            return Ok(RelativePtr::new(offset + helpers::HEADER_SPACE));
                         }
                     }
                 }
@@ -446,7 +453,7 @@ pub mod core {
         /// ### Returns:
         /// The Relative Pointer to the queried block
         pub fn query(&self, offset: u32) -> RelativePtr<u8> {
-            RelativePtr::new(offset + 32)
+            RelativePtr::new(offset + helpers::HEADER_SPACE)
         }
 
         /// Queries the TLSF bitmaps in search of a block.
@@ -613,7 +620,7 @@ pub mod core {
         /// ### Returns:
         /// A life time speficied reference to the header of this block
         pub unsafe fn resolve_header<'a>(&self, base_ptr: *const u8) -> &'a BlockHeader {
-            unsafe { &*(base_ptr.add((self.offset as usize) - 32) as *mut BlockHeader) }
+            unsafe { &*(base_ptr.add((self.offset as usize) - helpers::HEADER_SPACE as usize) as *mut BlockHeader) }
         }
 
         /// Resolves the header based on the base_ptr of the current caller process.
@@ -627,7 +634,7 @@ pub mod core {
         /// ### Returns:
         /// A life time speficied mutable reference to the header of this block
         pub unsafe fn resolve_header_mut<'a>(&self, base_ptr: *const u8) -> &'a mut BlockHeader {
-            unsafe { &mut *(base_ptr.add((self.offset as usize) - 32) as *mut BlockHeader) }
+            unsafe { &mut *(base_ptr.add((self.offset as usize) - helpers::HEADER_SPACE as usize) as *mut BlockHeader) }
         }
 
         /// Resolves the block scope based on the base_ptr of the current caller process.
@@ -731,8 +738,8 @@ mod tests {
             let ptr_e = matrix.allocate(base_ptr, 64).unwrap();
 
             let h_b = ptr_b.resolve_header(base_ptr);
-            let rel_c = RelativePtr::<BlockHeader>::new(ptr_c.offset() - 32);
-            let rel_d = RelativePtr::<BlockHeader>::new(ptr_d.offset() - 32);
+            let rel_c = RelativePtr::<BlockHeader>::new(ptr_c.offset() - helpers::HEADER_SPACE);
+            let rel_d = RelativePtr::<BlockHeader>::new(ptr_d.offset() - helpers::HEADER_SPACE);
 
             h_b.state.store(helpers::STATE_FREE, Ordering::Release);
             matrix.ack(&rel_c, base_ptr);
@@ -891,7 +898,7 @@ mod tests {
                         rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
 
                         if rng % 10 < 7 && my_blocks.len() < 200 {
-                            let alloc_size = (rng % 512) + 32;
+                            let alloc_size = (rng % 512);
                             if let Ok(ptr) = matrix.allocate(base_ptr, alloc_size as u32) {
                                 my_blocks.push(ptr);
                             }
@@ -899,7 +906,7 @@ mod tests {
                             let idx = (rng as usize) % my_blocks.len();
                             let ptr = my_blocks.swap_remove(idx);
 
-                            let header_ptr = RelativePtr::<BlockHeader>::new(ptr.offset() - 32);
+                            let header_ptr = RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
                             matrix.ack(&header_ptr, base_ptr);
 
                             if total_ops % 5 == 0 {
@@ -920,7 +927,7 @@ mod tests {
             let base_ptr = handler_arc.base_ptr() as *mut u8;
 
             for ptr in remaining {
-                let header_ptr = RelativePtr::<BlockHeader>::new(ptr.offset() - 32);
+                let header_ptr = RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
                 handler_arc.matrix().ack(&header_ptr, base_ptr);
                 handler_arc.matrix().coalesce(&header_ptr, base_ptr);
             }
