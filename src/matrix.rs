@@ -717,7 +717,7 @@ mod tests {
 
             let header = rel_ptr.resolve_header(base_ptr);
 
-            assert_eq!(header.size.load(Ordering::Acquire), 64);
+            assert_eq!(header.size.load(Ordering::Acquire), 64 + helpers::HEADER_SPACE);
             assert_eq!(header.state.load(Ordering::Acquire), helpers::STATE_ALLOCATED);
         }
     }
@@ -752,7 +752,7 @@ mod tests {
 
             let h_merged = ptr_b.resolve_header(base_ptr);
             assert_eq!(h_merged.state.load(Ordering::Acquire), helpers::STATE_FREE);
-            assert_eq!(h_merged.size.load(Ordering::Acquire), 256);
+            assert_eq!(h_merged.size.load(Ordering::Acquire), 448);
 
             let h_e = ptr_e.resolve_header(base_ptr);
             assert_eq!(h_e.state.load(Ordering::Acquire), helpers::STATE_ALLOCATED);
