@@ -7,18 +7,18 @@
 //! system already present into the matrix to enable sequential traversal.
 //!
 //! Following the logic of [`MatrixHandler`] This method provides access to
-//! typed data visualization directly into [`IterView`] through the method
+//! typed data visualization directly into [`LoopWindow`] through the method
 //! `.view_data_as::<T>()`, which returns a life time specified reference T.
 //! As well as providing the ability to read data as raw bytes.
 //!
 //! # Thread Sharing
 //!
-//! [`IterView`] is [`Send`] and [`Sync`] - once obtained, it can be freely
+//! [`LoopWindow`] is [`Send`] and [`Sync`] - once obtained, it can be freely
 //! shared across threads, as it only holds references. Note however that race
 //! conditions on concurrent read/write into the underlying block are still
 //! possible and must be handled by the caller.
 //!
-//! [`MatrixIter`] itself is not thread-safe (it holds mutable iteration state).
+//! [`Looper`] itself is not thread-safe (it holds mutable iteration state).
 //! To iterate from multiple threads, create one iterator per thread or collect
 //! data into a [`vec`] first.
 use std::sync::atomic::Ordering;
@@ -47,7 +47,7 @@ pub struct LoopWindow<'a> {
     handler: &'a MatrixHandler,
 }
 
-/// Default Iterator implementation on [`MatrixIter`], with the addition
+/// Default Iterator implementation on [`Looper`], with the addition
 /// of using the matrix chain as next instead of normal indexes.
 impl<'a> Iterator for Looper<'a> {
     type Item = LoopWindow<'a>;
@@ -55,10 +55,10 @@ impl<'a> Iterator for Looper<'a> {
     /// Queries the next block in the matrix based on the current item offset
     /// related to base_ptr() + the size of the block. If the size is 0 or the
     /// offset surpasses the boundaries of the matrix, the iteration stop.
-    /// Else, returns an [`IterView`] of the current record.
+    /// Else, returns an [`LoopWindow`] of the current record.
     ///
     /// # Returns
-    /// Either the [`IterView`] of the current record, or None.
+    /// Either the [`LoopWindow`] of the current record, or None.
     fn next(&mut self) -> Option<Self::Item> {
         if self.current_offset >= self.end_offset {
             return None;
@@ -82,7 +82,7 @@ impl<'a> Iterator for Looper<'a> {
 }
 
 impl<'a> Looper<'a> {
-    /// Creates a new [`MatrixIter`] instance over the current handler.
+    /// Creates a new [`Looper`] instance over the current handler.
     ///
     /// # Returns:
     /// An instance of Self.
@@ -98,7 +98,7 @@ impl<'a> Looper<'a> {
     }
 }
 
-// SAFETY: IterView contains only one RelativePtr<u8> (an offset u32,
+// SAFETY: LoopWindow contains only one RelativePtr<u8> (an offset u32,
 // essentially imutable as design) e an imutable reference &MatrixHandler.
 // The resolution to real pointer always goes through the handler, who
 // manages its own thread safety. No mutable state is contained in the
@@ -107,7 +107,7 @@ unsafe impl<'a> Send for LoopWindow<'a> {}
 unsafe impl<'a> Sync for LoopWindow<'a> {}
 
 impl<'a> LoopWindow<'a> {
-    /// Creates a new IterView instance of a record.
+    /// Creates a new [`LoopWindow`] instance of a record.
     ///
     /// # Params:
     /// @rel_ptr: The [`RelativePtr`] of the current record. \
