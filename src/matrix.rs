@@ -95,8 +95,6 @@ pub mod helpers {
 }
 
 pub mod core {
-    use crate::matrix::helpers::HEADER_SPACE;
-
     use super::*;
 
     /// Header structure that is written at the beginning of each block/sector

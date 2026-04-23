@@ -1,5 +1,0 @@
-    Updating crates.io index
-error: failed to select a version for the requirement `atomic-matrix = "^0.3"`
-candidate versions found which didn't match: 0.2.0, 0.1.0
-location searched: crates.io index
-required by package `looper-showcase v0.1.0 (/home/dotto/Documentos/Projs/atomic-matrix/examples/Looper)`

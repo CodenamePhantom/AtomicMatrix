@@ -29,9 +29,9 @@ fn main() {
 
     let start = Instant::now();
 
-    for _i in 0..PASSES {
-        let mut block = handler.allocate::<u16>().unwrap();
-        unsafe { handler.write(&mut block, 397) };
+    for i in 0..PASSES {
+        let mut block = handler.allocate::<u64>().unwrap();
+        unsafe { handler.write(&mut block, i as u64) };
     }
 
     let alloc_time = start.elapsed();
@@ -39,7 +39,7 @@ fn main() {
     for v in looper {
         let h = v.view_header();
         let d_r = v.view_data_raw();
-        let d_c = v.view_data_as::<u16>();
+        let d_c = v.view_data_as::<u64>();
 
         if h.state.load(std::sync::atomic::Ordering::Acquire) == helpers::STATE_FREE {
             println!("Done")
@@ -56,6 +56,7 @@ fn main() {
 
     let iter_time = start.elapsed();
 
+    println!("{:?}", my_blocks.get(817535));
     println!("Total blocks: {}", PASSES);
     println!(
         "Iter in {} ms. \n Alloc in {} ms",
