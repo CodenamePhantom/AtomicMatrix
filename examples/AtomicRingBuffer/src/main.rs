@@ -1,6 +1,6 @@
 use atomic_matrix::{
     internals::collections::atomic_ringbuffer::{AtomicRingBuffer, Behaviour},
-    matrix::core::*,
+    prelude::*,
 };
 use std::{thread, time::Instant};
 

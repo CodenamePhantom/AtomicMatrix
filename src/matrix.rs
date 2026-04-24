@@ -123,7 +123,7 @@ pub mod core {
     /// raw memory blocks.
     #[repr(C)]
     pub struct AtomicMatrix {
-        pub id: Uuid,
+        pub id: String,
         pub fl_bitmap: AtomicU32,
         pub sl_bitmaps: [AtomicU32; 32],
         pub matrix: [[AtomicU32; 8]; 32],
@@ -162,7 +162,7 @@ pub mod core {
         ///
         /// ### Returns
         /// A static, lifetime specified, reference to the matrix struct.
-        fn init(ptr: *mut AtomicMatrix, id: Uuid, size: u32) -> &'static mut Self {
+        fn init(ptr: *mut AtomicMatrix, id: String, size: u32) -> &'static mut Self {
             unsafe {
                 let matrix = &mut *ptr;
                 matrix.fl_bitmap.store(0, Ordering::Release);
@@ -192,11 +192,11 @@ pub mod core {
         /// ### Returns
         /// The matrix handler api, or an error to be handled
         pub fn bootstrap(
-            id: Option<Uuid>,
+            id: Option<String>,
             size: usize
         ) -> Result<crate::handlers::MatrixHandler, String> {
-            let path_id = id.unwrap_or_else(Uuid::new_v4);
-            let path = format!("/dev/shm/{}", path_id);
+            let path_id = id.unwrap_or_else(|| { Uuid::new_v4().to_string() });
+            let path = format!("/dev/shm/matrix-{}", path_id);
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -695,7 +695,7 @@ mod tests {
     #[test]
     fn test_initial_bootstrap() {
         let size = 1024 * 1024;
-        let handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
+        let handler = core::AtomicMatrix::bootstrap(Some(String::from("bootstrap_test")), size).unwrap();
 
         let bitmap = handler.matrix().fl_bitmap.load(Ordering::Acquire);
 
@@ -706,7 +706,7 @@ mod tests {
     #[test]
     fn test_allocation_and_spliting() {
         let size = 1024 * 1024;
-        let handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
+        let handler = core::AtomicMatrix::bootstrap(Some(String::from("a_s_test")), size).unwrap();
         let base_ptr = handler.base_ptr();
         let matrix = handler.matrix();
 
@@ -724,7 +724,7 @@ mod tests {
     #[test]
     fn test_ack_and_coalesce() {
         let size = 1024 * 1024;
-        let handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
+        let handler = core::AtomicMatrix::bootstrap(Some(String::from("a_c_test")), size).unwrap();
         let base_ptr = handler.base_ptr();
         let matrix = handler.matrix();
 
@@ -779,7 +779,7 @@ mod tests {
 
         // We use 500MB matrix to allocate all the buffers
         let size = 50 * 1024 * 1024;
-        let handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
+        let handler = core::AtomicMatrix::bootstrap(Some(String::from("m_s_test")), size).unwrap();
 
         let thread_count = 8;
         let allocs_per_second = 100_000;
@@ -870,7 +870,7 @@ mod tests {
         const THREADS: u32 = 8;
 
         let size = 50 * 1024 * 1024;
-        let handler = core::AtomicMatrix::bootstrap(Some(uuid::Uuid::new_v4()), size).unwrap();
+        let handler = core::AtomicMatrix::bootstrap(Some(String::from("f_h_test")), size).unwrap();
         let handler_arc = Arc::new(handler);
         let barrier = Arc::new(Barrier::new(THREADS as usize));
         let start_time = Instant::now();
@@ -896,7 +896,7 @@ mod tests {
                         rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
 
                         if rng % 10 < 7 && my_blocks.len() < 200 {
-                            let alloc_size = (rng % 512);
+                            let alloc_size = rng % 512;
                             if let Ok(ptr) = matrix.allocate(base_ptr, alloc_size as u32) {
                                 my_blocks.push(ptr);
                             }
