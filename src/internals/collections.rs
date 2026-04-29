@@ -6,7 +6,7 @@
 
 pub mod atomic_ringbuffer {
     use crate::{
-        handlers::{HandlerFunctions, MatrixHandler},
+        handlers::{HandlerFunctions, SharedHandler},
         matrix::core::RelativePtr,
     };
     use std::{
@@ -48,7 +48,7 @@ pub mod atomic_ringbuffer {
     /// It holds all the metadata related to the ring buffer registered in
     /// the block, as well as High-Level functions to safely read/write data
     /// in the buffer itself.
-    pub struct AtomicRingBuffer<'a> {
+    pub struct AtomicRingBuffer {
         _slots: usize,
         buf_size: usize,
         behaviour: Behaviour,
@@ -59,17 +59,17 @@ pub mod atomic_ringbuffer {
         tail: AtomicU32,
         has_message: AtomicBool,
         _is_full: AtomicBool,
-        handler_ref: &'a MatrixHandler,
+        handler_ref: SharedHandler,
     }
 
     // Safety: as the buffer inherits the zero-copy, lock-free traits from
     // the matrix by default, and not allowing direct manipulation through a
     // mut reference, it is safe to be shared across different threads with-
     // out causing race conditions (contentions are still implied).
-    unsafe impl Send for AtomicRingBuffer<'_> {}
-    unsafe impl Sync for AtomicRingBuffer<'_> {}
+    unsafe impl Send for AtomicRingBuffer {}
+    unsafe impl Sync for AtomicRingBuffer {}
 
-    impl<'a> AtomicRingBuffer<'a> {
+    impl<'a> AtomicRingBuffer {
         /// Internal helper function to move the current pointer forward in
         /// the buffer.
         ///
@@ -115,11 +115,11 @@ pub mod atomic_ringbuffer {
         /// The code will panic if it fails to allocate a buffer for the buffer.
         pub fn new<T>(
             slots: usize,
-            handler_ref: &'a MatrixHandler,
+            handler_ref: SharedHandler,
             behaviour: Behaviour,
         ) -> Option<&'a Self> {
             let buf_size = size_of::<T>();
-            let struct_size = size_of::<AtomicRingBuffer<'a>>();
+            let struct_size = size_of::<AtomicRingBuffer>();
             let size = struct_size + buf_size * slots;
 
             let rel_ptr = match handler_ref.allocate_raw(size as u32) {
@@ -134,7 +134,7 @@ pub mod atomic_ringbuffer {
             let header = unsafe { rel_ptr.resolve_header_mut(handler_ref.base_ptr()) };
 
             let atomic_rb_ptr = unsafe {
-                handler_ref.base_ptr().add(rel_ptr.offset() as usize) as *mut AtomicRingBuffer<'a>
+                handler_ref.base_ptr().add(rel_ptr.offset() as usize) as *mut AtomicRingBuffer
             };
 
             header.state.store(STATE_RINGBUFFER, Ordering::Relaxed);

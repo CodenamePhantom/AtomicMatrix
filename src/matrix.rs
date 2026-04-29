@@ -50,7 +50,7 @@ pub mod helpers {
     pub const STATE_ACKED: u32 = 2;
     pub const STATE_COALESCING: u32 = 3;
 
-    pub const HEADER_SPACE: u32 = std::mem::size_of::<core::BlockHeader>() as u32 + 16;
+    pub const HEADER_SPACE: u32 = std::mem::size_of::<core::BlockHeader>() as u32;
 
     /// A helper struct that provided the O(1) calculations to find the coordinates of
     /// a block that suits exactly the requested buffer size, or the next available one
@@ -95,6 +95,8 @@ pub mod helpers {
 }
 
 pub mod core {
+    use crate::prelude::HEADER_SPACE;
+
     use super::*;
 
     /// Header structure that is written at the beginning of each block/sector
@@ -108,7 +110,6 @@ pub mod core {
         pub state: AtomicU32,
         pub prev_phys: AtomicU32,
         pub next_free: AtomicU32,
-        pub prev_free: AtomicU32,
     }
 
     /// The structural core of the matrix.
@@ -121,13 +122,11 @@ pub mod core {
     /// The matrix is designed to be mapped directly into '/dev/shm". It starts with
     /// a 16-byte 'init_guard' followed by the struct itself, and then the sectorized
     /// raw memory blocks.
-    #[repr(C)]
+    #[repr(C, align(16))]
     pub struct AtomicMatrix {
-        pub id: String,
         pub fl_bitmap: AtomicU32,
         pub sl_bitmaps: [AtomicU32; 32],
         pub matrix: [[AtomicU32; 8]; 32],
-        pub mmap: MmapMut,
         pub sector_boundaries: [AtomicU32; 4],
         pub total_size: u32,
     }
@@ -162,7 +161,7 @@ pub mod core {
         ///
         /// ### Returns
         /// A static, lifetime specified, reference to the matrix struct.
-        fn init(ptr: *mut AtomicMatrix, id: String, size: u32) -> &'static mut Self {
+        fn init(ptr: *mut AtomicMatrix, size: u32) -> &'static mut Self {
             unsafe {
                 let matrix = &mut *ptr;
                 matrix.fl_bitmap.store(0, Ordering::Release);
@@ -172,7 +171,6 @@ pub mod core {
                         matrix.matrix[i][j].store(0, Ordering::Release);
                     }
                 }
-                matrix.id = id;
                 matrix.total_size = size;
                 matrix
             }
@@ -223,7 +221,7 @@ pub mod core {
                     )
                     .is_ok()
             {
-                let matrix = AtomicMatrix::init(matrix_ptr, path_id, size as u32);
+                let matrix = AtomicMatrix::init(matrix_ptr, size as u32);
 
                 let matrix_size = std::mem::size_of::<AtomicMatrix>();
                 current_offset = (16 + (matrix_size as u32)+ 15) & !15;
@@ -254,7 +252,8 @@ pub mod core {
             Ok(crate::handlers::MatrixHandler::new(
                 unsafe { &mut *matrix_ptr }, 
                 mmap, 
-                current_offset
+                current_offset,
+                path_id,
             ))
         }
 
@@ -363,8 +362,8 @@ pub mod core {
             unsafe {
                 let current_offset = ptr.offset();
                 let mut current_header = ptr.resolve_mut(base_ptr);
-                let mut total_size = current_header.size.load(Ordering::Acquire);
-                if total_size < 32 {
+                let mut total_size = current_header.size.swap(0, Ordering::AcqRel);
+                if total_size < HEADER_SPACE {
                     return;
                 }
 
@@ -583,7 +582,7 @@ pub mod core {
                 }
             }
 
-            self.mmap.len() as u32
+            self.total_size as u32
         }
     }
 
@@ -750,11 +749,13 @@ mod tests {
 
             let h_merged = ptr_b.resolve_header(base_ptr);
             assert_eq!(h_merged.state.load(Ordering::Acquire), helpers::STATE_FREE);
-            assert_eq!(h_merged.size.load(Ordering::Acquire), 448);
+            assert_eq!(h_merged.size.load(Ordering::Acquire), (64 * 3) + (3 * helpers::HEADER_SPACE));
 
             let h_e = ptr_e.resolve_header(base_ptr);
             assert_eq!(h_e.state.load(Ordering::Acquire), helpers::STATE_ALLOCATED);
-        }
+        };
+
+        handler.die().unwrap();
     }
 
     /// ----------------------------------------------------------------------------
@@ -764,7 +765,7 @@ mod tests {
     /// me. Before shipping, running these are explicitly required.
     /// ----------------------------------------------------------------------------
 
-    /// Run 8.000.000 allocations in parallel (1.000.000 each) to test if the matrix
+    /// Run 800.000 allocations in parallel (100.000 each) to test if the matrix
     /// can hold without race conditions.
     #[test]
     #[ignore]
@@ -778,8 +779,8 @@ mod tests {
         use std::collections::HashSet;
 
         // We use 500MB matrix to allocate all the buffers
-        let size = 50 * 1024 * 1024;
-        let handler = core::AtomicMatrix::bootstrap(Some(String::from("m_s_test")), size).unwrap();
+        let size = 62 * 1024 * 1024;
+        let handler = core::AtomicMatrix::bootstrap(None, size).unwrap();
 
         let thread_count = 8;
         let allocs_per_second = 100_000;
@@ -789,25 +790,28 @@ mod tests {
         let fail_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
         let mut handles = vec![];
+        static USED_SIZE: AtomicU32 = AtomicU32::new(0);
 
         // Fuck the matrix! GO GO GO
         for _ in 0..thread_count {
             let b = Arc::clone(&barrier);
-            let base_addr = handler.base_ptr() as usize;
-            let matrix_addr = handler.matrix() as *const core::AtomicMatrix as usize;
+            let us_ref = &USED_SIZE;
+            let s_handler = handler.share();
             let fail_count_clone = Arc::clone(&fail_count);
 
             handles.push(
                 thread::spawn(move || {
-                    let base_ptr = base_addr as *mut u8;
-                    let matrix = unsafe { &*(matrix_addr as *const core::AtomicMatrix) };
+
                     let mut my_offsets = Vec::new();
 
                     b.wait();
 
                     for _ in 0..allocs_per_second {
                         for _ in 0..10 {
-                            if let Ok(rel_ptr) = matrix.allocate(base_ptr, 64) {
+                            if let Ok(rel_ptr) = s_handler.matrix().allocate(s_handler.base_ptr(), 64) {
+                                let h = unsafe { rel_ptr.resolve_header(s_handler.base_ptr()) };
+                                us_ref.fetch_add(h.size.load(Ordering::Relaxed), Ordering::Release);
+
                                 my_offsets.push(rel_ptr.offset());
                                 break;
                             }
@@ -832,9 +836,12 @@ mod tests {
 
         // We allow for a 0.5% failure marging, as this stress test does not account for deallocations.
         let success_percentage = ((thread_count * allocs_per_second) as f64) * 0.995;
+        let used_size = USED_SIZE.load(Ordering::Relaxed) / 1024 / 1024;
 
         // Assert we can obtain at least 99.5% of the expected allocations without collisions, which would
         // indicate a potential race condition.
+        println!("{} MB used", used_size);
+        println!("Threshold: {}", success_percentage);
         assert!(
             total_obtained >= (success_percentage as usize),
             "Total allocations should match expected count"
@@ -850,6 +857,8 @@ mod tests {
             thread_count,
             fail_count.load(Ordering::Relaxed)
         );
+
+        handler.die().unwrap();
     }
 
     /// Test if the matrix can hold 10 minutes of 8 threads executing random alloc
@@ -952,5 +961,7 @@ mod tests {
 
         assert!(entrophy_percentage < 0.001, "Excessive Fragmentation");
         assert!(mops > 1.0, "Throughput regression: {:.2} Mop/s", mops);
+
+        handler_arc.die().unwrap();
     }
 }

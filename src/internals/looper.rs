@@ -31,8 +31,8 @@ use crate::matrix::core::*;
 /// It encapsules a reference to the [`MatrixHandler`] API and implements the
 /// std Iterator trait native from rust, with a few logic adaptations to run
 /// inside the matrix life-cycle.
-pub struct Looper<'a> {
-    handler_ref: &'a MatrixHandler,
+pub struct Looper {
+    handler_ref: SharedHandler,
     current_offset: u32,
     end_offset: u32,
 }
@@ -42,15 +42,15 @@ pub struct Looper<'a> {
 /// It provides operation abstractions on the [`RelativePtr`] and the
 /// [`MatrixHandler`] objects related to the context of iterating over the
 /// matrix.
-pub struct LoopWindow<'a> {
+pub struct LoopWindow {
     rel_ptr: RelativePtr<u8>,
-    handler: &'a MatrixHandler,
+    handler: SharedHandler,
 }
 
 /// Default Iterator implementation on [`Looper`], with the addition
 /// of using the matrix chain as next instead of normal indexes.
-impl<'a> Iterator for Looper<'a> {
-    type Item = LoopWindow<'a>;
+impl<'a> Iterator for Looper {
+    type Item = LoopWindow;
 
     /// Queries the next block in the matrix based on the current item offset
     /// related to base_ptr() + the size of the block. If the size is 0 or the
@@ -81,12 +81,12 @@ impl<'a> Iterator for Looper<'a> {
     }
 }
 
-impl<'a> Looper<'a> {
+impl Looper {
     /// Creates a new [`Looper`] instance over the current handler.
     ///
     /// # Returns:
     /// An instance of Self.
-    pub fn new(handler_ref: &'a MatrixHandler) -> Self {
+    pub fn new(handler_ref: SharedHandler) -> Self {
         let len = (16 + (std::mem::size_of::<AtomicMatrix>() as u32) + 15) & !15;
         let end = handler_ref.matrix().sector_boundaries[0].load(Ordering::Acquire);
 
@@ -103,10 +103,10 @@ impl<'a> Looper<'a> {
 // The resolution to real pointer always goes through the handler, who
 // manages its own thread safety. No mutable state is contained in the
 // Struct.
-unsafe impl<'a> Send for LoopWindow<'a> {}
-unsafe impl<'a> Sync for LoopWindow<'a> {}
+unsafe impl Send for LoopWindow {}
+unsafe impl Sync for LoopWindow {}
 
-impl<'a> LoopWindow<'a> {
+impl<'a> LoopWindow {
     /// Creates a new [`LoopWindow`] instance of a record.
     ///
     /// # Params:
@@ -115,7 +115,7 @@ impl<'a> LoopWindow<'a> {
     ///
     /// # Returns:
     /// An instance of Self.
-    pub fn new(rel_ptr: RelativePtr<u8>, handler: &'a MatrixHandler) -> Self {
+    pub fn new(rel_ptr: RelativePtr<u8>, handler: SharedHandler) -> Self {
         Self { rel_ptr, handler }
     }
 

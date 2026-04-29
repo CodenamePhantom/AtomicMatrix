@@ -50,7 +50,10 @@
 //! production code as per the current state of its development. User discretion
 //! is advised
 
-use crate::prelude::*;
+use crate::{
+    internals::{collections::atomic_ringbuffer::*, looper},
+    prelude::*,
+};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 pub const STATE_FENCER: u32 = 10_001;
@@ -87,9 +90,9 @@ pub struct Config {
 
 pub struct ACL {
     owner: [u8; 16],
-    sector_id: u32,
-    version: SectorModel,
-    entry_count: u32,
+    _sector_id: u32,
+    _version: SectorModel,
+    _entry_count: u32,
     entries: [Option<ACLEntry>; MAX_ACL_ENTRIES],
 }
 
@@ -100,16 +103,18 @@ pub struct ACLEntry {
 }
 
 pub struct Fencer {
-    buf_size: u32,
+    _buf_size: u32,
     sect_attached: AtomicU32,
-    bal_attached: AtomicU32,
+    _bal_attached: AtomicU32,
     guard_range: (AtomicU32, AtomicU32),
     config: Config,
 }
 
 pub struct RouteGuard<'a> {
     private_id: &'a str,
-    fencer_metadata: u32,
+    acl: &'static ACL,
+    acl_offset: u32,
+    inbox: &'a AtomicRingBuffer,
     sector_handler: MatrixHandler,
 }
 
@@ -149,8 +154,8 @@ impl Fencer {
                     fencer,
                     Fencer {
                         sect_attached: AtomicU32::new(0),
-                        bal_attached: AtomicU32::new(0),
-                        buf_size: HEADER_SPACE + acl_size,
+                        _bal_attached: AtomicU32::new(0),
+                        _buf_size: HEADER_SPACE + acl_size,
                         guard_range: (routeg_range_1, routeg_range_2),
                         config: cfg,
                     },
@@ -193,18 +198,24 @@ impl Fencer {
         }
 
         let handler = AtomicMatrix::bootstrap(Some(id.to_string()), size).unwrap();
+        let rb = match AtomicRingBuffer::new::<u32>(1024, handler.share(), Behaviour::Drop) {
+            Some(v) => v,
+            None => {
+                return Err(FencerErrors::SectorSpawnError(String::from(
+                    "Failed to create inbox",
+                )))
+            }
+        };
 
         let guard = RouteGuard {
             private_id: priv_id,
-            fencer_metadata: block.pointer.offset(),
+            acl: unsafe { dataplane.read::<ACL>(&block) },
+            acl_offset: block.pointer.offset(),
             sector_handler: handler,
+            inbox: rb,
         };
 
         Ok(guard)
-    }
-
-    pub fn register_sector(&self) -> RouteGuard<'_> {
-        unimplemented!()
     }
 
     pub fn generate_acl<'a>(
@@ -224,9 +235,10 @@ impl Fencer {
             owner_tag[i] = *v;
         }
         if perms.len() > MAX_ACL_ENTRIES {
-            return Err(FencerErrors::SectorSpawnError(
-                    format!("Too many ACL entries (max {})", MAX_ACL_ENTRIES)
-            ))
+            return Err(FencerErrors::SectorSpawnError(format!(
+                "Too many ACL entries (max {})",
+                MAX_ACL_ENTRIES
+            )));
         }
 
         let profile_name = prof.unwrap_or_else(|| self.config.default_profile);
@@ -238,14 +250,19 @@ impl Fencer {
 
         Ok(ACL {
             owner: owner_tag,
-            sector_id: id,
-            version: profile_name,
-            entry_count: perms.len() as u32,
+            _sector_id: id,
+            _version: profile_name,
+            _entry_count: perms.len() as u32,
             entries,
         })
     }
 
-    pub fn get_sector<'a>(&self, handler: &MatrixHandler, sec_id: u32, priv_id: &'a str) -> Result<RouteGuard<'a>, FencerErrors> {
+    pub fn get_sector<'a>(
+        &self,
+        handler: &MatrixHandler,
+        sec_id: u32,
+        priv_id: &'a str,
+    ) -> Result<RouteGuard<'a>, FencerErrors> {
         let block = Block::<ACL>::from_offset(handler.matrix().query(sec_id).offset());
         let mut module_tag = [0; 16];
 
@@ -259,48 +276,142 @@ impl Fencer {
 
         let acl_data = unsafe { handler.read(&block) };
 
-        let entry = acl_data.entries
+        let entry = acl_data
+            .entries
             .iter()
             .filter_map(|e| e.as_ref())
             .find(|e| e.module_id == module_tag);
         let perms = match entry {
             Some(e) => e.permissions,
             None if acl_data.owner == module_tag => PERM_READ | PERM_WRITE | PERM_OWN,
-            None => return Err(FencerErrors::SectorAttachingError)
+            None => return Err(FencerErrors::SectorAttachingError),
         };
 
         if perms & PERM_READ == 0 {
-            return Err(FencerErrors::UnauthorizedRead)
+            return Err(FencerErrors::UnauthorizedRead);
         }
 
         let sect_handler = AtomicMatrix::bootstrap(Some(sec_id.to_string()), 0).unwrap();
+        let m_iter = looper::Looper::new(sect_handler.share());
+
+        let mut iter_obj = m_iter.filter(|lv| {
+            let state = lv.view_header().state.load(Ordering::Relaxed);
+            if state == STATE_RINGBUFFER {
+                true
+            } else {
+                false
+            }
+        });
+
+        let rb = match iter_obj.next() {
+            Some(v) => v,
+            None => return Err(FencerErrors::SectorAttachingError),
+        };
 
         Ok(RouteGuard {
             private_id: priv_id,
-            fencer_metadata: block.pointer.offset(),
+            acl: unsafe { handler.read::<ACL>(&block) },
+            acl_offset: block.pointer.offset(),
             sector_handler: sect_handler,
+            inbox: rb.view_data_as::<AtomicRingBuffer>(),
         })
     }
 }
 
 impl<'a> RouteGuard<'a> {
-    pub fn route_msg(&self) -> Result<(), FencerErrors> {
-        unimplemented!()
+    pub fn route_msg<T>(&self, msg: T) -> Result<(), FencerErrors> {
+        if !self.check_permissions(PERM_WRITE) {
+            return Err(FencerErrors::UnauthorizedWrite);
+        };
+
+        let mut block = match self.sector_handler.allocate::<T>() {
+            Ok(v) => v,
+            Err(e) => return Err(FencerErrors::SectorError(format!("{:?}", e))),
+        };
+
+        unsafe { self.sector_handler.write(&mut block, msg) };
+
+        match self.inbox.enqueue::<u32>(block.pointer.offset()) {
+            Ok(_) => return Ok(()),
+            Err(e) => return Err(FencerErrors::SectorError(format!("{:?}", e))),
+        };
     }
 
-    pub fn load_msg(&self) -> Result<(), FencerErrors> {
-        unimplemented!()
+    pub fn load_msg<T>(&self) -> Result<Option<&T>, FencerErrors> {
+        if !self.check_permissions(PERM_READ) {
+            return Err(FencerErrors::UnauthorizedRead);
+        };
+
+        let msg_offset = match self.inbox.dequeue::<u32>() {
+            Some(v) => v,
+            None => return Ok(None),
+        };
+
+        let msg_block = Block::<T>::from_offset(*msg_offset);
+        let msg = unsafe { self.sector_handler.read(&msg_block) };
+
+        return Ok(Some(msg));
     }
 
-    pub fn clear_sector(&self) {
-        unimplemented!()
+    pub fn clear_sector(&self) -> Result<(), FencerErrors> {
+        if !self.check_permissions(PERM_WRITE) {
+            return Err(FencerErrors::UnauthorizedWrite);
+        }
+
+        let m_iter = looper::Looper::new(self.sector_handler.share());
+
+        for view in m_iter {
+            if view.view_header().state.load(Ordering::Relaxed) != STATE_RINGBUFFER {
+                self.sector_handler
+                    .free_at(view.view_offset() - HEADER_SPACE);
+            } else {
+                continue;
+            };
+        }
+
+        Ok(())
     }
 
-    pub fn decommission_sector(&self) {
-        unimplemented!()
+    pub fn decommission_sector(&self, dataplane: &MatrixHandler) -> Result<(), FencerErrors> {
+        if !self.check_permissions(PERM_OWN) {
+            return Err(FencerErrors::SectorError(String::from(
+                "Sector cannot be decomission by someone other than Owner.",
+            )));
+        }
+        
+        dataplane.free_at(self.acl_offset);
+        match self.sector_handler.die() {
+            Ok(_) => Ok(()),
+            Err(e) => Err(FencerErrors::SectorError(format!("{:?}", e))),
+        }
     }
 
-    pub fn check_permissions(&self) -> bool {
-        unimplemented!()
+    pub fn get_permissions(&self, id: [u8; 16]) -> Result<ACLEntry, u8> {
+        for entry in self.acl.entries {
+            match entry {
+                Some(v) => {
+                    if v.module_id == id {
+                        return Ok(v);
+                    }
+                }
+                None => continue,
+            }
+        }
+
+        return Err(1);
+    }
+
+    fn check_permissions(&self, perm_check: u8) -> bool {
+        let hashed_id = self.sector_handler.hash_id(self.private_id);
+        match self.get_permissions(hashed_id) {
+            Ok(v) => {
+                if v.permissions & perm_check == 0 && v.permissions & PERM_OWN == 0 {
+                    return false;
+                }
+            }
+            Err(_) => return false,
+        };
+
+        true
     }
 }
