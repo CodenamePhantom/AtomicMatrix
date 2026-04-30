@@ -16,5 +16,5 @@ server = ["libc"]
 
 [dependencies]
 memmap2 = "0.9.10"
-uuid = { version = "1.23.0", features = ["serde", "v4"] }
+uuid = { version = "1.23.1", features = ["serde", "v4"] }
 libc = { version = "0.2", optional = true }
