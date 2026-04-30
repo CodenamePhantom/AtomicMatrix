@@ -1,0 +1,7 @@
+[package]
+name = "looper-showcase"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+atomic-matrix = "0.3"

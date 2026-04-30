@@ -53,9 +53,9 @@
 //! [`SharedHandler`] that can be sent to other threads. The original handler must
 //! outlive all shared handles derived from it.
 
-use std::sync::atomic::Ordering;
-use crate::matrix::core::{ AtomicMatrix, BlockHeader, RelativePtr };
+use crate::prelude::*;
 use memmap2::MmapMut;
+use std::sync::atomic::Ordering;
 
 /// Minimum state value available for user-defined lifecycles.
 /// States 0–48 are reserved for internal matrix and future framework use.
@@ -76,7 +76,10 @@ pub enum HandlerError {
     /// The block offset is outside the valid segment range.
     InvalidOffset(u32),
     /// Failed to unlink the main SHM file for unpredicted reasons.
-    SeppukuFailed { path: String, reason: std::io::Error},
+    SeppukuFailed {
+        path: String,
+        reason: std::io::Error,
+    },
 }
 
 /// A typed handle to an allocated block in the matrix.
@@ -112,6 +115,7 @@ pub struct Block<T> {
 /// `SharedHandler` exposes the same allocation, I/O, lifecycle, and escape
 /// hatch API as [`MatrixHandler`] via the [`HandlerFunctions`] trait —
 /// it does not own the mmap.
+#[derive(Clone, Copy)]
 pub struct SharedHandler {
     matrix_addr: usize,
     base_addr: usize,
@@ -129,6 +133,7 @@ pub struct MatrixHandler {
     matrix: &'static mut AtomicMatrix,
     mmap: MmapMut,
     first_block_offset: u32,
+    id: String,
 }
 
 impl<T> Block<T> {
@@ -137,7 +142,9 @@ impl<T> Block<T> {
     /// The offset must point past the [`BlockHeader`] (i.e. `header_offset + 32`).
     /// Type `T` is introduced here — the matrix has no knowledge of it.
     pub(crate) fn from_offset(offset: u32) -> Self {
-        Self { pointer: RelativePtr::new(offset) }
+        Self {
+            pointer: RelativePtr::new(offset),
+        }
     }
 }
 
@@ -146,9 +153,15 @@ impl MatrixHandler {
     pub(crate) fn new(
         matrix: &'static mut AtomicMatrix,
         mmap: MmapMut,
-        first_block_offset: u32
+        first_block_offset: u32,
+        id: String,
     ) -> Self {
-        Self { matrix, mmap, first_block_offset }
+        Self {
+            matrix,
+            mmap,
+            first_block_offset,
+            id
+        }
     }
 
     /// Produces a lightweight [`SharedHandler`] that can be sent to other threads.
@@ -176,18 +189,15 @@ impl MatrixHandler {
     /// Existing mapping remains valid until the handlers are dropped; this
     /// only removes the filesystem entry, preventing new attachments.
     pub fn die(&self) -> Result<(), HandlerError> {
-        let id = self.matrix().id;
-        let path = format!("/dev/shm/{}", id);
+        let id = &self.id;
+        let path = format!("/dev/shm/matrix-{}", id);
 
         match std::fs::remove_file(&path) {
-            Ok(_) => {},
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                return Err(HandlerError::SeppukuFailed {
-                    path, 
-                    reason: e,
-                });
-            },
+                return Err(HandlerError::SeppukuFailed { path, reason: e });
+            }
         };
 
         Ok(())
@@ -195,10 +205,18 @@ impl MatrixHandler {
 }
 
 impl HandlerFunctions for MatrixHandler {
-    fn base_ptr(&self) -> *const u8 { self.mmap.as_ptr() }
-    fn matrix(&self) -> &AtomicMatrix { self.matrix }
-    fn first_block_offset(&self) -> u32 { self.first_block_offset }
-    fn segment_size(&self) -> u32 { self.mmap.len() as u32 }
+    fn base_ptr(&self) -> *const u8 {
+        self.mmap.as_ptr()
+    }
+    fn matrix(&self) -> &AtomicMatrix {
+        self.matrix
+    }
+    fn first_block_offset(&self) -> u32 {
+        self.first_block_offset
+    }
+    fn segment_size(&self) -> u32 {
+        self.mmap.len() as u32
+    }
 }
 
 // Safety: AtomicMatrix uses only atomic operations internally.
@@ -207,12 +225,18 @@ unsafe impl Send for SharedHandler {}
 unsafe impl Sync for SharedHandler {}
 
 impl HandlerFunctions for SharedHandler {
-    fn base_ptr(&self) -> *const u8 { self.base_addr as *const u8 }
+    fn base_ptr(&self) -> *const u8 {
+        self.base_addr as *const u8
+    }
     fn matrix(&self) -> &AtomicMatrix {
         unsafe { &*(self.matrix_addr as *const AtomicMatrix) }
     }
-    fn first_block_offset(&self) -> u32 { self.first_block_offset }
-    fn segment_size(&self) -> u32 { self.segment_size }
+    fn first_block_offset(&self) -> u32 {
+        self.first_block_offset
+    }
+    fn segment_size(&self) -> u32 {
+        self.segment_size
+    }
 }
 
 /// Defines the core interaction surface for any matrix handle.
@@ -261,8 +285,6 @@ pub trait HandlerFunctions {
             .map(|ptr| Block::from_offset(ptr.offset()))
             .map_err(HandlerError::AllocationFailed)
     }
-
-
 
     /// Allocates a raw byte block of the given size.
     ///
@@ -327,7 +349,7 @@ pub trait HandlerFunctions {
     /// The block is invalid after this call — using it in any way is
     /// undefined behaviour.
     fn free<T>(&self, block: Block<T>) {
-        let header_ptr = RelativePtr::<BlockHeader>::new(block.pointer.offset() - 32);
+        let header_ptr = RelativePtr::<BlockHeader>::new(block.pointer.offset() - HEADER_SPACE);
         self.matrix().ack(&header_ptr, self.base_ptr());
     }
 
@@ -357,7 +379,8 @@ pub trait HandlerFunctions {
             return Err(HandlerError::ReservedStatus(state));
         }
         unsafe {
-            block.pointer
+            block
+                .pointer
                 .resolve_header_mut(self.base_ptr())
                 .state
                 .store(state, Ordering::Release);
@@ -373,7 +396,8 @@ pub trait HandlerFunctions {
     /// payload.
     fn get_state<T>(&self, block: &Block<T>, order: Ordering) -> u32 {
         unsafe {
-            block.pointer
+            block
+                .pointer
                 .resolve_header(self.base_ptr())
                 .state
                 .load(order)
@@ -401,13 +425,14 @@ pub trait HandlerFunctions {
         block: &Block<T>,
         expected: u32,
         next: u32,
-        success_order: Ordering
+        success_order: Ordering,
     ) -> Result<u32, HandlerError> {
         if next < USER_STATE_MIN {
             return Err(HandlerError::ReservedStatus(next));
         }
         unsafe {
-            block.pointer
+            block
+                .pointer
                 .resolve_header_mut(self.base_ptr())
                 .state
                 .compare_exchange(expected, next, success_order, Ordering::Relaxed)
@@ -429,5 +454,30 @@ pub trait HandlerFunctions {
     /// direct access to block memory beyond what the typed API provides.
     fn raw_base_ptr(&self) -> *const u8 {
         self.base_ptr()
+    }
+
+    fn hash_id(&self, id: &str) -> [u8; 16] {
+        let mut h1: u64 = 0x9368517673b203ef;
+        let mut h2: u64 = 0x5851f42d4c957f2d;
+
+        for &b in id.as_bytes() {
+            h1 ^= b as u64;
+            h1 = h1.wrapping_mul(0xff51afd7ed558ccd);
+            h1 ^= h2.rotate_right(17); // cross-mix
+            h2 ^= b as u64;
+            h2 = h2.wrapping_mul(0xc4ceb9fe1a85ec53);
+            h2 ^= h1.rotate_right(31); // cross-mix
+        }
+
+        // finalization — spread remaining bit patterns
+        h1 ^= id.len() as u64;
+        h2 ^= id.len() as u64;
+        h1 = h1.wrapping_add(h2);
+        h2 = h2.wrapping_add(h1);
+
+        let mut out = [0u8; 16];
+        out[..8].copy_from_slice(&h1.to_le_bytes());
+        out[8..].copy_from_slice(&h2.to_le_bytes());
+        out
     }
 }
