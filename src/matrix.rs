@@ -3,13 +3,14 @@
 //! This module implements a high-velocity, lock-free memory arena designed for
 //! ultra-low latency IPC (Inter-Process Communication).
 //!
-//! # Theory of Operation: The Propagation Principle of Atomic Coalescence
+//! # Theory of Operation
 //! Unlike traditional allocators that use centralized mutexes or complex
 //! background garbage collection, the **AtomicMatrix** treats memory
 //! fragmentation as a fluid dynamics problem.
 //!
 //! 1. **Kinetic Healing:** Freeing a block triggers a "Ripple" ('coalesce')
 //! that propagates through the sector.
+//!
 //! 2. **Monotonicity:** Ripples only move backward (towards the sector origin)
 //! to prevent circular atomic dependencies and deadlocks.
 //! 3. **Permissive Concurrency:** If a thread encounters contention, it skips the
@@ -19,26 +20,23 @@
 //! # Memory Topography
 //! The matrix is laid out linearly in a shared memory segment:
 //! ```text
-//! [ Init Guard (16b) ] [ AtomicMatrix Struct ] [ Padding ] [ Sector 0 ] [ Sector 1 ] ...
+//! [ Init Guard (16b) ] [ AtomicMatrix Struct ] [ Padding ] [ Data Sector ]
 //! ```
-//! Each **Sector** acts as a self-contained fault domain with its own boundary,
-//! preventing local fragmentation from "bleeding" into the entire matrix.
 //!
 //! # Safety & Atomicity
 //! All state transitions follow a strict 'STATE_FREE -> STATE_ALLOCATED ->
 //! STATE_ACKED -> STATE_COALESCING' lifecycle. Hardware-level memory fences
-//! (std::sync::atomic::fence) are utilized to ensure visibility across 16+ CPU
+//! (std::sync::atomic::fence) are utilized to ensure visibility across all CPU
 //! cores without locking.
 
-use std::sync::atomic::{ AtomicU32, Ordering, fence };
-use std::marker::PhantomData;
-use std::fs::{ OpenOptions };
 use memmap2::MmapMut;
-use uuid::Uuid;
+use std::fs::OpenOptions;
+use std::marker::PhantomData;
+use std::sync::atomic::{AtomicU32, Ordering, fence};
 
 pub mod helpers {
     use super::*;
-    
+
     /// System initialization flags
     pub const SYS_UNINITIALIZED: u32 = 0;
     pub const SYS_FORMATTING: u32 = 1;
@@ -65,6 +63,7 @@ pub mod helpers {
         /// scaling of large blocks.
         ///
         /// ### Mapping Logic:
+        ///
         /// - **Linear (Small):** For sizes < 128, it uses a fixed FL (0) and 16-byte SL
         ///   subdivisions. This minimizes fragmentation for tiny objects.
         /// - **Logarithmic (Large):** For sizes >= 128, FL is the power of 2 (determined via
@@ -78,7 +77,7 @@ pub mod helpers {
         /// Indices are clamped to `(31, 7)` to prevent overflow in the matrix bitmask.
         ///
         /// # Arguments
-        /// * `size` - The total byte size of the memory block.
+        /// @size: The total byte size of the memory block.
         ///
         /// # Returns
         /// A tuple of `(fl, sl)` indices.
@@ -95,6 +94,8 @@ pub mod helpers {
 }
 
 pub mod core {
+    use crate::internals::error_collection::MatrixErrors;
+    use crate::internals::collections::uid_lite::{self, generate_uuid};
     use crate::prelude::HEADER_SPACE;
 
     use super::*;
@@ -119,6 +120,7 @@ pub mod core {
     /// a custom **Kinetic Coalescing** logic.
     ///
     /// # Memory Layout
+    ///
     /// The matrix is designed to be mapped directly into '/dev/shm". It starts with
     /// a 16-byte 'init_guard' followed by the struct itself, and then the sectorized
     /// raw memory blocks.
@@ -127,7 +129,7 @@ pub mod core {
         pub fl_bitmap: AtomicU32,
         pub sl_bitmaps: [AtomicU32; 32],
         pub matrix: [[AtomicU32; 8]; 32],
-        pub sector_boundaries: [AtomicU32; 4],
+        pub sector_boundaries: AtomicU32,
         pub total_size: u32,
     }
 
@@ -146,8 +148,6 @@ pub mod core {
         _marker: PhantomData<T>,
     }
 
-    
-
     impl AtomicMatrix {
         /// Initialized the matrix struct and returns it.
         ///
@@ -156,7 +156,6 @@ pub mod core {
         ///
         /// ### Params
         /// @ptr: The pointer to the beginning of the matrix segment \
-        /// @id: The ID of this matrix instance \
         /// @size: The total size of the SHM allocation
         ///
         /// ### Returns
@@ -183,48 +182,75 @@ pub mod core {
         /// to the caller.
         ///
         /// ### Params:
-        /// @id: The ID of a new or existing matrix. If one is provided, will skip 
+        /// @id: The ID of a new or existing matrix. If one is provided, will skip
         /// formatting and just bind to it \
         /// @size: The SHM allocation size
         ///
         /// ### Returns
-        /// The matrix handler api, or an error to be handled
+        /// The matrix handler api, or a [`MatrixErrors`]
         pub fn bootstrap(
             id: Option<String>,
-            size: usize
-        ) -> Result<crate::handlers::MatrixHandler, String> {
-            let path_id = id.unwrap_or_else(|| { Uuid::new_v4().to_string() });
+            size: usize,
+        ) -> Result<crate::internals::handlers::MatrixHandler, MatrixErrors> {
+            let mut retry_count = 0;
+
+            let path_id = id.unwrap_or_else(|| generate_uuid());
             let path = format!("/dev/shm/matrix-{}", path_id);
-            let file = OpenOptions::new()
+            let file = match OpenOptions::new()
                 .read(true)
                 .write(true)
                 .create(true)
                 .open(&path)
-                .map_err(|e| e.to_string())?;
+            {
+                Ok(v) => v,
+                Err(e) => {
+                    return Err(MatrixErrors::MatrixInitializationError(format!(
+                        "Failed to create SHM file: {}",
+                        e
+                    )));
+                }
+            };
 
-            file.set_len(size as u64).map_err(|e| e.to_string())?;
+            match file.set_len(size as u64) {
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(MatrixErrors::MatrixInitializationError(format!(
+                        "Failed to set matrix physical length: {}",
+                        e
+                    )));
+                }
+            };
 
-            let mut mmap = unsafe { MmapMut::map_mut(&file).map_err(|e| e.to_string())? };
+            let mut mmap = unsafe {
+                match MmapMut::map_mut(&file) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        return Err(MatrixErrors::MatrixInitializationError(format!(
+                            "Failed to create vmem map from the SHM file: {}",
+                            e
+                        )));
+                    }
+                }
+            };
             let base_ptr = mmap.as_mut_ptr();
 
             let init_guard = unsafe { &*(base_ptr as *const AtomicU32) };
             let matrix_ptr = unsafe { base_ptr.add(16) as *mut AtomicMatrix };
             let mut current_offset: u32 = 0;
 
-            if
-                init_guard
-                    .compare_exchange(
-                        helpers::SYS_UNINITIALIZED,
-                        helpers::SYS_FORMATTING,
-                        Ordering::SeqCst,
-                        Ordering::Relaxed
-                    )
-                    .is_ok()
+            if init_guard
+                .compare_exchange(
+                    helpers::SYS_UNINITIALIZED,
+                    helpers::SYS_FORMATTING,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
             {
                 let matrix = AtomicMatrix::init(matrix_ptr, size as u32);
 
                 let matrix_size = std::mem::size_of::<AtomicMatrix>();
-                current_offset = (16 + (matrix_size as u32)+ 15) & !15;
+                current_offset = (16 + (matrix_size as u32) + 15) & !15;
                 let remaining_size = size - (current_offset as usize);
 
                 let (fl, sl) = helpers::Mapping::find_indices(remaining_size as u32);
@@ -240,18 +266,25 @@ pub mod core {
                 header.next_free.store(0, Ordering::Release);
 
                 matrix.insert_free_block(base_ptr, current_offset, fl, sl);
-                matrix.sector_boundaries[0].store(size as u32, Ordering::Release);
+                matrix
+                    .sector_boundaries
+                    .store(size as u32, Ordering::Release);
 
                 init_guard.store(helpers::SYS_READY, Ordering::SeqCst);
             } else {
                 while init_guard.load(Ordering::Acquire) != helpers::SYS_READY {
-                    std::hint::spin_loop();
+                    if retry_count >= 512 {
+                        return Err(MatrixErrors::MatrixAttachingError);
+                    } else {
+                        retry_count += 1;
+                        std::hint::spin_loop();
+                    }
                 }
             }
 
-            Ok(crate::handlers::MatrixHandler::new(
-                unsafe { &mut *matrix_ptr }, 
-                mmap, 
+            Ok(crate::internals::handlers::MatrixHandler::new(
+                unsafe { &mut *matrix_ptr },
+                mmap,
                 current_offset,
                 path_id,
             ))
@@ -272,8 +305,12 @@ pub mod core {
         /// @size: The allocation size of the block
         ///
         /// ### Returns:
-        /// Either the relative pointer to the allocated block, or the OOM Contention flag.
-        pub fn allocate(&self, base_ptr: *const u8, size: u32) -> Result<RelativePtr<u8>, String> {
+        /// Either the relative pointer to the allocated block, or a [`MatrixErrors`].
+        pub fn allocate(
+            &self,
+            base_ptr: *const u8,
+            size: u32,
+        ) -> Result<RelativePtr<u8>, MatrixErrors> {
             let size = (size + 15) & !15;
             let size = size.max(32);
             let (fl, sl) = helpers::Mapping::find_indices(size);
@@ -288,37 +325,35 @@ pub mod core {
                             if total_size >= size + helpers::HEADER_SPACE {
                                 let rem_size = total_size - (size + helpers::HEADER_SPACE);
                                 let next_off = offset + size + helpers::HEADER_SPACE;
-                                let next_h = &mut *(
-                                    base_ptr.add(next_off as usize) as *mut BlockHeader
-                                );
+                                let next_h =
+                                    &mut *(base_ptr.add(next_off as usize) as *mut BlockHeader);
 
                                 next_h.size.store(rem_size, Ordering::Release);
                                 next_h.state.store(helpers::STATE_FREE, Ordering::Release);
                                 next_h.prev_phys.store(offset, Ordering::Release);
                                 next_h.next_free.store(0, Ordering::Release);
 
-                                header.size.store(size + helpers::HEADER_SPACE, Ordering::Release);
+                                header
+                                    .size
+                                    .store(size + helpers::HEADER_SPACE, Ordering::Release);
                                 fence(Ordering::SeqCst);
 
                                 let (r_fl, r_sl) = helpers::Mapping::find_indices(rem_size);
                                 self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
                             }
-                            header.state.store(helpers::STATE_ALLOCATED, Ordering::Release);
+                            header
+                                .state
+                                .store(helpers::STATE_ALLOCATED, Ordering::Release);
                             return Ok(RelativePtr::new(offset + helpers::HEADER_SPACE));
                         }
                     }
                 }
                 std::hint::spin_loop();
             }
-            Err("OOM: Contention".into())
+            Err(MatrixErrors::OutOfMemory)
         }
 
-        /// Acknowledges the freedon of a block and pushes it to the to_be_freed queue.
-        ///
-        /// If the to_be_freed queue is full, it will imediatelly trigger the drainage
-        /// of the queue and coalesce every block present before trying to push the
-        /// newly ack block into the queue. If there is space available, simply push
-        /// it and move on
+        /// Acknowledges the freedom of a block and pushes it to be coalesced.
         ///
         /// ### Params:
         /// @ptr: The relative pointer of the block to acknowledge \
@@ -331,6 +366,24 @@ pub mod core {
             }
 
             self.coalesce(ptr, base_ptr);
+        }
+
+        /// Acknowledges the freedom of a block without triggering the coalescing procedure.
+        ///
+        /// ### SAFETY
+        /// This function leaves a fragment in the matrix in hope someone will coleasce this
+        /// futher down the operation tree. Therefore, it is unsafe and should be used with
+        /// responsibility.
+        ///
+        /// ### Params:
+        /// @ptr: The relative pointer of the block to acknowledge \
+        /// @base_ptr: The offset from the start of the SHM segment.
+        pub unsafe fn fast_ack(&self, ptr: &RelativePtr<BlockHeader>, base_ptr: *const u8) {
+            unsafe {
+                let header = ptr.resolve_mut(base_ptr);
+
+                header.state.store(helpers::STATE_ACKED, Ordering::Release);
+            }
         }
 
         /// Tries to merge neighbouring blocks to the left until the end of the matrix is
@@ -376,27 +429,27 @@ pub mod core {
                         break;
                     }
 
-                    let prev_header_ptr = base_ptr.add(
-                        prev_phys_offset as usize
-                    ) as *mut BlockHeader;
+                    let prev_header_ptr =
+                        base_ptr.add(prev_phys_offset as usize) as *mut BlockHeader;
                     let prev_header = &mut *prev_header_ptr;
 
                     let res = prev_header.state.compare_exchange(
                         helpers::STATE_FREE,
                         helpers::STATE_COALESCING,
                         Ordering::Acquire,
-                        Ordering::Relaxed
+                        Ordering::Relaxed,
                     );
 
                     let claimed = if res.is_ok() {
                         true
                     } else {
-                        prev_header.state
+                        prev_header
+                            .state
                             .compare_exchange(
                                 helpers::STATE_ACKED,
                                 helpers::STATE_COALESCING,
                                 Ordering::Acquire,
-                                Ordering::Relaxed
+                                Ordering::Relaxed,
                             )
                             .is_ok()
                     };
@@ -415,7 +468,7 @@ pub mod core {
 
                         total_size = total_size
                             .checked_add(size_to_add)
-                            .expect("TidalRippleCoalescingError.");
+                            .expect("TidalRippleCoalescingError");
                         final_offset = prev_phys_offset;
                         current_header = prev_header;
                         self.remove_free_block(base_ptr, fl, sl).ok();
@@ -433,7 +486,9 @@ pub mod core {
                 }
 
                 current_header.size.store(total_size, Ordering::Release);
-                current_header.state.store(helpers::STATE_FREE, Ordering::Release);
+                current_header
+                    .state
+                    .store(helpers::STATE_FREE, Ordering::Release);
 
                 let (fl, sl) = helpers::Mapping::find_indices(total_size);
                 self.insert_free_block(base_ptr, final_offset, fl, sl);
@@ -506,19 +561,27 @@ pub mod core {
         /// ### Returns
         /// A result containing either the head of the newly acquired block, or an
         /// EmptyBitmapError
-        pub fn remove_free_block(&self, base_ptr: *const u8, fl: u32, sl: u32) -> Result<u32, String> {
+        pub fn remove_free_block(
+            &self,
+            base_ptr: *const u8,
+            fl: u32,
+            sl: u32,
+        ) -> Result<u32, MatrixErrors> {
             let head = &self.matrix[fl as usize][sl as usize];
             loop {
                 let off = head.load(Ordering::Acquire);
                 if off == 0 {
-                    return Err("EmptyBitmapError".into());
+                    return Err(MatrixErrors::EmptyBitmapError);
                 }
                 let next = unsafe {
-                    (*(base_ptr.add(off as usize) as *const BlockHeader)).next_free.load(
-                        Ordering::Acquire
-                    )
+                    (*(base_ptr.add(off as usize) as *const BlockHeader))
+                        .next_free
+                        .load(Ordering::Acquire)
                 };
-                if head.compare_exchange(off, next, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
+                if head
+                    .compare_exchange(off, next, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+                {
                     if next == 0 {
                         self.sl_bitmaps[fl as usize].fetch_and(!(1 << sl), Ordering::Release);
                         if self.sl_bitmaps[fl as usize].load(Ordering::Acquire) == 0 {
@@ -547,10 +610,9 @@ pub mod core {
                 loop {
                     let old = head.load(Ordering::Acquire);
                     h.next_free.store(old, Ordering::Release);
-                    if
-                        head
-                            .compare_exchange(old, offset, Ordering::AcqRel, Ordering::Relaxed)
-                            .is_ok()
+                    if head
+                        .compare_exchange(old, offset, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
                     {
                         break;
                     }
@@ -572,33 +634,36 @@ pub mod core {
         /// ### Returns:
         /// Either the boundary value of the current sector, or the end of the segment.
         pub fn sector_end_offset(&self, current_offset: u32) -> u32 {
-            for i in 0..4 {
-                let boundary = self.sector_boundaries[i].load(Ordering::Acquire);
-                if boundary == 0 {
-                    break;
-                }
-                if current_offset < boundary {
-                    return boundary;
-                }
+            let boundary = self.sector_boundaries.load(Ordering::Acquire);
+            if current_offset < boundary {
+                return boundary;
             }
 
             self.total_size as u32
         }
     }
 
+    /// # SAFETY
+    /// most functions inside of the Relative Pointer relies on math assuming that any
+    /// provided address is valid and functional inside the matrix. Therefore, the
+    /// caller must ensure that any operations executed are checked and valid before
+    /// proceeding.
     impl<T> RelativePtr<T> {
         /// Creates a new relative pointer based on the provided offset
         ///
-        /// This initializes the pointer with the PhantomData ownership over the type we
-        /// are passing the the parameter
+        /// This initializes the pointer with the PhantomData ownership over the type
+        /// passed in the parameter
         ///
         /// ### Params:
         /// @offset: The offset value to be wrapped in the pointer.
         ///
         /// ### Returns:
-        /// A instance of Self.
+        /// An instance of Self.
         pub fn new(offset: u32) -> Self {
-            Self { offset, _marker: PhantomData }
+            Self {
+                offset,
+                _marker: PhantomData,
+            }
         }
 
         /// Returns the offset value in the pointer
@@ -617,7 +682,10 @@ pub mod core {
         /// ### Returns:
         /// A life time speficied reference to the header of this block
         pub unsafe fn resolve_header<'a>(&self, base_ptr: *const u8) -> &'a BlockHeader {
-            unsafe { &*(base_ptr.add((self.offset as usize) - helpers::HEADER_SPACE as usize) as *mut BlockHeader) }
+            unsafe {
+                &*(base_ptr.add((self.offset as usize) - helpers::HEADER_SPACE as usize)
+                    as *mut BlockHeader)
+            }
         }
 
         /// Resolves the header based on the base_ptr of the current caller process.
@@ -631,7 +699,10 @@ pub mod core {
         /// ### Returns:
         /// A life time speficied mutable reference to the header of this block
         pub unsafe fn resolve_header_mut<'a>(&self, base_ptr: *const u8) -> &'a mut BlockHeader {
-            unsafe { &mut *(base_ptr.add((self.offset as usize) - helpers::HEADER_SPACE as usize) as *mut BlockHeader) }
+            unsafe {
+                &mut *(base_ptr.add((self.offset as usize) - helpers::HEADER_SPACE as usize)
+                    as *mut BlockHeader)
+            }
         }
 
         /// Resolves the block scope based on the base_ptr of the current caller process.
@@ -662,18 +733,22 @@ pub mod core {
             unsafe { &mut *(base_ptr.add(self.offset as usize) as *mut T) }
         }
 
+        /// Writes bytes to the pointer data section.
+        ///
+        /// ### Params:
+        /// @base_ptr: The offset from the start of the SHM segment.
+        /// @value: The value to be written into the pointer.
         pub unsafe fn write(&self, base_ptr: *const u8, value: T) {
             unsafe { std::ptr::write(self.resolve_mut(base_ptr), value) }
         }
     }
-
-    
 }
 
 #[cfg(test)]
 mod tests {
-    use crate::matrix::core::{ BlockHeader, RelativePtr };
-    use crate::handlers::HandlerFunctions;
+    use crate::internals::collections::memory_scale;
+    use crate::internals::handlers::HandlerFunctions;
+    use crate::matrix::core::{BlockHeader, RelativePtr};
 
     use super::*;
 
@@ -693,8 +768,9 @@ mod tests {
     /// blocks on the correct bitmaps.
     #[test]
     fn test_initial_bootstrap() {
-        let size = 1024 * 1024;
-        let handler = core::AtomicMatrix::bootstrap(Some(String::from("bootstrap_test")), size).unwrap();
+        let size = memory_scale::two::MB;
+        let handler =
+            core::AtomicMatrix::bootstrap(Some(String::from("bootstrap_test")), size).unwrap();
 
         let bitmap = handler.matrix().fl_bitmap.load(Ordering::Acquire);
 
@@ -704,7 +780,7 @@ mod tests {
     /// Test allocation and sppliting logic by comparing the size of our buffer.
     #[test]
     fn test_allocation_and_spliting() {
-        let size = 1024 * 1024;
+        let size = memory_scale::two::MB;
         let handler = core::AtomicMatrix::bootstrap(Some(String::from("a_s_test")), size).unwrap();
         let base_ptr = handler.base_ptr();
         let matrix = handler.matrix();
@@ -714,15 +790,21 @@ mod tests {
 
             let header = rel_ptr.resolve_header(base_ptr);
 
-            assert_eq!(header.size.load(Ordering::Acquire), 64 + helpers::HEADER_SPACE);
-            assert_eq!(header.state.load(Ordering::Acquire), helpers::STATE_ALLOCATED);
+            assert_eq!(
+                header.size.load(Ordering::Acquire),
+                64 + helpers::HEADER_SPACE
+            );
+            assert_eq!(
+                header.state.load(Ordering::Acquire),
+                helpers::STATE_ALLOCATED
+            );
         }
     }
 
     /// Test coalesce logic to see if blocks will merge correctly.
     #[test]
     fn test_ack_and_coalesce() {
-        let size = 1024 * 1024;
+        let size = memory_scale::two::MB;
         let handler = core::AtomicMatrix::bootstrap(Some(String::from("a_c_test")), size).unwrap();
         let base_ptr = handler.base_ptr();
         let matrix = handler.matrix();
@@ -749,7 +831,10 @@ mod tests {
 
             let h_merged = ptr_b.resolve_header(base_ptr);
             assert_eq!(h_merged.state.load(Ordering::Acquire), helpers::STATE_FREE);
-            assert_eq!(h_merged.size.load(Ordering::Acquire), (64 * 3) + (3 * helpers::HEADER_SPACE));
+            assert_eq!(
+                h_merged.size.load(Ordering::Acquire),
+                (64 * 3) + (3 * helpers::HEADER_SPACE)
+            );
 
             let h_e = ptr_e.resolve_header(base_ptr);
             assert_eq!(h_e.state.load(Ordering::Acquire), helpers::STATE_ALLOCATED);
@@ -774,12 +859,12 @@ mod tests {
         //
         // May God help us all at this moment.
 
-        use std::sync::{ Arc, Barrier };
-        use std::thread;
         use std::collections::HashSet;
+        use std::sync::{Arc, Barrier};
+        use std::thread;
 
-        // We use 500MB matrix to allocate all the buffers
-        let size = 62 * 1024 * 1024;
+        // We use 62MB matrix to allocate all the buffers
+        let size = memory_scale::custom::mb::<62>();
         let handler = core::AtomicMatrix::bootstrap(None, size).unwrap();
 
         let thread_count = 8;
@@ -799,30 +884,27 @@ mod tests {
             let s_handler = handler.share();
             let fail_count_clone = Arc::clone(&fail_count);
 
-            handles.push(
-                thread::spawn(move || {
+            handles.push(thread::spawn(move || {
+                let mut my_offsets = Vec::new();
 
-                    let mut my_offsets = Vec::new();
+                b.wait();
 
-                    b.wait();
+                for _ in 0..allocs_per_second {
+                    for _ in 0..10 {
+                        if let Ok(rel_ptr) = s_handler.matrix().allocate(s_handler.base_ptr(), 64) {
+                            let h = unsafe { rel_ptr.resolve_header(s_handler.base_ptr()) };
+                            us_ref.fetch_add(h.size.load(Ordering::Relaxed), Ordering::Release);
 
-                    for _ in 0..allocs_per_second {
-                        for _ in 0..10 {
-                            if let Ok(rel_ptr) = s_handler.matrix().allocate(s_handler.base_ptr(), 64) {
-                                let h = unsafe { rel_ptr.resolve_header(s_handler.base_ptr()) };
-                                us_ref.fetch_add(h.size.load(Ordering::Relaxed), Ordering::Release);
-
-                                my_offsets.push(rel_ptr.offset());
-                                break;
-                            }
-                            fail_count_clone.fetch_add(1, Ordering::Relaxed);
-                            std::hint::spin_loop();
+                            my_offsets.push(rel_ptr.offset());
+                            break;
                         }
+                        fail_count_clone.fetch_add(1, Ordering::Relaxed);
+                        std::hint::spin_loop();
                     }
+                }
 
-                    my_offsets
-                })
-            );
+                my_offsets
+            }));
         }
 
         // Collect everything we did and check
@@ -871,14 +953,14 @@ mod tests {
         //
         // May god help your device at this moment
 
-        use std::sync::{ Arc, Barrier };
+        use std::sync::{Arc, Barrier};
         use std::thread;
-        use std::time::{ Instant, Duration };
+        use std::time::{Duration, Instant};
 
         const DURATION: u32 = 600;
         const THREADS: u32 = 8;
 
-        let size = 50 * 1024 * 1024;
+        let size = memory_scale::custom::mb::<5>();
         let handler = core::AtomicMatrix::bootstrap(Some(String::from("f_h_test")), size).unwrap();
         let handler_arc = Arc::new(handler);
         let barrier = Arc::new(Barrier::new(THREADS as usize));
@@ -891,40 +973,39 @@ mod tests {
             let h = Arc::clone(&handler_arc);
             let b = Arc::clone(&barrier);
 
-            handles.push(
-                thread::spawn(move || {
-                    let base_ptr = h.base_ptr() as *mut u8;
-                    let matrix = &h.matrix();
-                    let mut my_blocks = Vec::new();
-                    let mut rng = t_id + 1;
-                    let mut total_ops = 0u64;
+            handles.push(thread::spawn(move || {
+                let base_ptr = h.base_ptr() as *mut u8;
+                let matrix = &h.matrix();
+                let mut my_blocks = Vec::new();
+                let mut rng = t_id + 1;
+                let mut total_ops = 0u64;
 
-                    b.wait();
+                b.wait();
 
-                    while start_time.elapsed() < duration {
-                        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+                while start_time.elapsed() < duration {
+                    rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
 
-                        if rng % 10 < 7 && my_blocks.len() < 200 {
-                            let alloc_size = rng % 512;
-                            if let Ok(ptr) = matrix.allocate(base_ptr, alloc_size as u32) {
-                                my_blocks.push(ptr);
-                            }
-                        } else if !my_blocks.is_empty() {
-                            let idx = (rng as usize) % my_blocks.len();
-                            let ptr = my_blocks.swap_remove(idx);
-
-                            let header_ptr = RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
-                            matrix.ack(&header_ptr, base_ptr);
-
-                            if total_ops % 5 == 0 {
-                                matrix.coalesce(&header_ptr, base_ptr);
-                            }
+                    if rng % 10 < 7 && my_blocks.len() < 200 {
+                        let alloc_size = rng % 512;
+                        if let Ok(ptr) = matrix.allocate(base_ptr, alloc_size as u32) {
+                            my_blocks.push(ptr);
                         }
-                        total_ops += 1;
+                    } else if !my_blocks.is_empty() {
+                        let idx = (rng as usize) % my_blocks.len();
+                        let ptr = my_blocks.swap_remove(idx);
+
+                        let header_ptr =
+                            RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
+                        matrix.ack(&header_ptr, base_ptr);
+
+                        if total_ops % 5 == 0 {
+                            matrix.coalesce(&header_ptr, base_ptr);
+                        }
                     }
-                    (my_blocks, total_ops)
-                })
-            );
+                    total_ops += 1;
+                }
+                (my_blocks, total_ops)
+            }));
         }
 
         let mut total_work = 0u64;
@@ -934,7 +1015,8 @@ mod tests {
             let base_ptr = handler_arc.base_ptr() as *mut u8;
 
             for ptr in remaining {
-                let header_ptr = RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
+                let header_ptr =
+                    RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
                 handler_arc.matrix().ack(&header_ptr, base_ptr);
                 handler_arc.matrix().coalesce(&header_ptr, base_ptr);
             }
@@ -955,7 +1037,10 @@ mod tests {
         println!("Endurance Results (Duration of {} seconds)", DURATION);
         println!("Num of threads: {}", THREADS);
         println!("Total operations: {}", total_work);
-        println!("Throughput: {:.2} Mop/s", (total_work as f64) / (DURATION as f64) / 1_000_000.0);
+        println!(
+            "Throughput: {:.2} Mop/s",
+            (total_work as f64) / (DURATION as f64) / 1_000_000.0
+        );
         println!("Final free fragments: {}", free_count);
         println!("Entrophy percentage: {}%", entrophy_percentage);
 

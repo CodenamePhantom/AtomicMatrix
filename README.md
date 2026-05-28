@@ -1,16 +1,6 @@
 # AtomicMatrix
 
-A lock-free, shared-memory-backed memory allocator for high-performance inter-process communication (IPC) operations. Built in Rust on a TLSF-inspired two-level bitmap with a custom kinetic coalescing engine.
-
-## Stats (60s of random workload - Per Thread scaling)
-| Threads | Total Ops | Throughput (Mop/s) | ns/op | Scaling vs 1T | Efficiency |
-|---------|-----------|-------------------|-------|---------------|------------|
-| 1 | 272,141,174 | 4.54 | 220.3 | 1.00x | 100% |
-| 2 | 431,437,387 | 7.19 | 139.1 | 1.58x | 79% |
-| 4 | 720,029,358 | 12.00 | 83.3 | 2.64x | 66% |
-| 8 | 1,104,515,810 | 18.41 | 54.3 | 4.05x | 51% |
-| 16 | 994,983,604 | 16.58 | 60.3 | 3.65x | 23% |
-
+AtomicMatrix is a lock-free shared-memory allocator for zero-copy IPC between processes on the same machine. No native mutexes and no kernel involvement on the hot path.
 
 ## What it is
 
@@ -22,7 +12,7 @@ It is designed as the memory fabric for low-latency IPC pipelines - the kind of 
 
 Most high-performance allocators make one of three sacrifices: they are fast but not general (fixed-size ring buffers), general but not fast (mutex-based), or fast and general but operationally complex (DPDK mempool, requiring specific NICs and a full DPDK stack).
 
-AtomicMatrix is a general-purpose allocator - arbitrary sizes, O(1) allocation and free - running at wire speed on commodity hardware, deployable as a single Rust crate with no external dependencies beyond the OS.
+AtomicMatrix is a general-purpose allocator with built in arbitrary sizes, O(1) allocation and free, running at wire speed on commodity hardware, deployable as a single Rust crate.
 
 | | Lock-free | Arbitrary sizes | SHM-backed | Commodity hardware |
 |---|---|---|---|---|
@@ -45,11 +35,11 @@ All metadata related to the matrix is stored at the very beginning to be globall
 
 ### Allocation: O(1)
 
-Allocation uses a two-level segregated fit (TLSF) inspired bitmap. A first-level bitmap indexes power-of-two size classes. A second-level bitmap subdivides each class into 8 linear steps. Finding a suitable block is two bitmap operations and one CAS - no scanning, no sorting, no locks.
+Allocation uses a two-level segregated fit (TLSF) inspired bitmap. A first-level bitmap indexes power-of-two size classes. A second-level bitmap subdivides each class into 8 linear steps. Finding a suitable block is two bitmap operations and one CAS. No scanning, no sorting, no locks.
 
 ### Memory Healing
 
-Freeing a block triggers a backward **Ripple** - a coalescing traversal that merges the freed block with its left physical neighbours as long as they are free or acknowledged. Three properties make this safe under concurrent access:
+Freeing a block triggers a backward **Ripple**. A coalescing traversal that merges the freed block with its left physical neighbours as long as they are free or acknowledged. Three properties make this safe under concurrent access:
 
 - **Monotonicity**: Ripples only propagate backward toward the sector origin, eliminating circular dependencies and deadlock.
 - **Permissive concurrency**: If a thread encounters contention on a neighbour, it stops the ripple and moves on. A future operation will complete the merge.
@@ -86,7 +76,7 @@ All benchmarks run on a single node with no NUMA tuning, no kernel patches, and 
 Total operations: 9,181,958,716
 Throughput: 15.30 Mop/s
 Final free fragments: 140
-Entrophy percentage: 0.0000015247291381962252%
+Entropy percentage: 0.0000015247291381962252%
 ```
 
 Workload: randomized allocation sizes (32–544 bytes), 70/30 alloc/free ratio, randomized free ordering to stress the coalescing engine. You can check by running:
@@ -94,6 +84,19 @@ Workload: randomized allocation sizes (32–544 bytes), 70/30 alloc/free ratio, 
 ```bash
 cargo test --lib matrix::tests::test_long_term_fragmentation_healing -- --include_ignored --no-capture
 ```
+
+### Stats (60s of random workload - Per Thread scaling)
+
+| Threads | Total Ops | Throughput (Mop/s) | ns/op | Scaling vs 1T | Efficiency |
+|---------|-----------|-------------------|-------|---------------|------------|
+| 1 | 272,141,174 | 4.54 | 220.3 | 1.00x | 100% |
+| 2 | 431,437,387 | 7.19 | 139.1 | 1.58x | 79% |
+| 4 | 720,029,358 | 12.00 | 83.3 | 2.64x | 66% |
+| 8 | 1,104,515,810 | 18.41 | 54.3 | 4.05x | 51% |
+| 16 | 994,983,604 | 16.58 | 60.3 | 3.65x | 23% |
+
+
+
 
 > **Attention**
 > The long term healing test is a stress test that produces a lot of workload in the CPU. It is recommended to adapt the quantity of concurrent threads to the declared number of vThreads provided by your manufacturer.
@@ -142,8 +145,19 @@ Multiple processes can map the same segment by passing the same UUID to `bootstr
 
 ## Roadmap
 
-### v0.3 — Standard Library for the matrix.
+### v0.6 (under development) — Internals and Extensive Library for the matrix.
 A set of pre-baked data structures and frameworks that can be used with the matrix to execute high-level actions (Iteration, IPC Semantics, etc).
+
+> The following have already been implemented or is activelly under development:
+
+- AtomicRingbuffer.
+- MemoryScaler.
+- UIDLite.
+- AtomicExtensions.
+- Fencer.
+- Looper
+
+For more information on how these works, check the documentation section (currently under development).
 
 ---
 
@@ -163,7 +177,7 @@ The allocator has been tested under:
 
 ## Contributing
 
-The standard library is the immediate area where contributions are welcome. If you want to build on top of the core allocator or have ideas for the API/Library design, open an issue.
+The standard library is the immediate area where contributions are welcome, as well as FFI bindings for other languages. If you want to build on top of the core allocator or have ideas for the API/Library design, open an issue.
 
 ---
 
