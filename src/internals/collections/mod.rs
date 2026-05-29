@@ -10,3 +10,4 @@ pub mod atomic_hashmap;
 pub mod atomic_vector;
 pub mod uid_lite;
 pub mod memory_scale;
+pub mod atomic_timestamp;

@@ -112,13 +112,12 @@ atomic-matrix = "0.1"
 ```
 
 ```rust
-use atomic_matrix::matrix::core::AtomicMatrix;
-use atomic_matrix::handlers::HandlerFunctions;
+use atomic_matrix::prelude::*;
 
 // Bootstrap a 50MB matrix in /dev/shm
 let handler = AtomicMatrix::bootstrap(
-    Some(uuid::Uuid::new_v4()),
-    50 * 1024 * 1024,
+    uid_lite::generate_uuid(), // internal uid generator because i hate have to import UUID to every other project.
+    memory_scale::custom::mb::<7>(), // memory layout creator because i love semantic sugar.
 ).unwrap();
 
 // Allocate a 128-byte block

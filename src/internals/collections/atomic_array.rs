@@ -1,5 +1,4 @@
 use crate::internals::error_collection::AtomicArrayErrors;
-use crate::helpers::atomic_ext::AtomicExtensions;
 use crate::prelude::*;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, Ordering};

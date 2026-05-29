@@ -281,7 +281,7 @@ impl<'a> AtomicRingBuffer {
             return None;
         }
 
-        let block = crate::internals::handlers::Block::<T>::from_offset(current_tail);
+        let block = Block::<T>::from_offset(current_tail);
         let data = unsafe { self.handler_ref.read(&block) };
 
         self.tail.store(next_tail, Ordering::Release);
@@ -309,7 +309,7 @@ impl<'a> AtomicRingBuffer {
             return None;
         }
 
-        let block = crate::internals::handlers::Block::<T>::from_offset(current_tail);
+        let block = Block::<T>::from_offset(current_tail);
         let data = unsafe { self.handler_ref.read(&block) };
 
         Some(data)

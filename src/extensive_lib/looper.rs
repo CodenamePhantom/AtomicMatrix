@@ -23,8 +23,7 @@
 //! data into a [`vec`] first.
 use std::sync::atomic::Ordering;
 
-use crate::internals::handlers::*;
-use crate::matrix::core::*;
+use crate::prelude::*;
 
 /// The Iterator object implementation for the matrix.
 ///
