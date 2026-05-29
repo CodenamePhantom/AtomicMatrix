@@ -48,7 +48,7 @@ pub mod helpers {
     pub const STATE_ACKED: u32 = 2;
     pub const STATE_COALESCING: u32 = 3;
 
-    pub const HEADER_SPACE: u32 = std::mem::size_of::<core::BlockHeader>() as u32;
+    pub const HEADER_SPACE: u32 = std::mem::size_of::<BlockHeader>() as u32;
 
     /// A helper struct that provided the O(1) calculations to find the coordinates of
     /// a block that suits exactly the requested buffer size, or the next available one

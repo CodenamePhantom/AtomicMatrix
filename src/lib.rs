@@ -12,5 +12,5 @@ pub mod prelude {
         }
     };
     pub use crate::internals::collections::*;
-    pub use crate::helpers::*;
+    pub use crate::helpers::atomic_ext::AtomicExtensions;
 }
