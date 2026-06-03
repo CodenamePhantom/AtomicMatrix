@@ -25,11 +25,11 @@ pub trait AtomicExtensions {
     /// The old value wraped in a result.
     #[must_use = "If swap result is not used, consider store_if_not instead."]
     fn swap_if_not(
-        &self, 
-        forbidden: Self::Value, 
-        new_value: Self::Value, 
+        &self,
+        forbidden: Self::Value,
+        new_value: Self::Value,
         success_ordering: Ordering,
-        fail_ordering: Ordering
+        fail_ordering: Ordering,
     ) -> Result<Self::Value, Self::Value>;
 
     /// Swaps the value if its equal to the provided target value.
@@ -47,8 +47,8 @@ pub trait AtomicExtensions {
     /// The old value wrapped in a result.
     #[must_use = "If swap result is not used, consider store_if instead."]
     fn swap_if(
-        &self, 
-        target: Self::Value, 
+        &self,
+        target: Self::Value,
         new_value: Self::Value,
         success_ordering: Ordering,
         fail_ordering: Ordering,
@@ -97,7 +97,7 @@ pub trait AtomicExtensions {
 
     /// Stores the value if its not equal the provided forbidden value.
     ///
-    /// If the current value doesn't match, it stores it and returns true. If not, false is returned 
+    /// If the current value doesn't match, it stores it and returns true. If not, false is returned
     /// instead.
     ///
     /// ### Params:
@@ -114,7 +114,7 @@ pub trait AtomicExtensions {
         forbidden: Self::Value,
         new_value: Self::Value,
         success_ordering: Ordering,
-        fail_ordering: Ordering
+        fail_ordering: Ordering,
     ) -> bool;
 
     /// Stores the value if its equal to the provided target value.
@@ -141,7 +141,7 @@ pub trait AtomicExtensions {
 
     /// Stores the value if it is not contained inside a provided list of forbidden values.
     ///
-    /// If the value doesn't exist inside the array list, it stores it and returns true . If not, 
+    /// If the value doesn't exist inside the array list, it stores it and returns true . If not,
     /// false is returned instead.
     ///
     /// ### Params:
@@ -180,8 +180,68 @@ pub trait AtomicExtensions {
         target_list: &[Self::Value],
         new_value: Self::Value,
         success_ordering: Ordering,
-        fail_ordering: Ordering
+        fail_ordering: Ordering,
     ) -> bool;
+
+    /// Loads the value if its not equal to the provided forbidden value.
+    ///
+    /// If the current value doesn't match, it loads and returns the value. If not, an empty error is
+    /// returned instead.
+    ///
+    /// ### Params:
+    /// @forbidden: The value to compare against the current value. \
+    /// @ordering: Atomic ordering for the load operation.
+    ///
+    /// ### Returns:
+    /// Either the loaded value, or an empty error.
+    fn load_if_not(&self, forbidden: Self::Value, ordering: Ordering) -> Result<Self::Value, ()>;
+
+    /// Loads the value if its equal to the provided target value.
+    ///
+    /// It the current value matches, it loads and return the value. If not, an empty error is
+    /// returned insted.
+    ///
+    /// ### Params:
+    /// @target: The value to compare against the current value. \
+    /// @ordering: Atomic ordering for the load operation.
+    ///
+    /// ### Returns:
+    /// Either the loaded value, or an empty error.
+    fn load_if(&self, target: Self::Value, ordering: Ordering) -> Result<Self::Value, ()>;
+
+    /// Loads a value if it is not present inside a provided list of forbidden values.
+    ///
+    /// If the value is present in the list, the call fails and returns an empty error to be treated
+    /// by the caller. If it's not, return the value wrapped in Ok().
+    ///
+    /// ### Params:
+    /// @forbidden_list: An array containing the list of forbidden values. \
+    /// @ordering: Atomic ordering for the load operation.
+    ///
+    /// ### Returns:
+    /// Either the loaded value, or an empty error.
+    fn load_if_not_any(
+        &self,
+        forbidden_list: &[Self::Value],
+        ordering: Ordering,
+    ) -> Result<Self::Value, ()>;
+
+    /// Loads a value if it is present inside a provided list of target values.
+    ///
+    /// If the value is present in the list, the value is returned wrapped in an Ok(). If its not,
+    /// the call fails and returns an empty error to be treated by the caller.
+    ///
+    /// ### Params:
+    /// @target_list: An array containing the list of target values. \
+    /// @ordering: Atomic ordering for the load operation.
+    ///
+    /// ### Returns:
+    /// Either the loaded value, or an empty error.
+    fn load_if_any(
+        &self,
+        target_list: &[Self::Value],
+        ordering: Ordering,
+    ) -> Result<Self::Value, ()>;
 }
 
 macro_rules! impl_atomic_extensions {
@@ -268,7 +328,7 @@ macro_rules! impl_atomic_extensions {
                 forbidden_list: &[$value],
                 new_value: $value,
                 success_ordering: Ordering,
-                fail_ordering: Ordering
+                fail_ordering: Ordering,
             ) -> bool {
                 self.fetch_update(success_ordering, fail_ordering, |cur| {
                     (!forbidden_list.contains(&cur)).then_some(new_value)
@@ -287,6 +347,54 @@ macro_rules! impl_atomic_extensions {
                     (target_list.contains(&cur)).then_some(new_value)
                 })
                 .is_ok()
+            }
+
+            fn load_if_not(&self, forbidden: $value, ordering: Ordering) -> Result<$value, ()> {
+                let value = self.load(ordering);
+
+                if value == forbidden {
+                    return Err(());
+                } else {
+                    return Ok(value);
+                }
+            }
+
+            fn load_if(&self, target: $value, ordering: Ordering) -> Result<$value, ()> {
+                let value = self.load(ordering);
+
+                if value == target {
+                    return Ok(value);
+                } else {
+                    return Err(());
+                }
+            }
+
+            fn load_if_not_any(
+                &self,
+                forbidden_list: &[$value],
+                ordering: Ordering,
+            ) -> Result<$value, ()> {
+                let value = self.load(ordering);
+
+                if forbidden_list.contains(&value) {
+                    return Err(());
+                } else {
+                    return Ok(value);
+                }
+            }
+
+            fn load_if_any(
+                &self,
+                target_list: &[$value],
+                ordering: Ordering,
+            ) -> Result<$value, ()> {
+                let value = self.load(ordering);
+
+                if target_list.contains(&value) {
+                    return Ok(value);
+                } else {
+                    return Err(());
+                }
             }
         }
     };

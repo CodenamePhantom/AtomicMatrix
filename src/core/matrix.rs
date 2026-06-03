@@ -96,9 +96,7 @@ pub mod helpers {
 use crate::internals::collections::atomic_timestamp::AtomicTimestamp;
 use crate::internals::collections::uid_lite::generate_uuid;
 use crate::internals::error_collection::MatrixErrors;
-use crate::prelude::HEADER_SPACE;
-
-use super::*;
+use crate::prelude::*;
 
 /// Header structure that is written at the beginning of each block/sector
 ///
@@ -501,15 +499,58 @@ impl AtomicMatrix {
 
     /// Queries a block offset inside of the matrix.
     ///
-    /// Not much to say about this, the name is pretty self explanatory.
+    /// This function does not provide any boundary checks, nor validate if the offset provided is,
+    /// in fact, a block. Whatever you pass in, we return a [`RelativePtr`] for it.
     ///
     /// ### Params:
     /// @offset: The offset of the block to be queried
     ///
     /// ### Returns:
     /// The Relative Pointer to the queried block
-    pub fn query(&self, offset: u32) -> RelativePtr<u8> {
+    pub unsafe fn query(&self, offset: u32) -> RelativePtr<u8> {
         RelativePtr::new(offset + helpers::HEADER_SPACE)
+    }
+
+    /// Tries to query a block offset inside the matrix with safety checks.
+    ///
+    /// It first checks if the requested offset is within the matrix dataplane bounds (before the
+    /// last offset, and after the matrix metadata section). Then it checks if the offset actually
+    /// has a header and if that header isn't in any of the controlled life cycle states. If all
+    /// the checks pass, the raw [`RelativePtr`] to the section is returned.
+    ///
+    /// ### Params:
+    /// @base_ptr: The offset to the beginning of the SHM segment. \
+    /// @offset: The offset of the block to be queried.
+    ///
+    /// ### Returns:
+    /// A result containing either the [`RelativePtr`], or a [`MatrixErrors`].
+    pub fn checked_query(
+        &self,
+        base_ptr: *const u8,
+        offset: u32,
+    ) -> Result<RelativePtr<u8>, MatrixErrors> {
+        let matadata_section =
+            unsafe { base_ptr.add(16 + std::mem::size_of::<AtomicMatrix>()) as u32 };
+
+        if offset >= self.sector_boundaries.load(Ordering::Relaxed) || offset <= matadata_section {
+            return Err(MatrixErrors::OutOfBounds);
+        }
+
+        let ptr = RelativePtr::<u8>::new(offset + HEADER_SPACE);
+        let header = unsafe { ptr.resolve_header(base_ptr) };
+
+        if header
+            .state
+            .load_if_not_any(
+                &[STATE_FREE, STATE_COALESCING, STATE_ACKED],
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return Err(MatrixErrors::InvalidBlock);
+        }
+
+        return Ok(ptr);
     }
 
     /// Queries the TLSF bitmaps in search of a block.
@@ -772,8 +813,7 @@ mod tests {
     #[test]
     fn test_initial_bootstrap() {
         let size = memory_scale::two::MB;
-        let handler =
-            AtomicMatrix::bootstrap(Some(String::from("bootstrap_test")), size).unwrap();
+        let handler = AtomicMatrix::bootstrap(Some(String::from("bootstrap_test")), size).unwrap();
 
         let bitmap = handler.matrix().fl_bitmap.load(Ordering::Acquire);
 

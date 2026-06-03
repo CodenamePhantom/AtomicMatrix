@@ -8,13 +8,15 @@
 //! # Abstraction Layers
 //!
 //! ```text
-//! [ internals -> Matrix Internal Frameworks ]   + iter, workers, tables, ...
+//! [ extensive_lib -> Matrix Internal Frameworks]  * fencer, guardian, looper ...
+//!     * and
+//! [ internals -> Matrix Internal Collections ]    + atomic data structs, errors ...
 //!     * builds on
-//! [ MatrixHandler ]                             + typed blocks, lifecycle, sharing
+//! [ MatrixHandler ]                               + typed blocks, lifecycle, sharing
 //!     * escape hatch
-//! [ AtomicMatrix ]                              + raw offsets, sizes, bytes
-//!     *
-//! [ /dev/shm ]                                  * physical shared memory
+//! [ AtomicMatrix ]                                + raw offsets, sizes, bytes
+//!     * physical bound layer
+//! [ /dev/shm ]                                    * physical shared memory
 //! ```
 //!
 //! # Handler Scope
@@ -28,8 +30,9 @@
 //! - Thread sharing via [`SharedHandler`]
 //! - Escape hatches to the raw matrix and base pointer
 //!
-//! > Any high-level datasets and operators will be implemented in the **internals**
-//! > folder.
+//! Safe handler functions also enforce typing at runtime through Type Tagging ( check 
+//! the [`type_tag`] helper module), returning a [`HandlerErrors::TypeMismatchError`]
+//! when the check fails.
 //!
 //! # Lifecycle States
 //!
@@ -54,6 +57,7 @@
 //! outlive all shared handles derived from it.
 
 use crate::internals::error_collection::HandlerErrors;
+use crate::helpers::type_tag;
 use crate::prelude::*;
 use memmap2::MmapMut;
 use std::sync::atomic::Ordering;
@@ -63,6 +67,7 @@ use std::sync::atomic::Ordering;
 /// Currently only 0–3 are assigned — the remaining range (4–48) is reserved
 /// for future internal lifecycle states without breaking user code.
 pub const USER_STATE_MIN: u32 = 49;
+pub const TAG_SIZE: u32 = std::mem::size_of::<u32>() as u32;
 
 /// A typed handle to an allocated block in the matrix.
 ///
@@ -264,13 +269,21 @@ pub trait HandlerFunctions {
     /// Returns [`HandlerError::AllocationFailed`] if the matrix is out of
     /// memory or under contention after 512 retries.
     fn allocate<T>(&self) -> Result<Block<T>, HandlerErrors> {
+        let tag = type_tag::make::<T>();
         let size = std::mem::size_of::<T>() as u32;
-        match self.matrix()
-            .allocate(self.base_ptr(), size)
-            .map(|ptr| Block::from_offset(ptr.offset())) {
-                Ok(v) => return Ok(v),
-                Err(_) =>  return Err(HandlerErrors::AllocationFailed("Unable to allocate block".into())),
-            };
+
+        let ptr = match self.matrix().allocate(self.base_ptr(), size + TAG_SIZE) {
+            Ok(v) => v,
+            Err(_) => return Err(HandlerErrors::AllocationFailed(format!("Failed to allocate a block")))
+        };
+        unsafe { 
+            let dp = *ptr.resolve_mut(self.base_ptr()) as *mut u32;
+            *dp = tag
+        };
+
+        let block = Block::<T>::from_offset(ptr.offset() + TAG_SIZE);
+
+        return Ok(block)
     }
 
     /// Allocates a raw byte block of the given size.
@@ -298,8 +311,17 @@ pub trait HandlerFunctions {
     /// - No other thread may be reading or writing this block concurrently.
     ///   The caller is responsible for all synchronization beyond the atomic
     ///   state transitions provided by [`set_state`] and [`transition_state`].
-    unsafe fn write<T>(&self, block: &mut Block<T>, value: T) {
-        unsafe { block.pointer.write(self.base_ptr(), value) }
+    fn write<T>(&self, block: &mut Block<T>, value: T) -> Result<(), HandlerErrors> {
+        if type_tag::compare::<T>(&block) {
+            return Err(HandlerErrors::TypeMismatchError);
+        }
+
+        unsafe { block.pointer.write(self.base_ptr(), value) };
+
+        let header = unsafe { block.pointer.resolve_header_mut(self.base_ptr())};
+        header.last_edit.set_now();
+
+        return Ok(());
     }
 
     /// Reads a shared reference to `T` from an allocated block.
@@ -312,8 +334,14 @@ pub trait HandlerFunctions {
     ///   of the [`Block<T>`] handle — the caller must ensure the block is not
     ///   freed while the reference is in use.
     /// - No other thread may be writing to this block concurrently.
-    unsafe fn read<'a, T>(&self, block: &Block<T>) -> &'a T {
-        unsafe { block.pointer.resolve(self.base_ptr()) }
+    unsafe fn read<'a, T>(&self, block: &Block<T>) -> Result<&'a T, HandlerErrors> {
+        if type_tag::compare::<T>(&block) {
+            return Err(HandlerErrors::TypeMismatchError);
+        }
+
+        let data = unsafe { block.pointer.resolve(self.base_ptr()) };
+
+        return Ok(data);
     }
 
     /// Reads a mutable reference to `T` from an allocated block.
@@ -327,8 +355,74 @@ pub trait HandlerFunctions {
     ///   freed while the reference is in use.
     /// - No other thread may be reading or writing this block concurrently.
     ///   Two simultaneous `read_mut` calls on the same block is undefined behaviour.
-    unsafe fn read_mut<'a, T>(&self, block: &Block<T>) -> &'a mut T {
-        unsafe { block.pointer.resolve_mut(self.base_ptr()) }
+    unsafe fn read_mut<'a, T>(&self, block: &Block<T>) -> Result<&'a mut T, HandlerErrors> {
+        if type_tag::compare::<T>(&block) {
+            return Err(HandlerErrors::TypeMismatchError);
+        }
+
+        let mut_data = unsafe { block.pointer.resolve_mut(self.base_ptr()) };
+
+        return Ok(mut_data);
+    }
+
+    /// Tries to query a block through a checked query.
+    ///
+    /// If the query fails, an error is return signaling why the query failed.
+    ///
+    /// ### Params:
+    /// @offset: The offset of the block to be queried.
+    ///
+    /// ### Returns:
+    /// An result containing either the requested block, or an InvalidOffset error containing the
+    /// offset address.
+    fn get_block<T>(&self, offset: u32) -> Result<Block<T>, HandlerErrors> {
+        match self.matrix().checked_query(self.base_ptr(), offset) {
+            Ok(v) => {
+                let block = Block::<T>::from_offset(v.offset());
+
+                if type_tag::compare::<T>(&block) {
+                    return Err(HandlerErrors::TypeMismatchError);
+                } else {
+                    return Ok(block);
+                }
+            },
+            Err(_) => {
+                return Err(HandlerErrors::InvalidOffset(offset));
+            }
+        }
+    }
+
+    /// Tries to query a list of blocks from the matrix through a checked query.
+    ///
+    /// A tuple containing a Vec with the successfull queried blocks and other with all failed
+    /// offset addresses is returned after all queries are completed, so the caller can react to all
+    /// failed offsets in a more adaptable way.
+    ///
+    /// ### Params:
+    /// @offset_list: An array list containing all the offsets to be queried.
+    ///
+    /// ### Returns:
+    /// A tuple containing a list of successfully queried blocks and a list of failed offsets.
+    fn batch_get<T>(&self, offset_list: &[u32]) -> (Vec<Block<T>>, Vec<u32>) {
+        let mut block_list = Vec::<Block<T>>::new();
+        let mut failed_query = Vec::<u32>::new();
+
+        for o in offset_list {
+            match self.matrix().checked_query(self.base_ptr(), *o) {
+                Ok(v) => {
+                    let block = Block::<T>::from_offset(v.offset());
+
+                    if type_tag::compare::<T>(&block) {
+                        failed_query.push(*o);
+                    } else {
+                        block_list.push(Block::<T>::from_offset(v.offset()));
+                    }
+                },
+                Err(_) => failed_query.push(*o)
+            }
+        }
+                    
+        return (block_list, failed_query)
     }
 
     /// Frees a typed block.
@@ -337,7 +431,7 @@ pub trait HandlerFunctions {
     /// The block is invalid after this call — using it in any way is
     /// undefined behaviour.
     fn free<T>(&self, block: Block<T>) {
-        let header_ptr = RelativePtr::<BlockHeader>::new(block.pointer.offset() - HEADER_SPACE);
+        let header_ptr = RelativePtr::<BlockHeader>::new(block.pointer.offset() - HEADER_SPACE - TAG_SIZE);
         self.matrix().ack(&header_ptr, self.base_ptr());
     }
 
@@ -366,8 +460,10 @@ pub trait HandlerFunctions {
         if state < USER_STATE_MIN {
             return Err(HandlerErrors::ReservedState(state));
         }
+
+        let unpadded_block = Block::<T>::from_offset(block.pointer.offset() - TAG_SIZE);
         unsafe {
-            block
+            unpadded_block
                 .pointer
                 .resolve_header_mut(self.base_ptr())
                 .state
@@ -383,8 +479,9 @@ pub trait HandlerFunctions {
     /// only if you do not need to synchronize with writes to the block's
     /// payload.
     fn get_state<T>(&self, block: &Block<T>, order: Ordering) -> u32 {
+        let unpadded_block = Block::<T>::from_offset(block.pointer.offset() - TAG_SIZE);
         unsafe {
-            block
+            unpadded_block
                 .pointer
                 .resolve_header(self.base_ptr())
                 .state
@@ -418,8 +515,10 @@ pub trait HandlerFunctions {
         if next < USER_STATE_MIN {
             return Err(HandlerErrors::ReservedState(next));
         }
+
+        let unpadded_block = Block::<T>::from_offset(block.pointer.offset() - TAG_SIZE);
         unsafe {
-            block
+            unpadded_block
                 .pointer
                 .resolve_header_mut(self.base_ptr())
                 .state

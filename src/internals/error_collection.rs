@@ -25,10 +25,13 @@ pub enum MatrixErrors {
     MatrixAttachingError,
     OutOfMemory,
     EmptyBitmapError,
+    OutOfBounds,
+    InvalidBlock,
 }
 
 #[derive(Debug)]
 pub enum HandlerErrors {
+    TypeMismatchError,
     AllocationFailed(String),
     ReservedState(u32),
     TransitionFailed(u32),
