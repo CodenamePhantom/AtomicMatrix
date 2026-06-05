@@ -160,7 +160,7 @@ impl AtomicMatrix {
     ///
     /// ### Returns
     /// A static, lifetime specified, reference to the matrix struct.
-    fn init(ptr: *mut AtomicMatrix, size: u32) -> &'static mut Self {
+    pub fn init(ptr: *mut AtomicMatrix, size: u32) -> &'static mut Self {
         unsafe {
             let matrix = &mut *ptr;
             matrix.fl_bitmap.store(0, Ordering::Release);

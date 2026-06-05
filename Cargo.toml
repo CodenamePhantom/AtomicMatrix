@@ -15,3 +15,4 @@ default = []
 
 [dependencies]
 memmap2 = "0.9.10"
+libc = "0.2.186"

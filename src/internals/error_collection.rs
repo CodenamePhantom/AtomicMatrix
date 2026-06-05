@@ -42,6 +42,17 @@ pub enum HandlerErrors {
     },
 }
 
+#[derive(Debug)]
+pub enum CartographerErrors {
+    InvalidFileTypeCall,
+    WhyWouldYouDoThat(String),
+    SysInitializedError,
+    MmapError,
+    FileCreationError,
+    FileTruncateError,
+    RuntimeProtError(String),
+}
+
 /// -------------------------------------------------------------------------------------
 ///
 /// Collection errors

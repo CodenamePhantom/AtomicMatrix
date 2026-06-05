@@ -1,10 +1,16 @@
 //! # Cartographer builder.
 //! 
+//! Provides a builder pattern construction for Cartographer configuration.
+
 // Quick author note:
 // May God forgive me for the hacks I´m about to do. But its 2:30 in the morning, and I must sleep.
-use crate::core::cartographer::*;
+// Update:
+// The hacks are no longer!
+
+use crate::prelude::*;
 use std::os::fd::RawFd;
 
+#[derive(PartialEq)]
 pub enum ProcessRole {
     Writer,
     Reader,
@@ -12,22 +18,23 @@ pub enum ProcessRole {
     Owner,
 }
 
+#[derive(PartialEq)]
 pub enum LinkMethod {
     New(u32),
     Attach
 }
 
-pub struct CartographerBuilder<F = fn()>
-where
-    F: FnOnce() + 'static,
-{
+pub struct CartographerBuilder {}
+
+pub struct CartographerShmBuilder {
     // basics
     size: LinkMethod,
     uuid: Option<String>,
     role: ProcessRole,
 
     // app protection
-    app_protection: bool,
+    apparmor: bool,
+    selinux: bool,
     app_protection_list: Vec<String>,
 
     // file system permissions.
@@ -38,42 +45,66 @@ where
     // Runtime Protection
     runtime_protected: bool,
 
-    // Memfd sealing
-    memfd: bool,
-    memfd_fd: Option<RawFd>,
+    // Complex init
+    defer: bool,
+    before_init: Option<Box<dyn FnOnce() + 'static>>,
+    attach_callback: Option<Box<dyn FnOnce() + 'static>>,
+}
+
+pub struct CartographerMemFdBuilder {
+    // basics
+    size: LinkMethod,
+    fd: Option<RawFd>,
+    fd_broker_addr: String,
+    role: ProcessRole,
+
+    // protection
+    runtime_protected: bool,
+    memfd_secret: bool,
     memfd_seal_write: bool,
 
     // Complex init
     defer: bool,
-    before_init: Option<F>,
+    before_init: Option<Box<dyn FnOnce() + 'static>>,
+    attach_callback: Option<Box<dyn FnOnce() + 'static>>,
 }
 
-impl CartographerBuilder<fn()> {
-    pub fn new(size: LinkMethod) -> Self{ 
-        Self {
-            size,
+impl CartographerBuilder {
+    pub fn shm(link: LinkMethod) -> CartographerShmBuilder{ 
+        CartographerShmBuilder {
+            size: link,
             uuid: None,
             role: ProcessRole::Reader,
-            app_protection: false,
+            apparmor: false,
+            selinux: false,
             app_protection_list: Vec::<String>::new(),
             fs_permission: 0o600,
             fs_uid: 0,
             fs_gid: 0,
             runtime_protected: false,
-            memfd: false,
-            memfd_fd: None,
-            memfd_seal_write: false,
             defer: false,
             before_init: None,
+            attach_callback: None,
+        }
+    }
+
+    pub fn memfd(link: LinkMethod, broker_addr: String,) -> CartographerMemFdBuilder {
+        CartographerMemFdBuilder { 
+            size: link, 
+            fd: None, 
+            fd_broker_addr: broker_addr,
+            role: ProcessRole::Reader, 
+            runtime_protected: false,
+            memfd_secret: false, 
+            memfd_seal_write: false, 
+            defer: false, 
+            before_init: None, 
+            attach_callback: None 
         }
     }
 }
 
-impl<F> CartographerBuilder<F> 
-where
-    F: FnOnce() + 'static,
-{
-
+impl CartographerShmBuilder {
     pub fn uuid(mut self, uuid: String) -> Self {
         self.uuid = Some(uuid);
         self
@@ -84,8 +115,8 @@ where
         self
     }
 
-    pub fn app_protection(mut self, toggle: bool) -> Self {
-        self.app_protection = toggle;
+    pub fn apparmor(mut self, toggle: bool) -> Self {
+        self.apparmor = toggle;
         self
     }
 
@@ -114,66 +145,37 @@ where
         self
     }
 
-    pub fn memfd(mut self, is_sealed: bool) -> Self {
-        self.memfd = is_sealed;
-        self
-    }
-
-    pub fn memfd_fd(mut self, file_desc: Option<RawFd>) -> Self {
-        self.memfd_fd = file_desc;
-        self
-    }
-
-    pub fn memfd_seal_write(mut self, is_write_sealed: bool) -> Self {
-        self.memfd_seal_write = is_write_sealed;
-        self
-    }
-
     pub fn defer(mut self, defer: bool) -> Self {
         self.defer = defer;
         self
     }
 
-    pub fn before_init<NewF>(self, action: NewF) -> CartographerBuilder<NewF> 
-    where
-        NewF: FnOnce() + 'static,
-    {
-        CartographerBuilder {
-            size: self.size,
-            uuid: self.uuid,
-            role: self.role,
-            app_protection: self.app_protection,
-            app_protection_list: self.app_protection_list,
-            fs_permission: self.fs_permission,
-            fs_uid: self.fs_uid,
-            fs_gid: self.fs_gid,
-            runtime_protected: self.runtime_protected,
-            memfd: self.memfd,
-            memfd_fd: self.memfd_fd,
-            memfd_seal_write: self.memfd_seal_write,
-            defer: self.defer,
-            before_init: Some(action),
-        }
+    pub fn before_init(mut self, action: impl FnOnce() + 'static) -> Self {
+        self.before_init = Some(Box::new(action));
+        self
     }
 
-    pub fn build(self) -> Result<Cartographer, ()> {
-        Ok(Cartographer {
-            config: CartographerConfig {
+    pub fn attach_callback(mut self, action: impl FnOnce() + 'static) -> Self {
+        self.attach_callback = Some(Box::new(action));
+        self
+    }
+
+    pub fn build(self) -> Cartographer {
+        Cartographer {
+            config: CartographerConfig::Shm(CartographerShm {
                 size: self.size,
                 uuid: self.uuid,
                 role: self.role,
-                app_protection: self.app_protection,
+                app_protection: self.apparmor,
                 app_protection_list: self.app_protection_list,
                 fs_permission: self.fs_permission,
                 fs_uid: self.fs_uid,
                 fs_gid: self.fs_gid,
                 runtime_protected: self.runtime_protected,
-                memfd: self.memfd,
-                memfd_fd: self.memfd_fd,
-                memfd_seal_write: self.memfd_seal_write,
                 defer: self.defer
-            },
-            before_init: self.before_init.map(|f| Box::new(f) as Box<dyn FnOnce()>)
-        })
+            }),
+            before_init: self.before_init,
+            attach_callback: self.attach_callback,
+        }
     }
 }
