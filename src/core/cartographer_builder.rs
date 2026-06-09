@@ -34,8 +34,9 @@ pub struct CartographerShmBuilder {
 
     // app protection
     apparmor: bool,
+    apparmor_confined: bool,
     selinux: bool,
-    app_protection_list: Vec<String>,
+    app_allowed_list: Vec<String>,
 
     // file system permissions.
     fs_permission: u32,
@@ -47,8 +48,8 @@ pub struct CartographerShmBuilder {
 
     // Complex init
     defer: bool,
-    before_init: Option<Box<dyn FnOnce() + 'static>>,
-    attach_callback: Option<Box<dyn FnOnce() + 'static>>,
+    before_init: Option<Box<dyn FnOnce(&mut AtomicMatrix) + 'static>>,
+    attach_callback: Option<fn(&mut AtomicMatrix)>,
 }
 
 pub struct CartographerMemFdBuilder {
@@ -65,7 +66,7 @@ pub struct CartographerMemFdBuilder {
 
     // Complex init
     defer: bool,
-    before_init: Option<Box<dyn FnOnce() + 'static>>,
+    before_init: Option<Box<dyn FnOnce(&mut AtomicMatrix) + 'static>>,
     attach_callback: Option<Box<dyn FnOnce() + 'static>>,
 }
 
@@ -76,8 +77,9 @@ impl CartographerBuilder {
             uuid: None,
             role: ProcessRole::Reader,
             apparmor: false,
+            apparmor_confined: false,
             selinux: false,
-            app_protection_list: Vec::<String>::new(),
+            app_allowed_list: Vec::<String>::new(),
             fs_permission: 0o600,
             fs_uid: 0,
             fs_gid: 0,
@@ -120,8 +122,8 @@ impl CartographerShmBuilder {
         self
     }
 
-    pub fn app_protection_list(mut self, list: Vec<String>) -> Self {
-        self.app_protection_list = list;
+    pub fn app_allowed_list(mut self, list: Vec<String>) -> Self {
+        self.app_allowed_list = list;
         self
     }
 
@@ -150,13 +152,13 @@ impl CartographerShmBuilder {
         self
     }
 
-    pub fn before_init(mut self, action: impl FnOnce() + 'static) -> Self {
+    pub fn before_init(mut self, action: impl FnOnce(&mut AtomicMatrix) + 'static) -> Self {
         self.before_init = Some(Box::new(action));
         self
     }
 
-    pub fn attach_callback(mut self, action: impl FnOnce() + 'static) -> Self {
-        self.attach_callback = Some(Box::new(action));
+    pub fn attach_callback(mut self, action: fn(&mut AtomicMatrix)) -> Self {
+        self.attach_callback = Some(action);
         self
     }
 
@@ -167,7 +169,7 @@ impl CartographerShmBuilder {
                 uuid: self.uuid,
                 role: self.role,
                 app_protection: self.apparmor,
-                app_protection_list: self.app_protection_list,
+                app_protection_list: self.app_allowed_list,
                 fs_permission: self.fs_permission,
                 fs_uid: self.fs_uid,
                 fs_gid: self.fs_gid,

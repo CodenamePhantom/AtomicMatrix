@@ -157,6 +157,7 @@ A set of pre-baked data structures and frameworks that can be used with the matr
 - Looper
 
 For more information on how these works, check the documentation section (currently under development).
+Check our [public development tracker](https://spiky-salad-0e7.notion.site/AtomicMatrix-3786c5a79f1e809893addd364b70ecf9)!
 
 ---
 

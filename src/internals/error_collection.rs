@@ -44,6 +44,8 @@ pub enum HandlerErrors {
 
 #[derive(Debug)]
 pub enum CartographerErrors {
+    NotACallback,
+    InvalidCrossProcess,
     InvalidFileTypeCall,
     WhyWouldYouDoThat(String),
     SysInitializedError,

@@ -25,12 +25,16 @@
 //! - Memfd sealing and file descriptor attachment.
 //! - Complex initialization procedures like initialization deferral and pre SYS_READY callbacks.
 
+use crate::helpers::type_tag::fnv1a_32;
 use crate::internals::error_collection::{CartographerErrors, MatrixErrors};
 use crate::prelude::*;
 
+use std::collections::hash_map::DefaultHasher;
 use std::ffi::CString;
-use std::ops::Deref;
+use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU32, Ordering};
+
+pub const STATE_CALLBACK: u32 = 4;
 
 /// Config enum to separate setups for SHM or MemFd based arenas
 ///
@@ -43,7 +47,7 @@ pub enum CartographerConfig {
 }
 
 /// SHM based configuration template
-pub struct CartographerShm {
+pub(crate) struct CartographerShm {
     pub size: LinkMethod,
     pub uuid: Option<String>,
     pub role: ProcessRole,
@@ -56,15 +60,28 @@ pub struct CartographerShm {
     pub defer: bool,
 }
 
-pub struct CartographerMemFd {}
+pub(crate) struct CartographerMemFd {}
 
+/// Cartographer struct for SHM arena deployment
+///
+/// This struct encapsulates the builded configuration for the arena deployment and all functions
+/// required to execute the operation. Although a default_run procedure is provided to execute the
+/// deployment with ease, all functions related to the pipeline are public and can be executed as
+/// deemed by the caller, providing extensive granularity.
 pub struct Cartographer {
     pub(crate) config: CartographerConfig,
-    pub(crate) before_init: Option<Box<dyn FnOnce()>>,
-    pub(crate) attach_callback: Option<Box<dyn FnOnce()>>,
+    pub(crate) before_init: Option<Box<dyn FnOnce(&mut AtomicMatrix)>>,
+    pub(crate) attach_callback: Option<fn(&mut AtomicMatrix)>,
 }
 
 impl Cartographer {
+    /// Creates a new [`Cartographer`] struct from a [`CartographerShmBuilder`] instance.
+    ///
+    /// ### Params:
+    /// @config: The CartographerShmBuilder instance to derivate the configuration from.
+    ///
+    /// ### Returns:
+    /// An instance of Self.
     // Hehe
     pub fn new_shm_from(config: CartographerShmBuilder) -> Self {
         let cartographer = config.build();
@@ -72,6 +89,20 @@ impl Cartographer {
         return cartographer;
     }
 
+    /// Creates or attach to a new file based SHM arena.
+    ///
+    /// If the configured method is attach, calls [`libc::shm_open`] with RDWR flag. If it's New(s),
+    /// get the size from the enum option, create the file and truncates it to the requested size.
+    /// Both branches attaches the configured file permission at shm_open, although attach calls
+    /// don't change the initially defined fs_permission.
+    ///
+    /// ### Returns:
+    /// Either the file descriptor, or a [`CartographerErrors`]:
+    ///
+    /// - [`CartographerErrors::InvalidFileTypeCall`]: tried to call an file based function on an
+    /// MemFd defined configuration.
+    /// - [`CartographerErrors::FileCreationError`]: Failed to open or attach to the SHM file.
+    /// - [`CartographerErrors::FileTruncateError`]: Failed to truncate the SHM file size.
     pub fn create_file(&self) -> Result<i32, CartographerErrors> {
         let config = match &self.config {
             CartographerConfig::Shm(v) => v,
@@ -121,6 +152,23 @@ impl Cartographer {
         }
     }
 
+    /// Enables the initial runtime page protection with [`libc::mprotect`] syscall.
+    ///
+    /// This function enables memory page write protection at runtime and returns the MprotectKey.
+    /// Processes can use this key to temporarely unlock the arena to write infomation and lock it
+    /// again at the end of the call. All blocks from the beginning of the matrix to the last used
+    /// block are measured to size the initial lock. This size is then padded to default page sizes
+    /// (4kb) and passed to mprotect. If the padded size exceeds the total size of the matrix, the
+    /// function will fail.
+    ///
+    /// ### Params:
+    /// @base_ptr: The offset to the beginning of the matrix in the current process.
+    ///
+    /// ### Returns:
+    /// Either a MprotectKey, or a [`CartographerErrors`]:
+    ///
+    /// - [CartographerErrors::RuntimeProtError]: Failed to activate mprotect at the requested
+    /// matrix file.
     pub fn rolling_runtime_protection(base_ptr: *const u8) -> Result<(), CartographerErrors> {
         let start_address = unsafe { base_ptr.add(16 + std::mem::size_of::<AtomicMatrix>()) };
 
@@ -160,14 +208,9 @@ impl Cartographer {
         Ok(())
     }
 
-    pub fn targeted_runtime_protection(
-        &self,
-        base_ptr: *const u8,
-        targets: &[RelativePtr<u8>],
-    ) -> Result<(), CartographerErrors> {
-        unimplemented!()
-    }
-
+    /// Detects if the current app contains a valid app protection system.
+    ///
+    /// #TODO: separate between apparmor and SELinux.
     pub fn app_protection_detect(path: &str, validation: &str) -> Option<bool> {
         let app_path = CString::new(path).unwrap();
         let app_fd = unsafe { libc::open(app_path.as_ptr(), libc::O_RDONLY) };
@@ -192,6 +235,23 @@ impl Cartographer {
         unimplemented!()
     }
 
+    /// Creates a MMAP pointer to the requested SHM file descriptor.
+    ///
+    /// First, it gets the size of the SHM file, either from the value attached in new, or from the
+    /// reuqested fd with [`libc::fstat`] and [`std::mem::zeroed`]. Then it defines the permission
+    /// flag based on the provided [`ProcessRole`] (PROT_READ for Reader or PROT_READ | PROT_WRITE
+    /// for Writer and above). Finally, it calls [`libc::mmap`] at the file descriptor and returns
+    /// the pointer as a `*mut u8`.
+    ///
+    /// ### Params:
+    /// @fd: The file descriptor of the SHM file to map.
+    ///
+    /// ### Returns:
+    /// Either the pointer to the mmap or a [`CartographerErrors`]:
+    ///
+    /// - [`CartographerErrors::InvalidFileTypeCall`]: Tried to call an file based function on an
+    /// MemFd defined configuration.
+    /// - [`CartographerErrors::MmapError`]: libc::mmap failed to map the fd into virtual memory.
     pub fn mmap_memory(&self, fd: i32) -> Result<*mut u8, CartographerErrors> {
         let (size, role) = match &self.config {
             CartographerConfig::Shm(c) => {
@@ -235,6 +295,25 @@ impl Cartographer {
     }
 
     /// Deploys the matrix structures at the metadata section at initialization.
+    ///
+    /// It exchanges the init guard flag at the first 16 bytes of the segment from SYS_UNITIALIZED
+    /// to SYS_FORMATTING, then it lays the matrix struct after the init flag, executes the
+    /// before_init callback with the matrix as argument and returns the constructed [`AtomicMatrix`]
+    /// to be used. This is the last function to be called in the pipeline, as it releases the use
+    /// of the matrix for other processes.
+    ///
+    /// ### Params:
+    /// @base_ptr: The offset to the beginning of the matrix in the current process.
+    ///
+    /// ### Returns:
+    /// Either the constructed matrix, or a [`CartographerErrors`]:
+    ///
+    /// - [`CartographerErrors::InvalidFileTypeCall`]: Tried to run a file based function with an
+    /// MemFd defined configuration.
+    /// - [`CartographerErrors::WhyWouldYouDoThat`]: Because why would you try to implement the
+    /// metadata in am Attach configuration?
+    /// - [`CartographerErrors::SysInitializedError`]: The system is already, or is being
+    /// initialized by another process.
     pub fn sys_implement(
         &mut self,
         base_ptr: *const u8,
@@ -288,7 +367,7 @@ impl Cartographer {
                 .store(size as u32, Ordering::Release);
 
             if let Some(callback) = self.before_init.take() {
-                callback();
+                callback(matrix);
             }
 
             init_guard.store(SYS_READY, Ordering::SeqCst);
@@ -297,6 +376,67 @@ impl Cartographer {
         }
 
         unsafe { Ok(&mut *matrix_ptr) }
+    }
+
+    pub fn sys_attach_callback(&mut self, base_ptr: *const u8) -> Result<(), CartographerErrors> {
+        let build_id = fnv1a_32(env!("CARGO_PKG_VERSION").as_bytes());
+
+        match &self.config {
+            CartographerConfig::Shm(_) => {
+                let attach_callback_offset = unsafe {
+                    base_ptr.add(16 as usize + std::mem::size_of::<AtomicMatrix>()) as usize
+                };
+                let callback_rel_ptr = RelativePtr::<u8>::new(attach_callback_offset as u32);
+                let h = unsafe { callback_rel_ptr.resolve_header(base_ptr) };
+
+                if h.state.load(Ordering::Relaxed) == STATE_CALLBACK {
+                    let callback_flag =
+                        unsafe { &*(*callback_rel_ptr.resolve(base_ptr) as *const AtomicU32) };
+                    let callback_magic = unsafe {
+                        &*(*callback_rel_ptr.resolve(base_ptr.add(16)) as *const AtomicU32)
+                    };
+                    let callback = unsafe {
+                        *callback_rel_ptr.resolve(base_ptr.add(32)) as *const fn(&mut AtomicMatrix)
+                    };
+
+                    if callback_flag.load(Ordering::Relaxed) != build_id
+                        || callback_magic.load(Ordering::Relaxed) != 0xCADEBABEDEADBEEF
+                    {
+                        return Err(CartographerErrors::InvalidCrossProcess);
+                    };
+
+                    self.attach_callback = unsafe { Some(*callback) };
+                } else {
+                    return Err(CartographerErrors::NotACallback);
+                };
+
+                Ok(())
+            }
+            CartographerConfig::MemFd(_) => {
+                return Err(CartographerErrors::InvalidFileTypeCall);
+            }
+        }
+    }
+
+    pub fn sys_attach(&self, base_ptr: *const u8) -> &'static AtomicMatrix {
+        let retry_count: u32 = 0;
+
+        let init_guard = unsafe { &*(base_ptr as *const AtomicU32) };
+        let matrix = unsafe { base_ptr.add(16) as *mut AtomicMatrix };
+
+        while init_guard
+            .load_if_any(&[SYS_UNINITIALIZED, SYS_FORMATTING], Ordering::Acquire)
+            .is_ok()
+        {
+            if retry_count <= 512 {
+                retry_count.checked_add(1);
+                std::hint::spin_loop();
+            } else {
+                panic!("Unable to connect to provided matrix!");
+            }
+        }
+
+        return unsafe { &mut *matrix };
     }
 
     pub fn default_run(&self) -> Result<MatrixHandler, MatrixErrors> {

@@ -6,8 +6,6 @@
 use crate::prelude::{ Block, TAG_SIZE };
 
 use std::any::type_name;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
 
 /// Generate a new type_tag in u32 format from the type passed to this function.
 ///
@@ -21,9 +19,7 @@ use std::hash::{Hash, Hasher};
 /// The hashed type name in u32 format.
 pub fn make<T>() -> u32 {
     let name = type_name::<T>();
-    let mut hasher = DefaultHasher::new();
-    name.hash(&mut hasher);
-    hasher.finish() as u32
+    return fnv1a_32(name.as_bytes())
 }
 
 /// Compares the passed type to the type tag inside the provided block.
@@ -44,4 +40,14 @@ pub fn compare<T>(block: &Block<T>) -> bool {
     let expected_tag = make::<T>();
 
     stored_tag == expected_tag
+}
+
+pub fn fnv1a_32(bytes: &[u8]) -> u32 {
+    let mut hash: u32 = 0x811c9dc5;
+    for &b in bytes {
+        hash ^= b as u32;
+        hash = hash.wrapping_mul(0x01000193);
+    }
+
+    hash
 }
