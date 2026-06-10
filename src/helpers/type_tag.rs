@@ -42,6 +42,17 @@ pub fn compare<T>(block: &Block<T>) -> bool {
     stored_tag == expected_tag
 }
 
+/// FNV-1a 32 bit hashing algorithm for deterministic u32 hash generation.
+///
+/// It consumes a string in byte array format, XOR the bytes into a base value, multiplies the
+/// current result with the FNV prime number and returns final hash after each byte from the string
+/// has gone through the loop.
+///
+/// ### Params:
+/// @bytes: The string to be hashed in &[u8] format.
+///
+/// ### Returns:
+/// The u32 result of the string hashing
 pub fn fnv1a_32(bytes: &[u8]) -> u32 {
     let mut hash: u32 = 0x811c9dc5;
     for &b in bytes {

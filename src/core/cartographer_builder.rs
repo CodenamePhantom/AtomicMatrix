@@ -176,6 +176,9 @@ impl CartographerShmBuilder {
                 runtime_protected: self.runtime_protected,
                 defer: self.defer
             }),
+            base_ptr: None,
+            mmap: None,
+            matrix: None,
             before_init: self.before_init,
             attach_callback: self.attach_callback,
         }

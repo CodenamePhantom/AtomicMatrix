@@ -25,16 +25,15 @@
 //! - Memfd sealing and file descriptor attachment.
 //! - Complex initialization procedures like initialization deferral and pre SYS_READY callbacks.
 
-use crate::helpers::type_tag::fnv1a_32;
-use crate::internals::error_collection::{CartographerErrors, MatrixErrors};
+use crate::internals::error_collection::CartographerErrors;
+use crate::helpers::type_tag;
 use crate::prelude::*;
-
-use std::collections::hash_map::DefaultHasher;
+use memmap2::MmapMut;
 use std::ffi::CString;
-use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 pub const STATE_CALLBACK: u32 = 4;
+pub const CALLBACK_MAGIC: u64 = 0xCADEBABEDEADBEEF;
 
 /// Config enum to separate setups for SHM or MemFd based arenas
 ///
@@ -44,6 +43,14 @@ pub const STATE_CALLBACK: u32 = 4;
 pub enum CartographerConfig {
     Shm(CartographerShm),
     MemFd(CartographerMemFd),
+}
+
+#[repr(C)]
+struct CallbackBlock {
+    flag: AtomicU32,
+    _pad: u32,
+    magic: AtomicU64,
+    callback: fn(&mut AtomicMatrix),
 }
 
 /// SHM based configuration template
@@ -70,6 +77,9 @@ pub(crate) struct CartographerMemFd {}
 /// deemed by the caller, providing extensive granularity.
 pub struct Cartographer {
     pub(crate) config: CartographerConfig,
+    pub(crate) base_ptr: Option<*const u8>,
+    pub(crate) mmap: Option<*mut u8>,
+    pub(crate) matrix: Option<&'static mut AtomicMatrix>,
     pub(crate) before_init: Option<Box<dyn FnOnce(&mut AtomicMatrix)>>,
     pub(crate) attach_callback: Option<fn(&mut AtomicMatrix)>,
 }
@@ -161,15 +171,15 @@ impl Cartographer {
     /// (4kb) and passed to mprotect. If the padded size exceeds the total size of the matrix, the
     /// function will fail.
     ///
-    /// ### Params:
-    /// @base_ptr: The offset to the beginning of the matrix in the current process.
-    ///
     /// ### Returns:
     /// Either a MprotectKey, or a [`CartographerErrors`]:
     ///
     /// - [CartographerErrors::RuntimeProtError]: Failed to activate mprotect at the requested
     /// matrix file.
-    pub fn rolling_runtime_protection(base_ptr: *const u8) -> Result<(), CartographerErrors> {
+    ///
+    // #TODO: implement MprotectKey
+    pub fn rolling_runtime_protection(&self) -> Result<(), CartographerErrors> {
+        let base_ptr = self.base_ptr.unwrap();
         let start_address = unsafe { base_ptr.add(16 + std::mem::size_of::<AtomicMatrix>()) };
 
         let current_address = start_address;
@@ -247,12 +257,13 @@ impl Cartographer {
     /// @fd: The file descriptor of the SHM file to map.
     ///
     /// ### Returns:
-    /// Either the pointer to the mmap or a [`CartographerErrors`]:
+    /// A result containing either Self, or a [`CartographerErrors`]:
     ///
     /// - [`CartographerErrors::InvalidFileTypeCall`]: Tried to call an file based function on an
     /// MemFd defined configuration.
     /// - [`CartographerErrors::MmapError`]: libc::mmap failed to map the fd into virtual memory.
-    pub fn mmap_memory(&self, fd: i32) -> Result<*mut u8, CartographerErrors> {
+    #[must_use = "Instance of Cartographer must be retrieved."]
+    pub fn mmap_memory(mut self, fd: i32) -> Result<Self, CartographerErrors> {
         let (size, role) = match &self.config {
             CartographerConfig::Shm(c) => {
                 let size = match c.size {
@@ -291,22 +302,67 @@ impl Cartographer {
             return Err(CartographerErrors::MmapError);
         }
 
-        Ok(ptr as *mut u8)
+        self.mmap = Some(ptr as *mut u8);
+        self.base_ptr = Some(ptr as *const u8);
+
+        Ok(self)
+    }
+
+    /// Allocates the attach callback function at the matrix.
+    ///
+    /// It first validates if an attach_callback was provided at building, then it allocates a
+    /// [`CallbackBlock`] at the matrix (ideally the first block), sets up the callback structure
+    /// and returns the writing confirmation.
+    ///
+    /// ### Returns:
+    /// Either the writing confirmation, or a [`CartographerErrors`]:
+    ///
+    /// - [`CartographerErrors::NotACallback`]: A callback was not provided at building.
+    /// - [`CartographerErrors::MmapError`]: Unable to allocate the callback at the matrix.
+    pub fn sys_callback_implement(&mut self) -> Result<(), CartographerErrors> {
+        let base_ptr = self.base_ptr.unwrap();
+        let matrix = match &self.matrix {
+            Some(v) => v,
+            None => return Err(CartographerErrors::InvalidCrossProcessCall),
+        };
+
+        let build_id = type_tag::fnv1a_32(env!("CARGO_PKG_VERSION").as_bytes());
+
+        let callback = match self.attach_callback {
+            Some(v) => v,
+            None => return Err(CartographerErrors::NotACallback),
+        };
+
+        let block_size = std::mem::size_of::<CallbackBlock>() as u32;
+        let (block, header) = match matrix.allocate(base_ptr, block_size) {
+            Ok(v) => {
+                let rel_ptr = RelativePtr::<CallbackBlock>::new(v.offset());
+                unsafe {
+                    let block = rel_ptr.resolve_mut(base_ptr);
+                    let header = rel_ptr.resolve_header_mut(base_ptr);
+                    (block, header)
+                }
+            }
+            Err(_) => return Err(CartographerErrors::MmapError),
+        };
+
+        header.state.store(STATE_CALLBACK, Ordering::Release);
+        block.flag.store(build_id, Ordering::Release);
+        block.magic.store(CALLBACK_MAGIC, Ordering::Release);
+        block.callback = callback;
+
+        Ok(())
     }
 
     /// Deploys the matrix structures at the metadata section at initialization.
     ///
     /// It exchanges the init guard flag at the first 16 bytes of the segment from SYS_UNITIALIZED
-    /// to SYS_FORMATTING, then it lays the matrix struct after the init flag, executes the
-    /// before_init callback with the matrix as argument and returns the constructed [`AtomicMatrix`]
-    /// to be used. This is the last function to be called in the pipeline, as it releases the use
-    /// of the matrix for other processes.
-    ///
-    /// ### Params:
-    /// @base_ptr: The offset to the beginning of the matrix in the current process.
+    /// to SYS_FORMATTING, then it lays the matrix struct after the init flag,and returns the
+    /// constructed [`AtomicMatrix`] to be used. This method **DO NOT** release the matrix, just
+    /// switches the init_guard to SYS_FORMATTING. To release the matrix, call `sys_release()`
     ///
     /// ### Returns:
-    /// Either the constructed matrix, or a [`CartographerErrors`]:
+    /// A result containing either Self, or a [`CartographerErrors`]:
     ///
     /// - [`CartographerErrors::InvalidFileTypeCall`]: Tried to run a file based function with an
     /// MemFd defined configuration.
@@ -314,10 +370,9 @@ impl Cartographer {
     /// metadata in am Attach configuration?
     /// - [`CartographerErrors::SysInitializedError`]: The system is already, or is being
     /// initialized by another process.
-    pub fn sys_implement(
-        &mut self,
-        base_ptr: *const u8,
-    ) -> Result<&'static AtomicMatrix, CartographerErrors> {
+    #[must_use = "Instance of Cartographer must be retrieved."]
+    pub fn sys_implement(mut self) -> Result<Self, CartographerErrors> {
+        let base_ptr = self.base_ptr.unwrap();
         let size = match &self.config {
             CartographerConfig::Shm(c) => match c.size {
                 LinkMethod::New(s) => s as usize,
@@ -365,47 +420,52 @@ impl Cartographer {
             matrix
                 .sector_boundaries
                 .store(size as u32, Ordering::Release);
-
-            if let Some(callback) = self.before_init.take() {
-                callback(matrix);
-            }
-
-            init_guard.store(SYS_READY, Ordering::SeqCst);
         } else {
             return Err(CartographerErrors::SysInitializedError);
         }
 
-        unsafe { Ok(&mut *matrix_ptr) }
+        unsafe { self.matrix = Some(&mut *matrix_ptr) };
+        Ok(self)
     }
 
-    pub fn sys_attach_callback(&mut self, base_ptr: *const u8) -> Result<(), CartographerErrors> {
-        let build_id = fnv1a_32(env!("CARGO_PKG_VERSION").as_bytes());
+    /// Reconstruct the callback written in the matrix back into the attach_callback property.
+    ///
+    /// It first queries the first block and checks if it is in callback state. Then it validates
+    /// the callback structure (build_id and magic number) to see if the callback is being
+    /// reconstructed from a process using the same binary. This ensures that call pointers doesn't
+    /// cause a SEGFALT in the vTable. Then it reconstructs the function and attach it to the
+    /// attach_callback property.
+    ///
+    /// ### Returns:
+    /// A result containing an empty Ok, or a [`CartographerErrors`]:
+    ///
+    /// - [CartographerErrors::InvalidCrossProcessCall]: Tried to reconstruct the callback from a
+    /// different binary process.
+    /// - [`CartographerErrors::NotACallback`]: The first block in the matrix is not a call on
+    /// attachment function.
+    /// - [`CartographerErrors::InvalidFileTypeCall`]: Tried to call a file based function with a
+    /// MemFd defined configuration.
+    pub fn sys_attach_callback(&mut self) -> Result<(), CartographerErrors> {
+        let base_ptr = self.base_ptr.unwrap();
+        let build_id = type_tag::fnv1a_32(env!("CARGO_PKG_VERSION").as_bytes());
 
         match &self.config {
             CartographerConfig::Shm(_) => {
                 let attach_callback_offset = unsafe {
                     base_ptr.add(16 as usize + std::mem::size_of::<AtomicMatrix>()) as usize
                 };
-                let callback_rel_ptr = RelativePtr::<u8>::new(attach_callback_offset as u32);
-                let h = unsafe { callback_rel_ptr.resolve_header(base_ptr) };
+                let callback_ptr = RelativePtr::<CallbackBlock>::new(attach_callback_offset as u32);
+                let callback = unsafe { callback_ptr.resolve(base_ptr) };
+                let h = unsafe { callback_ptr.resolve_header(base_ptr) };
 
                 if h.state.load(Ordering::Relaxed) == STATE_CALLBACK {
-                    let callback_flag =
-                        unsafe { &*(*callback_rel_ptr.resolve(base_ptr) as *const AtomicU32) };
-                    let callback_magic = unsafe {
-                        &*(*callback_rel_ptr.resolve(base_ptr.add(16)) as *const AtomicU32)
-                    };
-                    let callback = unsafe {
-                        *callback_rel_ptr.resolve(base_ptr.add(32)) as *const fn(&mut AtomicMatrix)
-                    };
-
-                    if callback_flag.load(Ordering::Relaxed) != build_id
-                        || callback_magic.load(Ordering::Relaxed) != 0xCADEBABEDEADBEEF
+                    if callback.flag.load(Ordering::Relaxed) != build_id
+                        || callback.magic.load(Ordering::Relaxed) != CALLBACK_MAGIC
                     {
-                        return Err(CartographerErrors::InvalidCrossProcess);
+                        return Err(CartographerErrors::InvalidCrossProcessCall);
                     };
 
-                    self.attach_callback = unsafe { Some(*callback) };
+                    self.attach_callback = Some(callback.callback);
                 } else {
                     return Err(CartographerErrors::NotACallback);
                 };
@@ -418,28 +478,173 @@ impl Cartographer {
         }
     }
 
-    pub fn sys_attach(&self, base_ptr: *const u8) -> &'static AtomicMatrix {
-        let retry_count: u32 = 0;
+    /// Attach to the SHM metadata.
+    ///
+    /// It first queries the init_guard and matrix structures from the metadata section, then it
+    /// checks if the flag is setted to SYS_READY. If the call passes the checks, it sets the matrix
+    /// property on Cartographer and finishes. The system is allowed to retry 512 times before
+    /// panicking.
+    ///
+    /// ### Returns:
+    /// An instance of self.
+    #[must_use = "Instance of Cartographer must be retrieved."]
+    pub fn sys_attach(mut self) -> Result<MatrixHandler, CartographerErrors> {
+        let base_ptr = self.base_ptr.unwrap();
+        let mut retry_count: u16 = 0;
 
         let init_guard = unsafe { &*(base_ptr as *const AtomicU32) };
         let matrix = unsafe { base_ptr.add(16) as *mut AtomicMatrix };
+
+        let id: String = match &self.config {
+            CartographerConfig::Shm(v) => match &v.uuid {
+                Some(v) => v.clone(),
+                None => String::from(uid_lite::generate_uuid()),
+            },
+            CartographerConfig::MemFd(_) => String::from(uid_lite::generate_uuid()),
+        };
+
+        let raw = match self.mmap.take() {
+            Some(v) => v,
+            None => return Err(CartographerErrors::MmapError),
+        };
+        let mmap = unsafe { std::ptr::read(raw as *const MmapMut) };
 
         while init_guard
             .load_if_any(&[SYS_UNINITIALIZED, SYS_FORMATTING], Ordering::Acquire)
             .is_ok()
         {
             if retry_count <= 512 {
-                retry_count.checked_add(1);
+                retry_count += retry_count.saturating_add(1);
                 std::hint::spin_loop();
             } else {
                 panic!("Unable to connect to provided matrix!");
             }
         }
 
-        return unsafe { &mut *matrix };
+        let handler = MatrixHandler::new(unsafe { &mut *matrix }, mmap, 0, id);
+
+        Ok(handler)
     }
 
-    pub fn default_run(&self) -> Result<MatrixHandler, MatrixErrors> {
-        unimplemented!()
+    /// Releases the system for all processes returning a [`MatrixHandler`] in the process.
+    ///
+    /// First, it gets the configured UUID, the mmap instance cast as MmapMut, and the matrix reference.
+    /// Then it calls the before_init callback, and tries to swap the init_guard from SYS_FORMATTING
+    /// to SYS_READY. If sucessful, it assembles the MatrixHandler and returns it.
+    ///
+    /// ### Returns:
+    /// A result containing either the MatrixHandler, or a [`CartographerErrors`]:
+    ///
+    /// - [`CartographerErrors::MmapError`]: no mmap or matrix instance found in Cartographer struct.
+    /// - [`CartographerErrors::InvalidCrossProcessCall`]: unable to swap init_guard to SYS_READY.
+    pub fn sys_release(&mut self) -> Result<MatrixHandler, CartographerErrors> {
+        let base_ptr = self.base_ptr.unwrap();
+        let init_guard = unsafe { &*(base_ptr as *mut AtomicU32) };
+
+        let id: String = match &self.config {
+            CartographerConfig::Shm(v) => match &v.uuid {
+                Some(v) => v.clone(),
+                None => String::from(uid_lite::generate_uuid()),
+            },
+            CartographerConfig::MemFd(_) => String::from(uid_lite::generate_uuid()),
+        };
+
+        let raw = match self.mmap.take() {
+            Some(v) => v,
+            None => return Err(CartographerErrors::MmapError),
+        };
+        let mmap = unsafe { std::ptr::read(raw as *const MmapMut) };
+
+        let matrix = match self.matrix.take() {
+            Some(v) => v,
+            None => return Err(CartographerErrors::MmapError),
+        };
+
+        if let Some(callback) = self.before_init.take() {
+            callback(matrix)
+        };
+
+        if init_guard
+            .compare_exchange(
+                SYS_FORMATTING,
+                SYS_READY,
+                Ordering::Release,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            let handler = MatrixHandler::new(matrix, mmap, 0, id);
+
+            Ok(handler)
+        } else {
+            Err(CartographerErrors::InvalidCrossProcessCall)
+        }
+    }
+
+    /// Default cartographer deployment pipeline to be used.
+    ///
+    /// This provides a clear usable path that ends up returning a [`MatrixHandler`], unless a very
+    /// specific problem happens (sys errors, files released or deleted, etc). Callers can opt out
+    /// of this implementation and construct their own pipeline by hand, provided they know what 
+    /// they're doing.
+    ///
+    /// ### Returns:
+    /// A result containing either the MatrixHandler, or a [`CartographerErrors`] related to the
+    /// step that failed.
+    pub fn default_run(mut self) -> Result<MatrixHandler, CartographerErrors> {
+        // Controller variables
+        let handler: MatrixHandler;
+        let file_descriptor: i32;
+
+        // Extract pipeline flags from builder config.
+        let (app_protection, runtime_protected, defer) = match &self.config {
+            CartographerConfig::Shm(v) => {
+                file_descriptor = self.create_file()?;
+                (v.app_protection, v.runtime_protected, v.defer)
+            },
+            CartographerConfig::MemFd(_) => unimplemented!(),
+        };
+
+        // App protection deployment. To be implemented.
+        if app_protection {
+            unimplemented!()
+        };
+
+        // Generates mmap.
+        self = self.mmap_memory(file_descriptor)?;
+
+        // Config deferral checkpoint
+        if !defer {
+            // Processes that pass execute administrative deployment.
+            self = self.sys_implement()?;
+
+            if runtime_protected {
+                self.rolling_runtime_protection()?;
+            };
+
+            if self.attach_callback.is_some() {
+                self.sys_callback_implement()?;
+            };
+
+            handler = match self.sys_release() {
+                Ok(w) => w,
+                Err(e) => return Err(e),
+            };
+        } else {
+            // attach callback is invoked at this stage, provided the process pass the binary check.
+            self.sys_attach_callback()?;
+            if let Some(callback) = self.attach_callback.take() {
+                match &mut self.matrix {
+                    Some(v) => callback(v),
+                    None => return Err(CartographerErrors::NotACallback),
+                };
+            }
+
+            // Processes that fails awaits implementation before attaching.
+            handler = self.sys_attach()?;
+        };
+
+        // MatrixHandler is returned regardless of branch taken.
+        return Ok(handler);
     }
 }
