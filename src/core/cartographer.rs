@@ -26,7 +26,6 @@
 //! - Complex initialization procedures like initialization deferral and pre SYS_READY callbacks.
 
 use crate::internals::error_collection::CartographerErrors;
-use crate::helpers::type_tag;
 use crate::prelude::*;
 use memmap2::MmapMut;
 use std::ffi::CString;
@@ -113,52 +112,69 @@ impl Cartographer {
     /// MemFd defined configuration.
     /// - [`CartographerErrors::FileCreationError`]: Failed to open or attach to the SHM file.
     /// - [`CartographerErrors::FileTruncateError`]: Failed to truncate the SHM file size.
-    pub fn create_file(&self) -> Result<i32, CartographerErrors> {
+    pub fn create_file(&self) -> BetterResult<i32, CartographerErrors> {
         let config = match &self.config {
             CartographerConfig::Shm(v) => v,
-            _ => return Err(CartographerErrors::InvalidFileTypeCall),
+            _ => {
+                return BetterResult::fail(CartographerErrors::InvalidFileTypeCall {
+                    file_type: "MemFd".into(),
+                });
+            }
         };
+        let attach_type = &config.size;
 
-        let name = match &config.uuid {
-            Some(v) => CString::new(format!("/dev/shm/matrix-{}", v)).unwrap(),
-            None => CString::new(format!("/dev/shm/matrix-{}", uid_lite::generate_uuid())).unwrap(),
+        let matrix_name = match &config.uuid {
+            Some(v) => CString::new(format!("/dev/shm/matrix-{}\0", v)).unwrap(),
+            None => {
+                if attach_type == &LinkMethod::Attach {
+                    return BetterResult::fail(CartographerErrors::InvalidCrossProcessCall {
+                        reason: "Can attach to an existing matrix without providing UUID.".into(),
+                    });
+                } else {
+                    CString::new(format!("/dev/shm/matrix-{}\0", uid_lite::generate_uuid()))
+                        .unwrap()
+                }
+            }
         };
-        let size = match config.size {
-            LinkMethod::New(s) => s as i64,
+        let size = match attach_type {
+            LinkMethod::New(s) => *s as i64,
             LinkMethod::Attach => unreachable!(),
         };
 
-        if config.size == LinkMethod::Attach {
-            let file = unsafe { libc::shm_open(name.as_ptr(), libc::O_RDWR, config.fs_permission) };
+        if attach_type == &LinkMethod::Attach {
+            let file =
+                unsafe { libc::shm_open(matrix_name.as_ptr(), libc::O_RDWR, config.fs_permission) };
 
             if file < 0 {
-                return Err(CartographerErrors::FileCreationError);
+                return BetterResult::fail(CartographerErrors::FileCreationError { err_no: file });
             } else {
-                return Ok(file);
+                return BetterResult::succeed(file);
             }
         } else {
             let file = unsafe {
                 libc::shm_open(
-                    name.as_ptr(),
+                    matrix_name.as_ptr(),
                     libc::O_RDWR | libc::O_CREAT,
                     config.fs_permission,
                 )
             };
 
             if file < 0 {
-                return Err(CartographerErrors::FileCreationError);
+                return BetterResult::fail(CartographerErrors::FileCreationError { err_no: file });
             }
 
             unsafe {
                 if libc::ftruncate(file, size) == -1 {
-                    libc::shm_unlink(name.as_ptr() as *const i8);
-                    return Err(CartographerErrors::FileTruncateError);
+                    libc::shm_unlink(matrix_name.as_ptr() as *const i8);
+                    return BetterResult::fail(CartographerErrors::FileTruncateError {
+                        err_no: file,
+                    });
                 }
 
                 libc::fchown(file, config.fs_uid, config.fs_gid);
             }
 
-            return Ok(file);
+            return BetterResult::succeed(file);
         }
     }
 
@@ -178,7 +194,7 @@ impl Cartographer {
     /// matrix file.
     ///
     // #TODO: implement MprotectKey
-    pub fn rolling_runtime_protection(&self) -> Result<(), CartographerErrors> {
+    pub fn rolling_runtime_protection(&self) -> BetterResult<(), CartographerErrors> {
         let base_ptr = self.base_ptr.unwrap();
         let start_address = unsafe { base_ptr.add(16 + std::mem::size_of::<AtomicMatrix>()) };
 
@@ -210,12 +226,12 @@ impl Cartographer {
         };
 
         if res < 0 {
-            return Err(CartographerErrors::RuntimeProtError(
-                "Unable to activate mprotect for blocks at initialization".into(),
-            ));
+            return BetterResult::fail(CartographerErrors::RuntimeProtError {
+                reason: "Unable to activate mprotect for blocks at initialization".into(),
+            });
         };
 
-        Ok(())
+        BetterResult::succeed(())
     }
 
     /// Detects if the current app contains a valid app protection system.
@@ -259,11 +275,9 @@ impl Cartographer {
     /// ### Returns:
     /// A result containing either Self, or a [`CartographerErrors`]:
     ///
-    /// - [`CartographerErrors::InvalidFileTypeCall`]: Tried to call an file based function on an
-    /// MemFd defined configuration.
     /// - [`CartographerErrors::MmapError`]: libc::mmap failed to map the fd into virtual memory.
     #[must_use = "Instance of Cartographer must be retrieved."]
-    pub fn mmap_memory(mut self, fd: i32) -> Result<Self, CartographerErrors> {
+    pub fn mmap_memory(mut self, fd: i32) -> BetterResult<Self, CartographerErrors> {
         let (size, role) = match &self.config {
             CartographerConfig::Shm(c) => {
                 let size = match c.size {
@@ -278,7 +292,7 @@ impl Cartographer {
 
                 (size, role)
             }
-            _ => return Err(CartographerErrors::InvalidFileTypeCall),
+            _ => unimplemented!(),
         };
 
         let permission = if role == &ProcessRole::Reader {
@@ -299,13 +313,16 @@ impl Cartographer {
         };
 
         if ptr == libc::MAP_FAILED {
-            return Err(CartographerErrors::MmapError);
+            return BetterResult::fail(CartographerErrors::MmapError {
+                err_no: ptr as i32,
+                call: "mmap_memory".into(),
+            });
         }
 
         self.mmap = Some(ptr as *mut u8);
         self.base_ptr = Some(ptr as *const u8);
 
-        Ok(self)
+        BetterResult::succeed(self)
     }
 
     /// Allocates the attach callback function at the matrix.
@@ -319,39 +336,47 @@ impl Cartographer {
     ///
     /// - [`CartographerErrors::NotACallback`]: A callback was not provided at building.
     /// - [`CartographerErrors::MmapError`]: Unable to allocate the callback at the matrix.
-    pub fn sys_callback_implement(&mut self) -> Result<(), CartographerErrors> {
+    pub fn sys_callback_implement(&mut self) -> BetterResult<(), CartographerErrors> {
         let base_ptr = self.base_ptr.unwrap();
         let matrix = match &self.matrix {
             Some(v) => v,
-            None => return Err(CartographerErrors::InvalidCrossProcessCall),
+            None => return BetterResult::fail(CartographerErrors::InvalidCrossProcessCall {
+                reason: "Can't implement callback without either constructing, or implementing the matrix first".into()
+            }),
         };
 
         let build_id = type_tag::fnv1a_32(env!("CARGO_PKG_VERSION").as_bytes());
 
         let callback = match self.attach_callback {
             Some(v) => v,
-            None => return Err(CartographerErrors::NotACallback),
+            None => {
+                return BetterResult::fail(CartographerErrors::CallbackError {
+                    reason: "Can't implement attach_callback without a callback being provided."
+                        .into(),
+                });
+            }
         };
 
         let block_size = std::mem::size_of::<CallbackBlock>() as u32;
-        let (block, header) = match matrix.allocate(base_ptr, block_size) {
-            Ok(v) => {
+        let (block, header) = matrix.allocate(base_ptr, block_size)
+            .catch_cast::<_, CartographerErrors>(|e| return BetterResult::fail(CartographerErrors::Inner(e)))
+            .finally_as::<_, (&mut CallbackBlock, &mut BlockHeader)>(|v| {
                 let rel_ptr = RelativePtr::<CallbackBlock>::new(v.offset());
+                
                 unsafe {
                     let block = rel_ptr.resolve_mut(base_ptr);
                     let header = rel_ptr.resolve_header_mut(base_ptr);
+
                     (block, header)
                 }
-            }
-            Err(_) => return Err(CartographerErrors::MmapError),
-        };
+            });
 
         header.state.store(STATE_CALLBACK, Ordering::Release);
         block.flag.store(build_id, Ordering::Release);
         block.magic.store(CALLBACK_MAGIC, Ordering::Release);
         block.callback = callback;
 
-        Ok(())
+        BetterResult::succeed(())
     }
 
     /// Deploys the matrix structures at the metadata section at initialization.
@@ -371,18 +396,16 @@ impl Cartographer {
     /// - [`CartographerErrors::SysInitializedError`]: The system is already, or is being
     /// initialized by another process.
     #[must_use = "Instance of Cartographer must be retrieved."]
-    pub fn sys_implement(mut self) -> Result<Self, CartographerErrors> {
+    pub fn sys_implement(mut self) -> BetterResult<Self, CartographerErrors> {
         let base_ptr = self.base_ptr.unwrap();
         let size = match &self.config {
             CartographerConfig::Shm(c) => match c.size {
                 LinkMethod::New(s) => s as usize,
                 LinkMethod::Attach => {
-                    return Err(CartographerErrors::WhyWouldYouDoThat(
-                        "Really... Why?".into(),
-                    ));
+                    return BetterResult::fail(CartographerErrors::WhyWouldYouDoThat);
                 }
             },
-            CartographerConfig::MemFd(_) => return Err(CartographerErrors::InvalidFileTypeCall),
+            CartographerConfig::MemFd(_) => unimplemented!(),
         };
         let init_guard = unsafe { &*(base_ptr as *const AtomicU32) };
         let matrix_ptr = unsafe { base_ptr.add(16) as *mut AtomicMatrix };
@@ -421,11 +444,11 @@ impl Cartographer {
                 .sector_boundaries
                 .store(size as u32, Ordering::Release);
         } else {
-            return Err(CartographerErrors::SysInitializedError);
+            return BetterResult::fail(CartographerErrors::SysInitializedError);
         }
 
         unsafe { self.matrix = Some(&mut *matrix_ptr) };
-        Ok(self)
+        BetterResult::succeed(self)
     }
 
     /// Reconstruct the callback written in the matrix back into the attach_callback property.
@@ -445,7 +468,7 @@ impl Cartographer {
     /// attachment function.
     /// - [`CartographerErrors::InvalidFileTypeCall`]: Tried to call a file based function with a
     /// MemFd defined configuration.
-    pub fn sys_attach_callback(&mut self) -> Result<(), CartographerErrors> {
+    pub fn sys_attach_callback(&mut self) -> BetterResult<(), CartographerErrors> {
         let base_ptr = self.base_ptr.unwrap();
         let build_id = type_tag::fnv1a_32(env!("CARGO_PKG_VERSION").as_bytes());
 
@@ -462,19 +485,22 @@ impl Cartographer {
                     if callback.flag.load(Ordering::Relaxed) != build_id
                         || callback.magic.load(Ordering::Relaxed) != CALLBACK_MAGIC
                     {
-                        return Err(CartographerErrors::InvalidCrossProcessCall);
+                        return BetterResult::fail(CartographerErrors::InvalidCrossProcessCall {
+                            reason: "Can't attach to a callback constructed on a different binary."
+                                .into(),
+                        });
                     };
 
                     self.attach_callback = Some(callback.callback);
                 } else {
-                    return Err(CartographerErrors::NotACallback);
+                    return BetterResult::fail(CartographerErrors::CallbackError {
+                        reason: "There isn't a callback attached to the matrix.".into(),
+                    });
                 };
 
-                Ok(())
+                BetterResult::succeed(())
             }
-            CartographerConfig::MemFd(_) => {
-                return Err(CartographerErrors::InvalidFileTypeCall);
-            }
+            CartographerConfig::MemFd(_) => unimplemented!(),
         }
     }
 
@@ -488,7 +514,7 @@ impl Cartographer {
     /// ### Returns:
     /// An instance of self.
     #[must_use = "Instance of Cartographer must be retrieved."]
-    pub fn sys_attach(mut self) -> Result<MatrixHandler, CartographerErrors> {
+    pub fn sys_attach(mut self) -> BetterResult<MatrixHandler, CartographerErrors> {
         let base_ptr = self.base_ptr.unwrap();
         let mut retry_count: u16 = 0;
 
@@ -505,7 +531,12 @@ impl Cartographer {
 
         let raw = match self.mmap.take() {
             Some(v) => v,
-            None => return Err(CartographerErrors::MmapError),
+            None => {
+                return BetterResult::fail(CartographerErrors::MmapError {
+                    err_no: 11,
+                    call: "sys_attach".into(),
+                });
+            }
         };
         let mmap = unsafe { std::ptr::read(raw as *const MmapMut) };
 
@@ -523,7 +554,7 @@ impl Cartographer {
 
         let handler = MatrixHandler::new(unsafe { &mut *matrix }, mmap, 0, id);
 
-        Ok(handler)
+        BetterResult::succeed(handler)
     }
 
     /// Releases the system for all processes returning a [`MatrixHandler`] in the process.
@@ -537,7 +568,7 @@ impl Cartographer {
     ///
     /// - [`CartographerErrors::MmapError`]: no mmap or matrix instance found in Cartographer struct.
     /// - [`CartographerErrors::InvalidCrossProcessCall`]: unable to swap init_guard to SYS_READY.
-    pub fn sys_release(&mut self) -> Result<MatrixHandler, CartographerErrors> {
+    pub fn sys_release(&mut self) -> BetterResult<MatrixHandler, CartographerErrors> {
         let base_ptr = self.base_ptr.unwrap();
         let init_guard = unsafe { &*(base_ptr as *mut AtomicU32) };
 
@@ -551,13 +582,23 @@ impl Cartographer {
 
         let raw = match self.mmap.take() {
             Some(v) => v,
-            None => return Err(CartographerErrors::MmapError),
+            None => {
+                return BetterResult::fail(CartographerErrors::MmapError {
+                    err_no: 11,
+                    call: "sys_release, retrieve raw mmap failed".into(),
+                });
+            }
         };
         let mmap = unsafe { std::ptr::read(raw as *const MmapMut) };
 
         let matrix = match self.matrix.take() {
             Some(v) => v,
-            None => return Err(CartographerErrors::MmapError),
+            None => {
+                return BetterResult::fail(CartographerErrors::MmapError {
+                    err_no: 12,
+                    call: "sys_release, retrieve matrix failed".into(),
+                });
+            }
         };
 
         if let Some(callback) = self.before_init.take() {
@@ -575,9 +616,11 @@ impl Cartographer {
         {
             let handler = MatrixHandler::new(matrix, mmap, 0, id);
 
-            Ok(handler)
+            BetterResult::succeed(handler)
         } else {
-            Err(CartographerErrors::InvalidCrossProcessCall)
+            BetterResult::fail(CartographerErrors::InvalidCrossProcessCall {
+                reason: "Failed to swap init_guard to SYS_READY.".into(),
+            })
         }
     }
 
@@ -585,23 +628,25 @@ impl Cartographer {
     ///
     /// This provides a clear usable path that ends up returning a [`MatrixHandler`], unless a very
     /// specific problem happens (sys errors, files released or deleted, etc). Callers can opt out
-    /// of this implementation and construct their own pipeline by hand, provided they know what 
+    /// of this implementation and construct their own pipeline by hand, provided they know what
     /// they're doing.
     ///
     /// ### Returns:
-    /// A result containing either the MatrixHandler, or a [`CartographerErrors`] related to the
+    /// An result containing either the MatrixHandler, or a [`CartographerErrors`] related to the
     /// step that failed.
-    pub fn default_run(mut self) -> Result<MatrixHandler, CartographerErrors> {
+    pub fn default_run(mut self) -> BetterResult<MatrixHandler, CartographerErrors> {
         // Controller variables
-        let handler: MatrixHandler;
         let file_descriptor: i32;
 
         // Extract pipeline flags from builder config.
         let (app_protection, runtime_protected, defer) = match &self.config {
             CartographerConfig::Shm(v) => {
-                file_descriptor = self.create_file()?;
+                file_descriptor = self
+                    .create_file()
+                    .catch(|e| return BetterResult::fail(e))
+                    .finally(|cv| cv);
                 (v.app_protection, v.runtime_protected, v.defer)
-            },
+            }
             CartographerConfig::MemFd(_) => unimplemented!(),
         };
 
@@ -611,40 +656,50 @@ impl Cartographer {
         };
 
         // Generates mmap.
-        self = self.mmap_memory(file_descriptor)?;
+        self = self
+            .mmap_memory(file_descriptor)
+            .catch(|e| return BetterResult::fail(e))
+            .finally(|v| v);
 
         // Config deferral checkpoint
         if !defer {
             // Processes that pass execute administrative deployment.
-            self = self.sys_implement()?;
+            self = self
+                .sys_implement()
+                .catch(|e| return BetterResult::fail(e))
+                .finally(|v| v);
 
             if runtime_protected {
-                self.rolling_runtime_protection()?;
+                self.rolling_runtime_protection()
+                    .chain_up::<CartographerErrors>();
             };
 
             if self.attach_callback.is_some() {
-                self.sys_callback_implement()?;
+                self.sys_callback_implement()
+                    .chain_up::<CartographerErrors>();
             };
 
-            handler = match self.sys_release() {
-                Ok(w) => w,
-                Err(e) => return Err(e),
-            };
+            self.sys_release()
+                .catch(|e| return BetterResult::fail(e))
+                .finally_return(|v| return BetterResult::succeed(v))
         } else {
             // attach callback is invoked at this stage, provided the process pass the binary check.
-            self.sys_attach_callback()?;
+            self.sys_attach_callback().chain_up::<CartographerErrors>();
             if let Some(callback) = self.attach_callback.take() {
                 match &mut self.matrix {
                     Some(v) => callback(v),
-                    None => return Err(CartographerErrors::NotACallback),
+                    None => {
+                        return BetterResult::fail(CartographerErrors::CallbackError {
+                            reason: "Unable to execute attach_callback function.".into(),
+                        });
+                    }
                 };
             }
 
             // Processes that fails awaits implementation before attaching.
-            handler = self.sys_attach()?;
-        };
-
-        // MatrixHandler is returned regardless of branch taken.
-        return Ok(handler);
+            self.sys_attach()
+                .catch(|e| return BetterResult::fail(e))
+                .finally_return(|v| return BetterResult::succeed(v))
+        }
     }
 }

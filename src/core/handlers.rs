@@ -57,7 +57,6 @@
 //! outlive all shared handles derived from it.
 
 use crate::internals::error_collection::HandlerErrors;
-use crate::helpers::type_tag;
 use crate::prelude::*;
 use memmap2::MmapMut;
 use std::sync::atomic::Ordering;
@@ -178,7 +177,7 @@ impl MatrixHandler {
     ///
     /// Existing mapping remains valid until the handlers are dropped; this
     /// only removes the filesystem entry, preventing new attachments.
-    pub fn die(&self) -> Result<(), HandlerErrors> {
+    pub fn die(&self) -> BetterResult<(), HandlerErrors> {
         let id = &self.id;
         let path = format!("/dev/shm/matrix-{}", id);
 
@@ -186,11 +185,11 @@ impl MatrixHandler {
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => {
-                return Err(HandlerErrors::DecomissionFailed { path, reason: e });
+                return BetterResult::fail(HandlerErrors::DecomissionFailed { path, reason: e });
             }
         };
 
-        Ok(())
+        BetterResult::succeed(())
     }
 }
 
@@ -229,7 +228,7 @@ impl HandlerFunctions for SharedHandler {
     }
 }
 
-/// Defines the core interaction surface for any matrix handle.
+/// Defines the core interaction surface for any matrix handler.
 ///
 /// Implemented by both [`MatrixHandler`] and [`SharedHandler`]. All matrix
 /// operations — allocation, I/O, lifecycle management, and escape hatches —
@@ -268,14 +267,16 @@ pub trait HandlerFunctions {
     /// # Errors
     /// Returns [`HandlerError::AllocationFailed`] if the matrix is out of
     /// memory or under contention after 512 retries.
-    fn allocate<T>(&self) -> Result<Block<T>, HandlerErrors> {
+    fn allocate<T>(&self) -> BetterResult<Block<T>, HandlerErrors> {
         let tag = type_tag::make::<T>();
         let size = std::mem::size_of::<T>() as u32;
 
-        let ptr = match self.matrix().allocate(self.base_ptr(), size + TAG_SIZE) {
-            Ok(v) => v,
-            Err(_) => return Err(HandlerErrors::AllocationFailed(format!("Failed to allocate a block")))
-        };
+        let ptr = self.matrix().allocate(self.base_ptr(), size + TAG_SIZE)
+            .catch_cast::<_, HandlerErrors>(|e| return {
+                BetterResult::fail(HandlerErrors::InnerMatrixError(e))
+            })
+            .finally(|v| v);
+
         unsafe { 
             let dp = *ptr.resolve_mut(self.base_ptr()) as *mut u32;
             *dp = tag
@@ -283,7 +284,7 @@ pub trait HandlerFunctions {
 
         let block = Block::<T>::from_offset(ptr.offset() + TAG_SIZE);
 
-        return Ok(block)
+        return BetterResult::succeed(block)
     }
 
     /// Allocates a raw byte block of the given size.
@@ -295,11 +296,12 @@ pub trait HandlerFunctions {
     ///
     /// # Errors
     /// Returns [`HandlerError::AllocationFailed`] if OOM or contention.
-    fn allocate_raw(&self, size: u32) -> Result<RelativePtr<u8>, HandlerErrors> {
-        match self.matrix().allocate(self.base_ptr(), size) {
-            Ok(v) => return Ok(v),
-            Err(_) =>  return Err(HandlerErrors::AllocationFailed("Unable to allocate block".into())),
-        };
+    fn allocate_raw(&self, size: u32) -> BetterResult<RelativePtr<u8>, HandlerErrors> {
+        self.matrix().allocate(self.base_ptr(), size)
+            .catch_cast::<_, HandlerErrors>(|e| {
+                return BetterResult::fail(HandlerErrors::InnerMatrixError(e))
+            })
+            .finally_return(|v| BetterResult::succeed(v))
     }
 
     /// Writes a value of type `T` into an allocated block.
@@ -311,9 +313,9 @@ pub trait HandlerFunctions {
     /// - No other thread may be reading or writing this block concurrently.
     ///   The caller is responsible for all synchronization beyond the atomic
     ///   state transitions provided by [`set_state`] and [`transition_state`].
-    fn write<T>(&self, block: &mut Block<T>, value: T) -> Result<(), HandlerErrors> {
+    fn write<T>(&self, block: &mut Block<T>, value: T) -> BetterResult<(), HandlerErrors> {
         if type_tag::compare::<T>(&block) {
-            return Err(HandlerErrors::TypeMismatchError);
+            return BetterResult::fail(HandlerErrors::TypeMismatchError);
         }
 
         unsafe { block.pointer.write(self.base_ptr(), value) };
@@ -321,7 +323,7 @@ pub trait HandlerFunctions {
         let header = unsafe { block.pointer.resolve_header_mut(self.base_ptr())};
         header.last_edit.set_now();
 
-        return Ok(());
+        return BetterResult::succeed(());
     }
 
     /// Reads a shared reference to `T` from an allocated block.
@@ -334,14 +336,14 @@ pub trait HandlerFunctions {
     ///   of the [`Block<T>`] handle — the caller must ensure the block is not
     ///   freed while the reference is in use.
     /// - No other thread may be writing to this block concurrently.
-    unsafe fn read<'a, T>(&self, block: &Block<T>) -> Result<&'a T, HandlerErrors> {
+    unsafe fn read<'a, T>(&self, block: &Block<T>) -> BetterResult<&'a T, HandlerErrors> {
         if type_tag::compare::<T>(&block) {
-            return Err(HandlerErrors::TypeMismatchError);
+            return BetterResult::fail(HandlerErrors::TypeMismatchError);
         }
 
         let data = unsafe { block.pointer.resolve(self.base_ptr()) };
 
-        return Ok(data);
+        return BetterResult::succeed(data);
     }
 
     /// Reads a mutable reference to `T` from an allocated block.
@@ -355,14 +357,14 @@ pub trait HandlerFunctions {
     ///   freed while the reference is in use.
     /// - No other thread may be reading or writing this block concurrently.
     ///   Two simultaneous `read_mut` calls on the same block is undefined behaviour.
-    unsafe fn read_mut<'a, T>(&self, block: &Block<T>) -> Result<&'a mut T, HandlerErrors> {
+    unsafe fn read_mut<'a, T>(&self, block: &Block<T>) -> BetterResult<&'a mut T, HandlerErrors> {
         if type_tag::compare::<T>(&block) {
-            return Err(HandlerErrors::TypeMismatchError);
+            return BetterResult::fail(HandlerErrors::TypeMismatchError);
         }
 
         let mut_data = unsafe { block.pointer.resolve_mut(self.base_ptr()) };
 
-        return Ok(mut_data);
+        return BetterResult::succeed(mut_data);
     }
 
     /// Tries to query a block through a checked query.
@@ -375,21 +377,20 @@ pub trait HandlerFunctions {
     /// ### Returns:
     /// An result containing either the requested block, or an InvalidOffset error containing the
     /// offset address.
-    fn get_block<T>(&self, offset: u32) -> Result<Block<T>, HandlerErrors> {
-        match self.matrix().checked_query(self.base_ptr(), offset) {
-            Ok(v) => {
+    fn get_block<T>(&self, offset: u32) -> BetterResult<Block<T>, HandlerErrors> {
+        self.matrix().checked_query(self.base_ptr(), offset)
+            .catch_cast::<_, HandlerErrors>(|e| {
+                return BetterResult::fail(HandlerErrors::InnerMatrixError(e))
+            })
+            .finally_return_as::<_, Block<T>>(|v| {
                 let block = Block::<T>::from_offset(v.offset());
 
                 if type_tag::compare::<T>(&block) {
-                    return Err(HandlerErrors::TypeMismatchError);
+                    return BetterResult::succeed(block)
                 } else {
-                    return Ok(block);
+                    return BetterResult::fail(HandlerErrors::TypeMismatchError)
                 }
-            },
-            Err(_) => {
-                return Err(HandlerErrors::InvalidOffset(offset));
-            }
-        }
+            })
     }
 
     /// Tries to query a list of blocks from the matrix through a checked query.
@@ -408,18 +409,17 @@ pub trait HandlerFunctions {
         let mut failed_query = Vec::<u32>::new();
 
         for o in offset_list {
-            match self.matrix().checked_query(self.base_ptr(), *o) {
-                Ok(v) => {
+            self.matrix().checked_query(self.base_ptr(), *o)
+                .then_capture(|v| {
                     let block = Block::<T>::from_offset(v.offset());
 
-                    if type_tag::compare::<T>(&block) {
+                    if type_tag::compare(&block) {
                         failed_query.push(*o);
                     } else {
-                        block_list.push(Block::<T>::from_offset(v.offset()));
+                        block_list.push(block);
                     }
-                },
-                Err(_) => failed_query.push(*o)
-            }
+                })
+                .catch_contained(|_| { failed_query.push(*o); });
         }
                     
         return (block_list, failed_query)
@@ -456,9 +456,9 @@ pub trait HandlerFunctions {
     ///
     /// # Errors
     /// Returns [`HandlerError::ReservedStatus`] if `state < USER_STATE_MIN`.
-    fn set_state<T>(&self, block: &Block<T>, state: u32) -> Result<(), HandlerErrors> {
+    fn set_state<T>(&self, block: &Block<T>, state: u32) -> BetterResult<(), HandlerErrors> {
         if state < USER_STATE_MIN {
-            return Err(HandlerErrors::ReservedState(state));
+            return BetterResult::fail(HandlerErrors::ReservedState { state: state });
         }
 
         let unpadded_block = Block::<T>::from_offset(block.pointer.offset() - TAG_SIZE);
@@ -469,7 +469,7 @@ pub trait HandlerFunctions {
                 .state
                 .store(state, Ordering::Release);
         }
-        Ok(())
+        BetterResult::succeed(())
     }
 
     /// Returns the current state of a block.
@@ -511,20 +511,26 @@ pub trait HandlerFunctions {
         expected: u32,
         next: u32,
         success_order: Ordering,
-    ) -> Result<u32, HandlerErrors> {
+    ) -> BetterResult<u32, HandlerErrors> {
         if next < USER_STATE_MIN {
-            return Err(HandlerErrors::ReservedState(next));
+            return BetterResult::fail(HandlerErrors::ReservedState { state: next });
         }
 
         let unpadded_block = Block::<T>::from_offset(block.pointer.offset() - TAG_SIZE);
         unsafe {
-            unpadded_block
+            match unpadded_block
                 .pointer
                 .resolve_header_mut(self.base_ptr())
                 .state
-                .compare_exchange(expected, next, success_order, Ordering::Relaxed)
-                .map_err(HandlerErrors::TransitionFailed)
+                .compare_exchange(expected, next, success_order, Ordering::Relaxed) {
+                    Err(_) => return BetterResult::fail(HandlerErrors::TransitionFailed{
+                        old_state: expected,
+                        new_state: next
+                    }),
+                    Ok(v) => BetterResult::succeed(v),
+                }
         }
+
     }
 
     /// Returns a raw reference to the underlying [`AtomicMatrix`].

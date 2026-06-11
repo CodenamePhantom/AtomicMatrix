@@ -191,7 +191,7 @@ impl AtomicMatrix {
     pub fn bootstrap(
         id: Option<String>,
         size: usize,
-    ) -> Result<crate::core::handlers::MatrixHandler, MatrixErrors> {
+    ) -> BetterResult<MatrixHandler, MatrixErrors> {
         let mut retry_count = 0;
 
         let path_id = id.unwrap_or_else(|| generate_uuid());
@@ -204,20 +204,18 @@ impl AtomicMatrix {
         {
             Ok(v) => v,
             Err(e) => {
-                return Err(MatrixErrors::MatrixInitializationError(format!(
-                    "Failed to create SHM file: {}",
-                    e
-                )));
+                return BetterResult::fail(MatrixErrors::MatrixInitializationError {
+                    reason: format!("Failed to create SHM file: {}",e)
+                });
             }
         };
 
         match file.set_len(size as u64) {
             Ok(_) => {}
             Err(e) => {
-                return Err(MatrixErrors::MatrixInitializationError(format!(
-                    "Failed to set matrix physical length: {}",
-                    e
-                )));
+                return BetterResult::fail(MatrixErrors::MatrixInitializationError {
+                    reason: format!("Failed to set matrix physical length: {}", e)
+                });
             }
         };
 
@@ -225,10 +223,9 @@ impl AtomicMatrix {
             match MmapMut::map_mut(&file) {
                 Ok(v) => v,
                 Err(e) => {
-                    return Err(MatrixErrors::MatrixInitializationError(format!(
-                        "Failed to create vmem map from the SHM file: {}",
-                        e
-                    )));
+                    return BetterResult::fail(MatrixErrors::MatrixInitializationError {
+                        reason: format!("Failed to create vmem map from the SHM file: {}", e)
+                    });
                 }
             }
         };
@@ -275,7 +272,7 @@ impl AtomicMatrix {
         } else {
             while init_guard.load(Ordering::Acquire) != helpers::SYS_READY {
                 if retry_count >= 512 {
-                    return Err(MatrixErrors::MatrixAttachingError);
+                    return BetterResult::fail(MatrixErrors::MatrixAttachingError);
                 } else {
                     retry_count += 1;
                     std::hint::spin_loop();
@@ -283,7 +280,7 @@ impl AtomicMatrix {
             }
         }
 
-        Ok(crate::core::handlers::MatrixHandler::new(
+        BetterResult::succeed(MatrixHandler::new(
             unsafe { &mut *matrix_ptr },
             mmap,
             current_offset,
@@ -311,14 +308,14 @@ impl AtomicMatrix {
         &self,
         base_ptr: *const u8,
         size: u32,
-    ) -> Result<RelativePtr<u8>, MatrixErrors> {
+    ) -> BetterResult<RelativePtr<u8>, MatrixErrors> {
         let size = (size + 15) & !15;
         let size = size.max(32);
         let (fl, sl) = helpers::Mapping::find_indices(size);
 
         for _ in 0..512 {
             if let Some((f_fl, f_sl)) = self.find_suitable_block(fl, sl) {
-                if let Ok(offset) = self.remove_free_block(base_ptr, f_fl, f_sl) {
+                if let BetterResult::Val(Some(offset)) = self.remove_free_block(base_ptr, f_fl, f_sl) {
                     unsafe {
                         let header = &mut *(base_ptr.add(offset as usize) as *mut BlockHeader);
                         let total_size = header.size.load(Ordering::Acquire);
@@ -346,13 +343,13 @@ impl AtomicMatrix {
                         header
                             .state
                             .store(helpers::STATE_ALLOCATED, Ordering::Release);
-                        return Ok(RelativePtr::new(offset + helpers::HEADER_SPACE));
+                        return BetterResult::succeed(RelativePtr::new(offset + helpers::HEADER_SPACE));
                     }
                 }
             }
             std::hint::spin_loop();
         }
-        Err(MatrixErrors::OutOfMemory)
+        BetterResult::fail(MatrixErrors::OutOfMemory)
     }
 
     /// Acknowledges the freedom of a block and pushes it to be coalesced.
@@ -434,26 +431,12 @@ impl AtomicMatrix {
                 let prev_header_ptr = base_ptr.add(prev_phys_offset as usize) as *mut BlockHeader;
                 let prev_header = &mut *prev_header_ptr;
 
-                let res = prev_header.state.compare_exchange(
-                    helpers::STATE_FREE,
-                    helpers::STATE_COALESCING,
+                let claimed = prev_header.state.swap_if_any(
+                    &[STATE_FREE, STATE_ACKED], 
+                    STATE_COALESCING, 
                     Ordering::Acquire,
-                    Ordering::Relaxed,
-                );
-
-                let claimed = if res.is_ok() {
-                    true
-                } else {
-                    prev_header
-                        .state
-                        .compare_exchange(
-                            helpers::STATE_ACKED,
-                            helpers::STATE_COALESCING,
-                            Ordering::Acquire,
-                            Ordering::Relaxed,
-                        )
-                        .is_ok()
-                };
+                    Ordering::Relaxed
+                ).is_ok();
 
                 if claimed {
                     let size_to_add = prev_header.size.swap(0, Ordering::Acquire);
@@ -472,7 +455,7 @@ impl AtomicMatrix {
                         .expect("TidalRippleCoalescingError");
                     final_offset = prev_phys_offset;
                     current_header = prev_header;
-                    self.remove_free_block(base_ptr, fl, sl).ok();
+                    self.remove_free_block(base_ptr, fl, sl).is_ok();
                 } else {
                     break;
                 }
@@ -528,12 +511,12 @@ impl AtomicMatrix {
         &self,
         base_ptr: *const u8,
         offset: u32,
-    ) -> Result<RelativePtr<u8>, MatrixErrors> {
+    ) -> BetterResult<RelativePtr<u8>, MatrixErrors> {
         let matadata_section =
             unsafe { base_ptr.add(16 + std::mem::size_of::<AtomicMatrix>()) as u32 };
 
         if offset >= self.sector_boundaries.load(Ordering::Relaxed) || offset <= matadata_section {
-            return Err(MatrixErrors::OutOfBounds);
+            return BetterResult::fail(MatrixErrors::OutOfBounds);
         }
 
         let ptr = RelativePtr::<u8>::new(offset + HEADER_SPACE);
@@ -547,10 +530,10 @@ impl AtomicMatrix {
             )
             .is_err()
         {
-            return Err(MatrixErrors::InvalidBlock);
+            return BetterResult::fail(MatrixErrors::InvalidBlock);
         }
 
-        return Ok(ptr);
+        return BetterResult::succeed(ptr);
     }
 
     /// Queries the TLSF bitmaps in search of a block.
@@ -611,12 +594,12 @@ impl AtomicMatrix {
         base_ptr: *const u8,
         fl: u32,
         sl: u32,
-    ) -> Result<u32, MatrixErrors> {
+    ) -> BetterResult<u32, MatrixErrors> {
         let head = &self.matrix[fl as usize][sl as usize];
         loop {
             let off = head.load(Ordering::Acquire);
             if off == 0 {
-                return Err(MatrixErrors::EmptyBitmapError);
+                return BetterResult::fail(MatrixErrors::EmptyBitmapError);
             }
             let next = unsafe {
                 (*(base_ptr.add(off as usize) as *const BlockHeader))
@@ -633,7 +616,7 @@ impl AtomicMatrix {
                         self.fl_bitmap.fetch_and(!(1 << fl), Ordering::Release);
                     }
                 }
-                return Ok(off);
+                return BetterResult::succeed(off);
             }
             std::hint::spin_loop();
         }
@@ -934,7 +917,7 @@ mod tests {
 
                 for _ in 0..allocs_per_second {
                     for _ in 0..10 {
-                        if let Ok(rel_ptr) = s_handler.matrix().allocate(s_handler.base_ptr(), 64) {
+                        if let BetterResult::Val(Some(rel_ptr)) = s_handler.matrix().allocate(s_handler.base_ptr(), 64) {
                             let h = unsafe { rel_ptr.resolve_header(s_handler.base_ptr()) };
                             us_ref.fetch_add(h.size.load(Ordering::Relaxed), Ordering::Release);
 
@@ -1030,7 +1013,7 @@ mod tests {
 
                     if rng % 10 < 7 && my_blocks.len() < 200 {
                         let alloc_size = rng % 512;
-                        if let Ok(ptr) = matrix.allocate(base_ptr, alloc_size as u32) {
+                        if let BetterResult::Val(Some(ptr)) = matrix.allocate(base_ptr, alloc_size as u32) {
                             my_blocks.push(ptr);
                         }
                     } else if !my_blocks.is_empty() {
