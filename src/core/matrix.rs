@@ -29,6 +29,7 @@
 //! (std::sync::atomic::fence) are utilized to ensure visibility across all CPU
 //! cores without locking.
 
+use better_result::BetterResult;
 use memmap2::MmapMut;
 use std::fs::OpenOptions;
 use std::marker::PhantomData;
@@ -188,10 +189,7 @@ impl AtomicMatrix {
     ///
     /// ### Returns
     /// The matrix handler api, or a [`MatrixErrors`]
-    pub fn bootstrap(
-        id: Option<String>,
-        size: usize,
-    ) -> BetterResult<MatrixHandler, MatrixErrors> {
+    pub fn bootstrap(id: Option<String>, size: usize) -> BetterResult<MatrixHandler, MatrixErrors> {
         let mut retry_count = 0;
 
         let path_id = id.unwrap_or_else(|| generate_uuid());
@@ -205,7 +203,7 @@ impl AtomicMatrix {
             Ok(v) => v,
             Err(e) => {
                 return BetterResult::fail(MatrixErrors::MatrixInitializationError {
-                    reason: format!("Failed to create SHM file: {}",e)
+                    reason: format!("Failed to create SHM file: {}", e),
                 });
             }
         };
@@ -214,7 +212,7 @@ impl AtomicMatrix {
             Ok(_) => {}
             Err(e) => {
                 return BetterResult::fail(MatrixErrors::MatrixInitializationError {
-                    reason: format!("Failed to set matrix physical length: {}", e)
+                    reason: format!("Failed to set matrix physical length: {}", e),
                 });
             }
         };
@@ -224,7 +222,7 @@ impl AtomicMatrix {
                 Ok(v) => v,
                 Err(e) => {
                     return BetterResult::fail(MatrixErrors::MatrixInitializationError {
-                        reason: format!("Failed to create vmem map from the SHM file: {}", e)
+                        reason: format!("Failed to create vmem map from the SHM file: {}", e),
                     });
                 }
             }
@@ -315,22 +313,31 @@ impl AtomicMatrix {
 
         for _ in 0..512 {
             if let Some((f_fl, f_sl)) = self.find_suitable_block(fl, sl) {
-                if let BetterResult::Val(Some(offset)) = self.remove_free_block(base_ptr, f_fl, f_sl) {
+                if let BetterResult::Val(Some(offset)) =
+                    self.remove_free_block(base_ptr, f_fl, f_sl)
+                {
                     unsafe {
                         let header = &mut *(base_ptr.add(offset as usize) as *mut BlockHeader);
+                        header.state.store(STATE_ALLOCATED, Ordering::Release);
+
                         let total_size = header.size.load(Ordering::Acquire);
 
                         if total_size >= size + helpers::HEADER_SPACE {
-                            let rem_size = total_size - (size + helpers::HEADER_SPACE);
                             let next_off = offset + size + helpers::HEADER_SPACE;
-                            let next_h =
-                                &mut *(base_ptr.add(next_off as usize) as *mut BlockHeader);
+                            let eos = self.sector_end_offset(next_off);
 
-                            next_h.size.store(rem_size, Ordering::Release);
-                            next_h.state.store(helpers::STATE_FREE, Ordering::Release);
-                            next_h.prev_phys.store(offset, Ordering::Release);
-                            next_h.next_free.store(0, Ordering::Release);
-                            next_h.created_at.set_now();
+                            let rem_size = total_size - (size + helpers::HEADER_SPACE);
+
+                            if next_off < eos {
+                                let next_h =
+                                    &mut *(base_ptr.add(next_off as usize) as *mut BlockHeader);
+
+                                next_h.size.store(rem_size, Ordering::Release);
+                                next_h.state.store(helpers::STATE_FREE, Ordering::Release);
+                                next_h.prev_phys.store(offset, Ordering::Release);
+                                next_h.next_free.store(0, Ordering::Release);
+                                next_h.created_at.set_now();
+                            }
 
                             header
                                 .size
@@ -340,10 +347,10 @@ impl AtomicMatrix {
                             let (r_fl, r_sl) = helpers::Mapping::find_indices(rem_size);
                             self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
                         }
-                        header
-                            .state
-                            .store(helpers::STATE_ALLOCATED, Ordering::Release);
-                        return BetterResult::succeed(RelativePtr::new(offset + helpers::HEADER_SPACE));
+
+                        return BetterResult::succeed(RelativePtr::new(
+                            offset + helpers::HEADER_SPACE,
+                        ));
                     }
                 }
             }
@@ -421,7 +428,7 @@ impl AtomicMatrix {
 
             let mut final_offset = current_offset;
 
-            while current_offset > 16 {
+            while current_offset > 16 + std::mem::size_of::<AtomicMatrix>() as u32 {
                 let prev_phys_offset = current_header.prev_phys.load(Ordering::Acquire);
 
                 if prev_phys_offset == 0 {
@@ -431,12 +438,15 @@ impl AtomicMatrix {
                 let prev_header_ptr = base_ptr.add(prev_phys_offset as usize) as *mut BlockHeader;
                 let prev_header = &mut *prev_header_ptr;
 
-                let claimed = prev_header.state.swap_if_any(
-                    &[STATE_FREE, STATE_ACKED], 
-                    STATE_COALESCING, 
-                    Ordering::Acquire,
-                    Ordering::Relaxed
-                ).is_ok();
+                let claimed = prev_header
+                    .state
+                    .swap_if_any(
+                        &[STATE_ACKED, STATE_FREE],
+                        STATE_COALESCING,
+                        Ordering::Acquire,
+                        Ordering::Relaxed,
+                    )
+                    .is_ok();
 
                 if claimed {
                     let size_to_add = prev_header.size.swap(0, Ordering::Acquire);
@@ -890,7 +900,7 @@ mod tests {
         use std::thread;
 
         // We use 62MB matrix to allocate all the buffers
-        let size = memory_scale::custom::mb::<62>();
+        let size = memory_scale::custom::mb::<100>();
         let handler = AtomicMatrix::bootstrap(None, size).unwrap();
 
         let thread_count = 8;
@@ -917,7 +927,9 @@ mod tests {
 
                 for _ in 0..allocs_per_second {
                     for _ in 0..10 {
-                        if let BetterResult::Val(Some(rel_ptr)) = s_handler.matrix().allocate(s_handler.base_ptr(), 64) {
+                        if let BetterResult::Val(Some(rel_ptr)) =
+                            s_handler.matrix().allocate(s_handler.base_ptr(), 64)
+                        {
                             let h = unsafe { rel_ptr.resolve_header(s_handler.base_ptr()) };
                             us_ref.fetch_add(h.size.load(Ordering::Relaxed), Ordering::Release);
 
@@ -949,6 +961,7 @@ mod tests {
         // Assert we can obtain at least 99.5% of the expected allocations without collisions, which would
         // indicate a potential race condition.
         println!("{} MB used", used_size);
+        println!("Obtained: {}", total_obtained);
         println!("Threshold: {}", success_percentage);
         assert!(
             total_obtained >= (success_percentage as usize),
@@ -986,7 +999,7 @@ mod tests {
         const DURATION: u32 = 600;
         const THREADS: u32 = 8;
 
-        let size = memory_scale::custom::mb::<5>();
+        let size = memory_scale::custom::mb::<20>();
         let handler = AtomicMatrix::bootstrap(Some(String::from("f_h_test")), size).unwrap();
         let handler_arc = Arc::new(handler);
         let barrier = Arc::new(Barrier::new(THREADS as usize));
@@ -1013,7 +1026,9 @@ mod tests {
 
                     if rng % 10 < 7 && my_blocks.len() < 200 {
                         let alloc_size = rng % 512;
-                        if let BetterResult::Val(Some(ptr)) = matrix.allocate(base_ptr, alloc_size as u32) {
+                        if let BetterResult::Val(Some(ptr)) =
+                            matrix.allocate(base_ptr, alloc_size as u32)
+                        {
                             my_blocks.push(ptr);
                         }
                     } else if !my_blocks.is_empty() {

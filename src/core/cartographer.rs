@@ -28,6 +28,7 @@
 use crate::internals::error_collection::CartographerErrors;
 use crate::prelude::*;
 use memmap2::MmapMut;
+use better_result::{ BetterResult, chain_up };
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -359,7 +360,7 @@ impl Cartographer {
 
         let block_size = std::mem::size_of::<CallbackBlock>() as u32;
         let (block, header) = matrix.allocate(base_ptr, block_size)
-            .catch_cast::<_, CartographerErrors>(|e| return BetterResult::fail(CartographerErrors::Inner(e)))
+            .catch_as(|e| return BetterResult::Err(Some(CartographerErrors::Inner(e))))
             .finally_as::<_, (&mut CallbackBlock, &mut BlockHeader)>(|v| {
                 let rel_ptr = RelativePtr::<CallbackBlock>::new(v.offset());
                 
@@ -369,7 +370,7 @@ impl Cartographer {
 
                     (block, header)
                 }
-            });
+            }).unwrap();
 
         header.state.store(STATE_CALLBACK, Ordering::Release);
         block.flag.store(build_id, Ordering::Release);
@@ -636,15 +637,15 @@ impl Cartographer {
     /// step that failed.
     pub fn default_run(mut self) -> BetterResult<MatrixHandler, CartographerErrors> {
         // Controller variables
-        let file_descriptor: i32;
+        let mut file_descriptor: i32 = 0;
 
         // Extract pipeline flags from builder config.
         let (app_protection, runtime_protected, defer) = match &self.config {
             CartographerConfig::Shm(v) => {
-                file_descriptor = self
+                self
                     .create_file()
-                    .catch(|e| return BetterResult::fail(e))
-                    .finally(|cv| cv);
+                    .then_consume(|v_inner| file_descriptor = v_inner)
+                    .catch(|e| return BetterResult::fail(e));
                 (v.app_protection, v.runtime_protected, v.defer)
             }
             CartographerConfig::MemFd(_) => unimplemented!(),
@@ -656,35 +657,27 @@ impl Cartographer {
         };
 
         // Generates mmap.
-        self = self
-            .mmap_memory(file_descriptor)
-            .catch(|e| return BetterResult::fail(e))
-            .finally(|v| v);
+        self = chain_up!(self.mmap_memory(file_descriptor));
 
         // Config deferral checkpoint
         if !defer {
             // Processes that pass execute administrative deployment.
-            self = self
-                .sys_implement()
-                .catch(|e| return BetterResult::fail(e))
-                .finally(|v| v);
+            self = chain_up!(self.sys_implement());
 
             if runtime_protected {
-                self.rolling_runtime_protection()
-                    .chain_up::<CartographerErrors>();
+                chain_up!(self.rolling_runtime_protection());
             };
 
             if self.attach_callback.is_some() {
-                self.sys_callback_implement()
-                    .chain_up::<CartographerErrors>();
+                chain_up!(self.sys_callback_implement())
             };
 
-            self.sys_release()
-                .catch(|e| return BetterResult::fail(e))
-                .finally_return(|v| return BetterResult::succeed(v))
+            let handler = chain_up!(self.sys_release());
+
+            return BetterResult::succeed(handler)
         } else {
             // attach callback is invoked at this stage, provided the process pass the binary check.
-            self.sys_attach_callback().chain_up::<CartographerErrors>();
+            chain_up!(self.sys_attach_callback());
             if let Some(callback) = self.attach_callback.take() {
                 match &mut self.matrix {
                     Some(v) => callback(v),
@@ -697,9 +690,9 @@ impl Cartographer {
             }
 
             // Processes that fails awaits implementation before attaching.
-            self.sys_attach()
-                .catch(|e| return BetterResult::fail(e))
-                .finally_return(|v| return BetterResult::succeed(v))
+            let handler = chain_up!(self.sys_release());
+
+            return BetterResult::succeed(handler);
         }
     }
 }

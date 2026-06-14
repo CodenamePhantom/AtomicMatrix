@@ -6,9 +6,14 @@ version = 4
 name = "atomic-matrix"
 version = "0.3.2"
 dependencies = [
+ "better_result",
  "libc",
  "memmap2",
 ]
+
+[[package]]
+name = "better_result"
+version = "0.2.1"
 
 [[package]]
 name = "libc"

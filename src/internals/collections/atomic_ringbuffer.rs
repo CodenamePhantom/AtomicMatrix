@@ -40,6 +40,7 @@
 
 use crate::internals::error_collection::BufferErrors;
 use crate::prelude::*;
+use better_result::BetterResult;
 use std::{
     mem::size_of,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
@@ -140,13 +141,12 @@ impl<'a> AtomicRingBuffer {
         let struct_size = size_of::<AtomicRingBuffer>();
         let size = struct_size + buf_size * slots;
 
-        let rel_ptr = match handler_ref.allocate_raw(size as u32) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("Failed to allocate ring_buffer: {:?}", e);
-                return None;
-            }
-        };
+        let rel_ptr = handler_ref.allocate_raw(size as u32)
+            .catch_as(|e| {
+                BetterResult::Err(Some(e))
+            })
+            .finally_as(|v| v).unwrap();
+
         let rb_start = rel_ptr.offset() + struct_size as u32;
         let rb_end = rb_start + size as u32;
         let header = unsafe { rel_ptr.resolve_header_mut(handler_ref.base_ptr()) };
@@ -274,6 +274,8 @@ impl<'a> AtomicRingBuffer {
     /// Either a life time specified reference to the block data, or
     /// None if the block is empty
     pub fn dequeue<T>(&self) -> Option<&'a T> {
+        let mut data = None;
+
         let current_tail = self.tail.load(Ordering::Relaxed);
         let next_tail = self.advance(current_tail);
 
@@ -282,7 +284,10 @@ impl<'a> AtomicRingBuffer {
         }
 
         let block = Block::<T>::from_offset(current_tail);
-        let data = unsafe { self.handler_ref.read(&block) };
+        unsafe { self.handler_ref.read(&block)
+            .then_consume(|v| data = Some(v))
+            .catch_contained(|_| data = None)
+        };
 
         self.tail.store(next_tail, Ordering::Release);
 
@@ -290,7 +295,7 @@ impl<'a> AtomicRingBuffer {
             self.has_message.store(false, Ordering::Release);
         }
 
-        Some(data)
+        return data
     }
 
     /// Returns the current head from the buffer without moving the pointer
@@ -310,7 +315,12 @@ impl<'a> AtomicRingBuffer {
         }
 
         let block = Block::<T>::from_offset(current_tail);
-        let data = unsafe { self.handler_ref.read(&block) };
+        let data = unsafe { self.handler_ref.read(&block)
+            .catch_as(|e| { 
+                BetterResult::Err(Some(e))
+            })
+            .finally(|v| v).unwrap()
+        };
 
         Some(data)
     }

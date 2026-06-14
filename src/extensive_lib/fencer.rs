@@ -50,6 +50,8 @@
 //! production code as per the current state of its development. User discretion
 //! is advised
 
+use better_result::BetterResult;
+
 use crate::{
     extensive_lib::looper,
     internals::{
@@ -183,7 +185,7 @@ impl Fencer {
         let handler =
             AtomicMatrix::bootstrap(Some(id), (metadata_session + util_size) as usize).unwrap();
 
-        let first_h = handler.matrix().query(metadata_session).offset() - HEADER_SPACE;
+        let first_h = unsafe { handler.matrix().query(metadata_session).offset() - HEADER_SPACE };
         let h_struct = unsafe {
             handler
                 .matrix()
@@ -278,7 +280,7 @@ impl Fencer {
 
         let guard = RouteGuard {
             private_id: priv_id,
-            acl: unsafe { dataplane.read::<ACL>(&block) },
+            acl: unsafe { dataplane.read::<ACL>(&block).unwrap() },
             acl_offset: block.pointer.offset(),
             sector_handler: handler,
             inbox: rb,
@@ -357,10 +359,10 @@ impl Fencer {
         sec_id: u32,
         priv_id: &'a str,
     ) -> Result<RouteGuard<'a>, FencerErrors> {
-        let block = Block::<ACL>::from_offset(dataplane.matrix().query(sec_id).offset());
+        let block = unsafe { Block::<ACL>::from_offset(dataplane.matrix().query(sec_id).offset()) };
         let module_tag = dataplane.hash_id(priv_id);
 
-        let acl_data = unsafe { dataplane.read(&block) };
+        let acl_data = unsafe { dataplane.read(&block).unwrap() };
 
         let entry = acl_data
             .entries
@@ -396,7 +398,7 @@ impl Fencer {
 
         Ok(RouteGuard {
             private_id: priv_id,
-            acl: unsafe { dataplane.read::<ACL>(&block) },
+            acl: unsafe { dataplane.read::<ACL>(&block).unwrap() },
             acl_offset: block.pointer.offset(),
             sector_handler: sect_handler,
             inbox: rb.view_data_as::<AtomicRingBuffer>(),
@@ -444,11 +446,12 @@ impl<'a> RouteGuard<'a> {
         };
 
         let mut block = match self.sector_handler.allocate::<T>() {
-            Ok(v) => v,
-            Err(e) => return Err(FencerErrors::SectorError(format!("{:?}", e))),
+            BetterResult::Val(Some(v)) => v,
+            BetterResult::Err(Some(e)) => return Err(FencerErrors::SectorError(format!("{:?}", e))),
+            _ => todo!(),
         };
 
-        unsafe { self.sector_handler.write(&mut block, msg) };
+        self.sector_handler.write(&mut block, msg);
 
         match self.inbox.enqueue::<u32>(block.pointer.offset()) {
             Ok(_) => return Ok(()),
@@ -480,7 +483,7 @@ impl<'a> RouteGuard<'a> {
         };
 
         let msg_block = Block::<T>::from_offset(*msg_offset);
-        let msg = unsafe { self.sector_handler.read(&msg_block) };
+        let msg = unsafe { self.sector_handler.read(&msg_block).unwrap() };
 
         return Ok(Some(msg));
     }
@@ -541,8 +544,9 @@ impl<'a> RouteGuard<'a> {
         
         dataplane.free_at(self.acl_offset);
         match self.sector_handler.die() {
-            Ok(_) => Ok(()),
-            Err(e) => Err(FencerErrors::SectorError(format!("{:?}", e))),
+            BetterResult::Val(Some(_)) => Ok(()),
+            BetterResult::Err(Some(e)) => Err(FencerErrors::SectorError(format!("{:?}", e))),
+            _ => todo!()
         }
     }
 

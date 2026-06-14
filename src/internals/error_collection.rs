@@ -1,9 +1,10 @@
-use crate::matrix_error;
-/// -------------------------------------------------------------------------------------
-///
-/// Extensive Lib errors
-///
-/// -------------------------------------------------------------------------------------
+use better_result::better_error;
+
+// -------------------------------------------------------------------------------------
+//
+// Extensive Lib errors
+//
+// -------------------------------------------------------------------------------------
 #[derive(Debug)]
 pub enum FencerErrors {
     UnauthorizedRead,
@@ -20,7 +21,7 @@ pub enum FencerErrors {
 // Core errors
 //
 // -------------------------------------------------------------------------------------
-matrix_error! {
+better_error! {
     #[derive(Debug)]
     pub enum MatrixErrors {
         MatrixInitializationError { reason: String } => "Failed to initialized matrix: {reason}",
@@ -32,7 +33,7 @@ matrix_error! {
     }
 }
 
-matrix_error! {
+better_error! {
     #[derive(Debug)]
     pub enum HandlerErrors {
         TypeMismatchError => "The provided type doesn't match the block type tag.",
@@ -53,7 +54,7 @@ matrix_error! {
     }
 }
 
-matrix_error! {
+better_error! {
     #[derive(Debug)]
     pub enum CartographerErrors {
         CallbackError { reason: String } => "Failed to execute callback procedures: {reason}",
@@ -72,16 +73,18 @@ matrix_error! {
     }
 }
 
-/// -------------------------------------------------------------------------------------
-///
-/// Collection errors
-///
-/// -------------------------------------------------------------------------------------
-#[derive(Debug)]
-pub enum BufferErrors {
-    TooManyProducers,
-    DropBehaviour,
-    BufferFull,
+// -------------------------------------------------------------------------------------
+//
+// Collection errors
+//
+// -------------------------------------------------------------------------------------
+better_error! {
+    #[derive(Debug)]
+    pub enum BufferErrors {
+        TooManyProducers => "Too many threads hanging on the buffer",
+        DropBehaviour => "Drop behaviour",
+        BufferFull => "The buffer is completely full",
+    }
 }
 
 #[derive(Debug)]

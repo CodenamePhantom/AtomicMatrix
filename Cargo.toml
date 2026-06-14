@@ -14,5 +14,6 @@ readme = "README.md"
 default = []
 
 [dependencies]
+better_result = { path = "../better_result" }
 memmap2 = "0.9.10"
 libc = "0.2.186"

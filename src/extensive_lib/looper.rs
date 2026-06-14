@@ -63,7 +63,7 @@ impl<'a> Iterator for Looper {
             return None;
         }
 
-        let rel_ptr = self.handler_ref.matrix().query(self.current_offset);
+        let rel_ptr = unsafe { self.handler_ref.matrix().query(self.current_offset) };
         let header = unsafe { rel_ptr.resolve_header(self.handler_ref.base_ptr()) };
 
         let size = header.size.load(Ordering::Acquire);
@@ -121,7 +121,7 @@ impl<'a> LoopWindow {
     /// Returns a reference to the current record data typed as T.
     pub fn view_data_as<T>(&self) -> &'a T {
         let block = Block::<T>::from_offset(self.rel_ptr.offset());
-        let res = unsafe { self.handler.read(&block) };
+        let res = unsafe { self.handler.read(&block).unwrap() };
 
         res
     }

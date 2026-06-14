@@ -59,6 +59,7 @@
 use crate::internals::error_collection::HandlerErrors;
 use crate::prelude::*;
 use memmap2::MmapMut;
+use better_result::BetterResult;
 use std::sync::atomic::Ordering;
 
 /// Minimum state value available for user-defined lifecycles.
@@ -272,10 +273,10 @@ pub trait HandlerFunctions {
         let size = std::mem::size_of::<T>() as u32;
 
         let ptr = self.matrix().allocate(self.base_ptr(), size + TAG_SIZE)
-            .catch_cast::<_, HandlerErrors>(|e| return {
-                BetterResult::fail(HandlerErrors::InnerMatrixError(e))
+            .catch_as::<_, HandlerErrors>(|e| return {
+                BetterResult::Err(Some(HandlerErrors::InnerMatrixError(e)))
             })
-            .finally(|v| v);
+            .finally(|v| v).unwrap();
 
         unsafe { 
             let dp = *ptr.resolve_mut(self.base_ptr()) as *mut u32;
@@ -298,10 +299,10 @@ pub trait HandlerFunctions {
     /// Returns [`HandlerError::AllocationFailed`] if OOM or contention.
     fn allocate_raw(&self, size: u32) -> BetterResult<RelativePtr<u8>, HandlerErrors> {
         self.matrix().allocate(self.base_ptr(), size)
-            .catch_cast::<_, HandlerErrors>(|e| {
-                return BetterResult::fail(HandlerErrors::InnerMatrixError(e))
+            .catch_as(|e| {
+                return BetterResult::Err(Some(HandlerErrors::InnerMatrixError(e)))
             })
-            .finally_return(|v| BetterResult::succeed(v))
+            .finally_as(|v| BetterResult::Val(Some(v))).unwrap()
     }
 
     /// Writes a value of type `T` into an allocated block.
@@ -379,10 +380,10 @@ pub trait HandlerFunctions {
     /// offset address.
     fn get_block<T>(&self, offset: u32) -> BetterResult<Block<T>, HandlerErrors> {
         self.matrix().checked_query(self.base_ptr(), offset)
-            .catch_cast::<_, HandlerErrors>(|e| {
-                return BetterResult::fail(HandlerErrors::InnerMatrixError(e))
+            .catch_as(|e| {
+                return BetterResult::Err(Some(HandlerErrors::InnerMatrixError(e)))
             })
-            .finally_return_as::<_, Block<T>>(|v| {
+            .finally_as(|v| {
                 let block = Block::<T>::from_offset(v.offset());
 
                 if type_tag::compare::<T>(&block) {
@@ -390,7 +391,7 @@ pub trait HandlerFunctions {
                 } else {
                     return BetterResult::fail(HandlerErrors::TypeMismatchError)
                 }
-            })
+            }).unwrap()
     }
 
     /// Tries to query a list of blocks from the matrix through a checked query.
@@ -410,7 +411,7 @@ pub trait HandlerFunctions {
 
         for o in offset_list {
             self.matrix().checked_query(self.base_ptr(), *o)
-                .then_capture(|v| {
+                .then_consume(|v| {
                     let block = Block::<T>::from_offset(v.offset());
 
                     if type_tag::compare(&block) {
