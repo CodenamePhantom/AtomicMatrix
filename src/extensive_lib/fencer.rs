@@ -50,8 +50,6 @@
 //! production code as per the current state of its development. User discretion
 //! is advised
 
-use better_result::BetterResult;
-
 use crate::{
     extensive_lib::looper,
     internals::{
@@ -446,9 +444,8 @@ impl<'a> RouteGuard<'a> {
         };
 
         let mut block = match self.sector_handler.allocate::<T>() {
-            BetterResult::Val(Some(v)) => v,
-            BetterResult::Err(Some(e)) => return Err(FencerErrors::SectorError(format!("{:?}", e))),
-            _ => todo!(),
+            Ok(v) => v,
+            Err(e) => return Err(FencerErrors::SectorError(format!("{:?}", e))),
         };
 
         self.sector_handler.write(&mut block, msg);
@@ -544,9 +541,8 @@ impl<'a> RouteGuard<'a> {
         
         dataplane.free_at(self.acl_offset);
         match self.sector_handler.die() {
-            BetterResult::Val(Some(_)) => Ok(()),
-            BetterResult::Err(Some(e)) => Err(FencerErrors::SectorError(format!("{:?}", e))),
-            _ => todo!()
+            Ok(_) => Ok(()),
+            Err(e) => Err(FencerErrors::SectorError(format!("{:?}", e))),
         }
     }
 
@@ -603,7 +599,7 @@ impl<'a> RouteGuard<'a> {
 }
 
 impl<T: Fn() -> ()> Balancer<T> {
-    pub fn balance<F>(&self, msg: F) {
+    pub fn balance<F>(&self, _msg: F) {
         unimplemented!()
     }
 

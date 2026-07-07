@@ -63,7 +63,11 @@ impl<'a> Iterator for Looper {
             return None;
         }
 
-        let rel_ptr = unsafe { self.handler_ref.matrix().query(self.current_offset) };
+        let rel_ptr = match self.handler_ref.matrix().checked_query(self.handler_ref.base_ptr(), self.current_offset) {
+            Ok(v) => v,
+            Err(crate::internals::error_collection::MatrixErrors::InvalidBlock) => return None,
+            _ => panic!("Something went very wrong here.")
+        };
         let header = unsafe { rel_ptr.resolve_header(self.handler_ref.base_ptr()) };
 
         let size = header.size.load(Ordering::Acquire);
@@ -86,12 +90,12 @@ impl Looper {
     /// # Returns:
     /// An instance of Self.
     pub fn new(handler_ref: SharedHandler) -> Self {
-        let len = (16 + (std::mem::size_of::<AtomicMatrix>() as u32) + 15) & !15;
+        let len = (16 + std::mem::size_of::<AtomicMatrix>() + 15) & !15;
         let end = handler_ref.matrix().sector_boundaries.load(Ordering::Acquire);
 
         Self {
             handler_ref,
-            current_offset: len,
+            current_offset: len as u32,
             end_offset: end,
         }
     }

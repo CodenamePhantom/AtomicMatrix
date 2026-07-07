@@ -40,14 +40,18 @@ better_error! {
         AllocationFailed { reason: String } => "Failed to allocate: {reason}",
         ReservedState { state: u32 } => "State {state} is reserved for matrix ops.",
         InvalidOffset { offset: u32 } => "Offset {offset} not found.",
+        BlockOverflow {
+            block_size: usize,
+            payload_size: usize
+        } => "The requested size doesn't fit the block: Req Size -> {payload_size} | Available size -> {block_size}",
         DecomissionFailed {
             path: String,
             reason: std::io::Error
         } => "Failed to decommission matrix file: Path -> {path} | Reason -> {reason}",
         TransitionFailed { 
-            old_state: u32,
-            new_state: u32
-        } => "Failed to switch state: {old_state} -> {new_state}",
+            requested_state: u32,
+            current_state: u32
+        } => "Failed to switch state: {requested_state} -> {current_state}",
     }
     from {
         InnerMatrixError(MatrixErrors),

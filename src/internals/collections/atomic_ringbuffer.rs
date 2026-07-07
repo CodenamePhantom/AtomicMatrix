@@ -40,7 +40,6 @@
 
 use crate::internals::error_collection::BufferErrors;
 use crate::prelude::*;
-use better_result::BetterResult;
 use std::{
     mem::size_of,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
@@ -83,6 +82,7 @@ pub struct AtomicRingBuffer {
     tail: AtomicU32,
     has_message: AtomicBool,
     handler_ref: SharedHandler,
+    address: u32,
 }
 
 // Safety: as the buffer inherits the zero-copy, lock-free traits from
@@ -141,11 +141,7 @@ impl<'a> AtomicRingBuffer {
         let struct_size = size_of::<AtomicRingBuffer>();
         let size = struct_size + buf_size * slots;
 
-        let rel_ptr = handler_ref.allocate_raw(size as u32)
-            .catch_as(|e| {
-                BetterResult::Err(Some(e))
-            })
-            .finally_as(|v| v).unwrap();
+        let rel_ptr = handler_ref.allocate_raw(size as u32).unwrap();
 
         let rb_start = rel_ptr.offset() + struct_size as u32;
         let rb_end = rb_start + size as u32;
@@ -170,6 +166,7 @@ impl<'a> AtomicRingBuffer {
                     tail: AtomicU32::new(rb_start),
                     has_message: AtomicBool::new(false),
                     handler_ref,
+                    address: rel_ptr.offset(),
                 },
             );
             Some(&*atomic_rb_ptr)
@@ -274,7 +271,7 @@ impl<'a> AtomicRingBuffer {
     /// Either a life time specified reference to the block data, or
     /// None if the block is empty
     pub fn dequeue<T>(&self) -> Option<&'a T> {
-        let mut data = None;
+        let data: Option<&T>;
 
         let current_tail = self.tail.load(Ordering::Relaxed);
         let next_tail = self.advance(current_tail);
@@ -284,9 +281,11 @@ impl<'a> AtomicRingBuffer {
         }
 
         let block = Block::<T>::from_offset(current_tail);
-        unsafe { self.handler_ref.read(&block)
-            .then_consume(|v| data = Some(v))
-            .catch_contained(|_| data = None)
+        unsafe {
+            match self.handler_ref.read(&block) {
+                Ok(v) => data = Some(v),
+                Err(_) => data = None,
+            }
         };
 
         self.tail.store(next_tail, Ordering::Release);
@@ -315,11 +314,11 @@ impl<'a> AtomicRingBuffer {
         }
 
         let block = Block::<T>::from_offset(current_tail);
-        let data = unsafe { self.handler_ref.read(&block)
-            .catch_as(|e| { 
-                BetterResult::Err(Some(e))
-            })
-            .finally(|v| v).unwrap()
+        let data = unsafe {
+            match self.handler_ref.read(&block) {
+                Ok(v) => v,
+                Err(_) => return None,
+            }
         };
 
         Some(data)
@@ -338,5 +337,9 @@ impl<'a> AtomicRingBuffer {
     /// Returns the current tail available to read.
     pub fn current_tail(&self) -> u32 {
         self.tail.load(Ordering::Relaxed)
+    }
+
+    pub fn address(&self) -> u32 {
+        self.address
     }
 }

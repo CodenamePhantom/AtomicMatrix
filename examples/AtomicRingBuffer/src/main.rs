@@ -32,7 +32,7 @@ fn main() {
     const LOOPS: u32 = 1_000_000;
 
     let handler = AtomicMatrix::bootstrap(None, 5 * 1024 * 1024).unwrap();
-    let ring_buffer = AtomicRingBuffer::new::<u16>(1024, &handler, Behaviour::Wait(5)).unwrap();
+    let ring_buffer = AtomicRingBuffer::new::<u16>(1024, handler.share(), Behaviour::Wait(5)).unwrap();
 
     let instant = Instant::now();
 
