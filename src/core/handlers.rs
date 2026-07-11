@@ -93,7 +93,7 @@ pub struct Block<T> {
 }
 
 #[repr(C)]
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug)]
 pub struct BlockMetadata {
     pub type_tag: u32,
     pub offset: u32,
@@ -302,10 +302,7 @@ pub trait HandlerFunctions {
             }
         };
 
-        unsafe {
-            let mut _dp = *ptr.resolve_mut(self.base_ptr()) as u32;
-            _dp = tag
-        };
+        unsafe { *(self.base_ptr().add(ptr.offset() as usize) as *mut u32) = tag };
 
         let block = Block::<T>::from_offset(ptr.offset() + TAG_SIZE, self.base_ptr() as usize);
         self.block_list().push(BlockMetadata {
@@ -350,17 +347,17 @@ pub trait HandlerFunctions {
     /// - No other thread may be reading or writing this block concurrently.
     ///   The caller is responsible for all synchronization beyond the atomic
     ///   state transitions provided by [`set_state`] and [`transition_state`].
-    fn write<T>(&self, block: &mut Block<T>, value: T) -> Result<(), HandlerErrors> {
+    unsafe fn write<T>(&self, block: &mut Block<T>, value: T) -> Result<(), HandlerErrors> {
         let header = unsafe { block.pointer.resolve_header_mut(self.base_ptr()) };
         let state = &header.state;
         let total_size = header.size.load(Ordering::Acquire) - HEADER_SPACE;
         
-        if type_tag::compare::<T>(&block) {
+        if !type_tag::compare::<T>(&block) {
             return Err(HandlerErrors::TypeMismatchError);
         }
 
         if state
-            .load_if_not_any(
+            .load_if_any(
                 &[STATE_ACKED, STATE_COALESCING, STATE_FREE],
                 Ordering::Relaxed,
             )
@@ -401,7 +398,7 @@ pub trait HandlerFunctions {
         let state = &header.state;
         let total_size = header.size.load(Ordering::Acquire) - HEADER_SPACE;
 
-        if type_tag::compare::<T>(&block) {
+        if !type_tag::compare::<T>(&block) {
             return Err(HandlerErrors::TypeMismatchError)
         };
 
@@ -442,12 +439,12 @@ pub trait HandlerFunctions {
         let state = &header.state;
         let total_size = header.size.load(Ordering::Acquire) - HEADER_SPACE;
 
-        if type_tag::compare::<T>(&block) {
+        if !type_tag::compare::<T>(&block) {
             return Err(HandlerErrors::TypeMismatchError)
         };
 
-        if state.compare_exchange_weak(current, next, success_order, Ordering::Relaxed).is_err() {
-            return Err(HandlerErrors::TransitionFailed { requested_state: state.load(Ordering::Relaxed), current_state: next })
+        if state.compare_exchange(current, next, success_order, Ordering::Relaxed).is_err() {
+            return Err(HandlerErrors::TransitionFailed { requested_state: current, current_state: state.load(Ordering::Relaxed) })
         };
 
         unsafe {
@@ -478,7 +475,7 @@ pub trait HandlerFunctions {
     ///   freed while the reference is in use.
     /// - No other thread may be writing to this block concurrently.
     unsafe fn read<'a, T>(&self, block: &Block<T>) -> Result<&'a T, HandlerErrors> {
-        if type_tag::compare::<T>(&block) {
+        if !type_tag::compare::<T>(&block) {
             return Err(HandlerErrors::TypeMismatchError);
         }
 
@@ -499,7 +496,7 @@ pub trait HandlerFunctions {
     /// - No other thread may be reading or writing this block concurrently.
     ///   Two simultaneous `read_mut` calls on the same block is undefined behaviour.
     unsafe fn read_mut<'a, T>(&self, block: &Block<T>) -> Result<&'a mut T, HandlerErrors> {
-        if type_tag::compare::<T>(&block) {
+        if !type_tag::compare::<T>(&block) {
             return Err(HandlerErrors::TypeMismatchError);
         }
 
@@ -519,10 +516,10 @@ pub trait HandlerFunctions {
     /// An result containing either the requested block, or an InvalidOffset error containing the
     /// offset address.
     fn get_block<T>(&self, offset: u32) -> Result<Block<T>, HandlerErrors> {
-        let v = self
-            .matrix()
-            .checked_query(self.base_ptr(), offset)
-            .unwrap();
+        let v = match self.matrix().checked_query(self.base_ptr(), offset) {
+            Ok(v) => v,
+            Err(_) => return Err(HandlerErrors::InvalidOffset { offset: offset })
+        };
 
         let block = Block::<T>::from_offset(v.offset(), self.base_ptr() as usize);
 
@@ -553,7 +550,7 @@ pub trait HandlerFunctions {
                 Ok(v) => {
                     let block = Block::<T>::from_offset(v.offset(), self.base_ptr() as usize);
 
-                    if type_tag::compare(&block) {
+                    if !type_tag::compare(&block) {
                         failed_query.push(*o);
                     } else {
                         block_list.push(block);
@@ -693,6 +690,11 @@ pub trait HandlerFunctions {
 
     /// Hashes a Matrix ID into a standard 16 bytes sized segment.
     ///
+    /// ## DISCLAIMER
+    ///
+    /// This is not a fully fledged hasher, and its meant to compress ID Strings into 16 bytes.
+    /// **DO NOT** use it for other things than its destined purpose.
+    ///
     /// ### Params:
     /// @id: The ID to be hashed.
     fn hash_id(&self, id: &str) -> [u8; 16] {
@@ -725,7 +727,5 @@ impl Drop for MatrixHandler {
         for block_md in self.blocks.iter() {
             self.free_at(block_md.offset - HEADER_SPACE);
         }
-
-        self.die();
     }
 }
