@@ -172,6 +172,9 @@ impl MatrixHandler {
     /// **must** outlive all shared handles derived from it — Rust cannot enforce
     /// this lifetime relationship automatically because `SharedHandler` uses raw
     /// pointers. Violating this contract is undefined behaviour.
+    ///
+    /// ### Returns:
+    /// A new SharedHandler instance.
     pub fn share(&self) -> SharedHandler {
         SharedHandler {
             matrix_addr: self.matrix as *const AtomicMatrix as usize,
@@ -186,11 +189,11 @@ impl MatrixHandler {
     ///
     /// Should be called before the application exits to prevent the SHM file
     /// from persisting in `/dev/shm/` across runs. This is an explicit, opt-
-    /// in cleanup - if omitted, the file survives until the system reboots
+    /// in cleanup. If omitted, the file survives until the system reboots
     /// or it's manually removed.
     ///
-    /// Existing mapping remains valid until the handlers are dropped; this
-    /// only removes the filesystem entry, preventing new attachments.
+    /// ### Returns:
+    /// A result containing either an empty Ok, or a HandlerErrors.
     pub fn die(&self) -> Result<(), HandlerErrors> {
         let id = &self.id;
         let path = format!("/dev/shm/matrix-{}", id);
@@ -278,6 +281,7 @@ pub trait HandlerFunctions {
     /// Returns the total segment size in bytes.
     fn segment_size(&self) -> u32;
 
+    /// Returns the block list for the current handler.
     fn block_list(&self) -> Vec<BlockMetadata>;
 
     /// Allocates a block sized to hold `T`.
@@ -286,9 +290,8 @@ pub trait HandlerFunctions {
     /// minimum payload if necessary. The matrix remains typeless — type
     /// information exists only in the returned [`Block<T>`].
     ///
-    /// # Errors
-    /// Returns [`HandlerError::AllocationFailed`] if the matrix is out of
-    /// memory or under contention after 512 retries.
+    /// # Returns:
+    /// A result containing either the block of type T, or a HandlerErros.
     fn allocate<T>(&self) -> Result<Block<T>, HandlerErrors> {
         let tag = type_tag::make::<T>();
         let size = std::mem::size_of::<T>() as u32;
