@@ -88,16 +88,8 @@ pub const TAG_SIZE: u32 = std::mem::size_of::<u32>() as u32;
 #[derive(Debug)]
 pub struct Block<T> {
     /// Payload offset from SHM base — points past the `BlockHeader`.
-    pub pointer: RelativePtr<T>,
+    pointer: RelativePtr<T>,
     base_ref: usize,
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug)]
-pub struct BlockMetadata {
-    pub type_tag: u32,
-    pub offset: u32,
-    pub len: u32,
 }
 
 /// A lightweight reflection of the original handler that can be safely sent
@@ -108,23 +100,22 @@ pub struct BlockMetadata {
 /// `SharedHandler` instances derived from it.
 ///
 /// `SharedHandler` exposes the same allocation, I/O, lifecycle, and escape
-/// hatch API as [`MatrixHandler`] via the [`HandlerFunctions`] trait —
-/// it does not own the mmap.
+/// hatch API as [`MatrixHandler`] via the [`HandlerFunctions`] trait.
+/// It does not own the mmap.
 ///
 /// **IF A DEDICATED MMAP IS NEEDED**, create a new MatrixHandler through
 /// `AtomicMatrix::bootstrap()`.
 #[derive(Clone, Copy)]
-pub struct SharedHandler<'a> {
+pub struct SharedHandler {
     matrix_addr: usize,
     base_addr: usize,
     segment_size: u32,
     first_block_offset: u32,
-    blocks: &'a [BlockMetadata],
 }
 
 /// The primary interface for interacting with an [`AtomicMatrix`].
 ///
-/// Owns the SHM mapping. Cannot be cloned — use [`share()`] to produce a
+/// Owns the SHM mapping. Cannot be cloned, use [`share()`] to produce a
 /// [`SharedHandler`] for other threads.
 ///
 /// See module documentation for the full abstraction layer diagram.
@@ -133,19 +124,30 @@ pub struct MatrixHandler {
     mmap: MmapMut,
     first_block_offset: u32,
     id: String,
-    blocks: Vec<BlockMetadata>,
 }
 
 impl<T> Block<T> {
     /// Constructs a `Block<T>` from a raw payload offset.
     ///
-    /// The offset must point past the [`BlockHeader`] (i.e. `header_offset + 32`).
-    /// Type `T` is introduced here — the matrix has no knowledge of it.
-    pub fn from_offset(offset: u32, base_ref: usize) -> Self {
+    /// ### Safety:
+    /// This function will construct a block from whatever offset you pass into it, unchecked. This
+    /// behaviour must be taken into account when running code with it.
+    ///
+    /// ### Params:
+    /// @offset: The u32 offset of the allocated block. \
+    /// @base_ref: The base_ptr from MatrixHandler.
+    ///
+    /// ### Returns:
+    /// An instance of self.
+    pub(crate) fn from_offset(offset: u32, base_ref: usize) -> Self {
         Self {
             pointer: RelativePtr::new(offset),
             base_ref,
         }
+    }
+
+    pub fn pointer(&self) -> &RelativePtr<T> {
+        return &self.pointer
     }
 }
 
@@ -162,16 +164,14 @@ impl MatrixHandler {
             mmap,
             first_block_offset,
             id,
-            blocks: Vec::<BlockMetadata>::new(),
         }
     }
 
     /// Produces a lightweight [`SharedHandler`] that can be sent to other threads.
     ///
-    /// [`SharedHandler`] holds raw pointers into the SHM segment. This handler
-    /// **must** outlive all shared handles derived from it — Rust cannot enforce
-    /// this lifetime relationship automatically because `SharedHandler` uses raw
-    /// pointers. Violating this contract is undefined behaviour.
+    /// [`SharedHandler`] holds raw pointers into the SHM segment. This handler **must** outlive all
+    /// shared handles derived from it, as Rust cannot enforce this lifetime relationship automatically
+    /// because `SharedHandler` uses raw pointers. Violating this contract is undefined behaviour.
     ///
     /// ### Returns:
     /// A new SharedHandler instance.
@@ -181,20 +181,23 @@ impl MatrixHandler {
             base_addr: self.base_ptr() as usize,
             segment_size: self.segment_size(),
             first_block_offset: self.first_block_offset,
-            blocks: &self.blocks,
         }
     }
 
     /// Removes the SHM file from the system.
     ///
-    /// Should be called before the application exits to prevent the SHM file
-    /// from persisting in `/dev/shm/` across runs. This is an explicit, opt-
-    /// in cleanup. If omitted, the file survives until the system reboots
-    /// or it's manually removed.
+    /// Should be called before the application exits to prevent the SHM file from persisting in
+    /// `/dev/shm/` across runs. This is an explicit, opt-in cleanup. If omitted, the file survives
+    /// until the system reboots, or it's manually removed.
+    ///
+    /// ### Safety:
+    /// `die` deallocate the whole SHM arena, disregarding whatever other processes is hooked onto
+    /// it at execution time. Therefore, it should be timed across all participants at the caller
+    /// side.
     ///
     /// ### Returns:
     /// A result containing either an empty Ok, or a HandlerErrors.
-    pub fn die(&self) -> Result<(), HandlerErrors> {
+    pub unsafe fn die(&self) -> Result<(), HandlerErrors> {
         let id = &self.id;
         let path = format!("/dev/shm/matrix-{}", id);
 
@@ -223,17 +226,14 @@ impl HandlerFunctions for MatrixHandler {
     fn segment_size(&self) -> u32 {
         self.mmap.len() as u32
     }
-    fn block_list(&self) -> Vec<BlockMetadata> {
-        self.blocks.clone()
-    }
 }
 
 // Safety: AtomicMatrix uses only atomic operations internally.
 // Caller guarantees the originating MatrixHandler outlives all SharedHandlers.
-unsafe impl Send for SharedHandler<'_> {}
-unsafe impl Sync for SharedHandler<'_> {}
+unsafe impl Send for SharedHandler {}
+unsafe impl Sync for SharedHandler {}
 
-impl HandlerFunctions for SharedHandler<'_> {
+impl HandlerFunctions for SharedHandler {
     fn base_ptr(&self) -> *const u8 {
         self.base_addr as *const u8
     }
@@ -245,9 +245,6 @@ impl HandlerFunctions for SharedHandler<'_> {
     }
     fn segment_size(&self) -> u32 {
         self.segment_size
-    }
-    fn block_list(&self) -> Vec<BlockMetadata> {
-        self.blocks.to_vec()
     }
 }
 
@@ -281,9 +278,6 @@ pub trait HandlerFunctions {
     /// Returns the total segment size in bytes.
     fn segment_size(&self) -> u32;
 
-    /// Returns the block list for the current handler.
-    fn block_list(&self) -> Vec<BlockMetadata>;
-
     /// Allocates a block sized to hold `T`.
     ///
     /// Size is computed from `size_of::<T>()` and rounded up to the 16-byte
@@ -308,11 +302,6 @@ pub trait HandlerFunctions {
         unsafe { *(self.base_ptr().add(ptr.offset() as usize) as *mut u32) = tag };
 
         let block = Block::<T>::from_offset(ptr.offset() + TAG_SIZE, self.base_ptr() as usize);
-        self.block_list().push(BlockMetadata {
-            type_tag: tag,
-            offset: block.pointer.offset(),
-            len: size,
-        });
 
         return Ok(block);
     }
@@ -329,11 +318,6 @@ pub trait HandlerFunctions {
     fn allocate_raw(&self, size: u32) -> Result<RelativePtr<u8>, HandlerErrors> {
         match self.matrix().allocate(self.base_ptr(), size) {
             Ok(v) => {
-                self.block_list().push(BlockMetadata {
-                    type_tag: 0,
-                    offset: v.offset(),
-                    len: size,
-                });
                 return Ok(v);
             }
             Err(e) => {
@@ -346,15 +330,22 @@ pub trait HandlerFunctions {
 
     /// Writes a value of type `T` into an allocated block.
     ///
-    /// # Safety
-    /// - No other thread may be reading or writing this block concurrently.
-    ///   The caller is responsible for all synchronization beyond the atomic
-    ///   state transitions provided by [`set_state`] and [`transition_state`].
+    /// ### Safety
+    /// This function is a mostly unchecked write. The only safety provided by it is that the type
+    /// of the block image and the segment in the matrix have the same type tag, and that the block is
+    /// not in any of the forbidden states. All other safety checks are excluded.
+    ///
+    /// ### Params:
+    /// @block: The block on which the value will be written to. \
+    /// @value: The value to write into the block.
+    ///
+    /// ### Returns:
+    /// A result containing an empty Ok, or a HandlerErrors
     unsafe fn write<T>(&self, block: &mut Block<T>, value: T) -> Result<(), HandlerErrors> {
         let header = unsafe { block.pointer.resolve_header_mut(self.base_ptr()) };
         let state = &header.state;
         let total_size = header.size.load(Ordering::Acquire) - HEADER_SPACE;
-        
+
         if !type_tag::compare::<T>(&block) {
             return Err(HandlerErrors::TypeMismatchError);
         }
@@ -377,7 +368,10 @@ pub trait HandlerFunctions {
             let dst = self.base_ptr().add(block.pointer.offset() as usize) as *mut T;
 
             if size > total_size as usize {
-                return Err(HandlerErrors::BlockOverflow { block_size: total_size as usize, payload_size: size })
+                return Err(HandlerErrors::BlockOverflow {
+                    block_size: total_size as usize,
+                    payload_size: size,
+                });
             };
 
             std::ptr::copy_nonoverlapping(payload, dst, size);
@@ -391,6 +385,14 @@ pub trait HandlerFunctions {
     /// Writes a value of type `T` into an allocated block, if the block is in the provided state.
     ///
     /// If the target fails, it will not write the data into the block.
+    ///
+    /// ### Params:
+    /// @block: The block to write the value into. \
+    /// @value: The value to write into the block. \
+    /// @taget: The targetted state of the block.
+    ///
+    /// ### Returns:
+    /// A result containing either an empty Ok, or a HandlerErrors.
     fn write_if<T>(
         &self,
         block: &mut Block<T>,
@@ -402,11 +404,13 @@ pub trait HandlerFunctions {
         let total_size = header.size.load(Ordering::Acquire) - HEADER_SPACE;
 
         if !type_tag::compare::<T>(&block) {
-            return Err(HandlerErrors::TypeMismatchError)
+            return Err(HandlerErrors::TypeMismatchError);
         };
 
         if state.load_if(target, Ordering::Acquire).is_err() {
-            return Err(HandlerErrors::ReservedState { state: state.load(Ordering::Relaxed) })
+            return Err(HandlerErrors::ReservedState {
+                state: state.load(Ordering::Relaxed),
+            });
         };
 
         unsafe {
@@ -415,12 +419,15 @@ pub trait HandlerFunctions {
             let dst = self.base_ptr().add(block.pointer.offset() as usize) as *mut T;
 
             if size > total_size as usize {
-                return Err(HandlerErrors::BlockOverflow { block_size: total_size as usize, payload_size: size});
+                return Err(HandlerErrors::BlockOverflow {
+                    block_size: total_size as usize,
+                    payload_size: size,
+                });
             };
 
             std::ptr::copy_nonoverlapping(payload, dst, size);
         };
-        
+
         header.last_edit.set_now();
 
         Ok(())
@@ -430,24 +437,40 @@ pub trait HandlerFunctions {
     /// into a targetted state.
     ///
     /// If the block is not into the targetted state, it will not be transitioned nor be written into.
+    ///
+    /// ### Params:
+    /// @block: The block to write the value into. \
+    /// @value: The value to write into the block. \
+    /// @current: The targetted state of the block. \
+    /// @next: The state to transition the block into. \
+    /// @sucess_order: Atomic ordering for a successful transition.
+    ///
+    /// ### Returns:
+    /// A result containing either an empty Ok, or a HandlerErrors.
     fn write_transition<T>(
         &self,
         block: &mut Block<T>,
         value: T,
         current: u32,
         next: u32,
-        success_order: Ordering
+        success_order: Ordering,
     ) -> Result<(), HandlerErrors> {
         let header = unsafe { block.pointer.resolve_header(self.base_ptr()) };
         let state = &header.state;
         let total_size = header.size.load(Ordering::Acquire) - HEADER_SPACE;
 
         if !type_tag::compare::<T>(&block) {
-            return Err(HandlerErrors::TypeMismatchError)
+            return Err(HandlerErrors::TypeMismatchError);
         };
 
-        if state.compare_exchange(current, next, success_order, Ordering::Relaxed).is_err() {
-            return Err(HandlerErrors::TransitionFailed { requested_state: current, current_state: state.load(Ordering::Relaxed) })
+        if state
+            .compare_exchange(current, next, success_order, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(HandlerErrors::TransitionFailed {
+                requested_state: current,
+                current_state: state.load(Ordering::Relaxed),
+            });
         };
 
         unsafe {
@@ -456,7 +479,10 @@ pub trait HandlerFunctions {
             let dst = self.base_ptr().add(block.pointer.offset() as usize) as *mut T;
 
             if size > total_size as usize {
-                return Err(HandlerErrors::BlockOverflow { block_size: total_size as usize, payload_size: size })
+                return Err(HandlerErrors::BlockOverflow {
+                    block_size: total_size as usize,
+                    payload_size: size,
+                });
             };
 
             std::ptr::copy_nonoverlapping(payload, dst, size);
@@ -469,18 +495,34 @@ pub trait HandlerFunctions {
 
     /// Reads a shared reference to `T` from an allocated block.
     ///
-    /// # Safety
-    /// - `block` must be in `STATE_ALLOCATED`.
-    /// - A value of type `T` must have been previously written via [`write`].
-    /// - The returned reference is valid as long as the SHM mapping is alive
-    ///   and the block has not been freed. It is **not** tied to the lifetime
-    ///   of the [`Block<T>`] handle — the caller must ensure the block is not
-    ///   freed while the reference is in use.
-    /// - No other thread may be writing to this block concurrently.
+    /// The value of T stays live inside the matrix as long as the segment exists.
+    ///
+    /// ### Safety:
+    /// The validity of this lifetime cannot be enforced at runtime, as the block can be freed by
+    /// another participant, and reading the freed data would cause an undefined behaviour. Therefore,
+    /// reference checking should be validated by the caller before attempting any operations uppon
+    /// it.
+    ///
+    /// ### Params:
+    /// @block: The block to get a reference from.
+    ///
+    /// ### Returns:
+    /// A result containing either a reference to T, or a HandlerErrors.
     unsafe fn read<'a, T>(&self, block: &Block<T>) -> Result<&'a T, HandlerErrors> {
         if !type_tag::compare::<T>(&block) {
             return Err(HandlerErrors::TypeMismatchError);
         }
+        match self
+            .matrix()
+            .checked_query(self.base_ptr(), block.pointer.offset())
+        {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(HandlerErrors::InvalidOffset {
+                    offset: block.pointer.offset(),
+                });
+            }
+        };
 
         let data = unsafe { block.pointer.resolve(self.base_ptr()) };
 
@@ -489,23 +531,69 @@ pub trait HandlerFunctions {
 
     /// Reads a mutable reference to `T` from an allocated block.
     ///
-    /// # Safety
-    /// - `block` must be in `STATE_ALLOCATED`.
-    /// - A value of type `T` must have been previously written via [`write`].
-    /// - The returned reference is valid as long as the SHM mapping is alive
-    ///   and the block has not been freed. It is **not** tied to the lifetime
-    ///   of the [`Block<T>`] handle — the caller must ensure the block is not
-    ///   freed while the reference is in use.
-    /// - No other thread may be reading or writing this block concurrently.
-    ///   Two simultaneous `read_mut` calls on the same block is undefined behaviour.
+    /// ### Safety:
+    /// The validity of this lifetime cannot be enforced at runtime, as the block can be freed by
+    /// another participant, and reading the freed data would cause an undefined behaviour. Therefore,
+    /// reference checking should be validated by the caller before attempting any operations uppon
+    /// it. Also, having a mutable reference to a shared value in runtime may cause undefined behaviour
+    /// on other participants, so careful synchronization is required.
+    ///
+    /// ### Params:
+    /// @block: The block to get a reference from.
+    ///
+    /// ### Returns:
+    /// A result containing either a mutable reference to T, or a HandlerErrors.
     unsafe fn read_mut<'a, T>(&self, block: &Block<T>) -> Result<&'a mut T, HandlerErrors> {
         if !type_tag::compare::<T>(&block) {
             return Err(HandlerErrors::TypeMismatchError);
         }
+        match self
+            .matrix()
+            .checked_query(self.base_ptr(), block.pointer.offset())
+        {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(HandlerErrors::InvalidOffset {
+                    offset: block.pointer.offset(),
+                });
+            }
+        };
 
         let mut_data = unsafe { block.pointer.resolve_mut(self.base_ptr()) };
 
         return Ok(mut_data);
+    }
+
+    /// Reads a copy of `T` from an allocated block.
+    ///
+    /// This function extract a thread safe copy of the value that cannot be changed nor dropped by
+    /// other participants, with the downside of being a stale copy that may not reflect the latest
+    /// state of the value.
+    ///
+    /// ### Params:
+    /// @block: The block to get a reference from.
+    ///
+    /// ### Returns:
+    /// A result containing either a copy of T, or a HandlerErrors.
+    fn read_copy<T>(&self, block: &Block<T>) -> Result<T, HandlerErrors> {
+        if !type_tag::compare::<T>(&block) {
+            return Err(HandlerErrors::TypeMismatchError);
+        }
+        match self
+            .matrix()
+            .checked_query(self.base_ptr(), block.pointer.offset())
+        {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(HandlerErrors::InvalidOffset {
+                    offset: block.pointer.offset(),
+                });
+            }
+        };
+
+        let data_cp = unsafe { std::ptr::read(block.pointer.resolve(self.base_ptr())) };
+
+        Ok(data_cp)
     }
 
     /// Tries to query a block through a checked query.
@@ -521,7 +609,7 @@ pub trait HandlerFunctions {
     fn get_block<T>(&self, offset: u32) -> Result<Block<T>, HandlerErrors> {
         let v = match self.matrix().checked_query(self.base_ptr(), offset) {
             Ok(v) => v,
-            Err(_) => return Err(HandlerErrors::InvalidOffset { offset: offset })
+            Err(_) => return Err(HandlerErrors::InvalidOffset { offset: offset }),
         };
 
         let block = Block::<T>::from_offset(v.offset(), self.base_ptr() as usize);
@@ -537,7 +625,7 @@ pub trait HandlerFunctions {
     ///
     /// A tuple containing a Vec with the successfull queried blocks and other with all failed
     /// offset addresses is returned after all queries are completed, so the caller can react to all
-    /// failed offsets in a more adaptable way.
+    /// failed offsets in a more dynamic way.
     ///
     /// ### Params:
     /// @offset_list: An array list containing all the offsets to be queried.
@@ -571,10 +659,24 @@ pub trait HandlerFunctions {
     /// Marks the block `STATE_ACKED` and immediately triggers coalescing.
     /// The block is invalid after this call — using it in any way is
     /// undefined behaviour.
-    fn free<T>(&self, block: Block<T>) {
+    fn free<T>(&self, block: Block<T>) -> Result<(), HandlerErrors> {
+        match self
+            .matrix()
+            .checked_query(self.base_ptr(), block.pointer.offset())
+        {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(HandlerErrors::InvalidOffset {
+                    offset: block.pointer.offset(),
+                });
+            }
+        };
+
         let header_ptr =
             RelativePtr::<BlockHeader>::new(block.pointer.offset() - HEADER_SPACE - TAG_SIZE);
         self.matrix().ack(&header_ptr, self.base_ptr());
+
+        Ok(())
     }
 
     /// Frees a block by its header offset directly.
@@ -582,23 +684,45 @@ pub trait HandlerFunctions {
     /// Used by `internals` framework code that operates on raw offsets
     /// rather than typed [`Block<T>`] handles. `header_offset` must point
     /// to a valid [`BlockHeader`] within the segment.
-    fn free_at(&self, header_offset: u32) {
+    fn free_at(&self, header_offset: u32) -> Result<(), HandlerErrors> {
+        match self.matrix().checked_query(self.base_ptr(), header_offset) {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(HandlerErrors::InvalidOffset {
+                    offset: header_offset,
+                });
+            }
+        };
+
         let header_ptr = RelativePtr::<BlockHeader>::new(header_offset);
         self.matrix().ack(&header_ptr, self.base_ptr());
+
+        Ok(())
     }
 
     /// Sets a user-defined lifecycle state on a block.
     ///
-    /// The state must be >= [`USER_STATE_MIN`] (49). Attempting to set an
-    /// internal state (0–48) returns [`HandlerError::ReservedStatus`].
+    /// Any state provided that is bellow the defined min state (49) will fail the call.
     ///
-    /// User states are invisible to the coalescing engine — a block in any
-    /// user state will never be automatically reclaimed. Call [`free`]
-    /// explicitly when the lifecycle is complete.
+    /// ### Params:
+    /// @block: The block to apply the desired state. \
+    /// @state: The custom state to apply into the block header.
     ///
-    /// # Errors
-    /// Returns [`HandlerError::ReservedStatus`] if `state < USER_STATE_MIN`.
+    /// ### Returns:
+    /// A result containing either an empty Ok, or a HandlerErrors.
     fn set_state<T>(&self, block: &Block<T>, state: u32) -> Result<(), HandlerErrors> {
+        match self
+            .matrix()
+            .checked_query(self.base_ptr(), block.pointer.offset())
+        {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(HandlerErrors::InvalidOffset {
+                    offset: block.pointer.offset(),
+                });
+            }
+        };
+
         if state < USER_STATE_MIN {
             return Err(HandlerErrors::ReservedState { state: state });
         }
@@ -621,34 +745,44 @@ pub trait HandlerFunctions {
     /// `Ordering::Acquire` for the general case. Use `Ordering::Relaxed`
     /// only if you do not need to synchronize with writes to the block's
     /// payload.
-    fn get_state<T>(&self, block: &Block<T>, order: Ordering) -> u32 {
+    fn get_state<T>(&self, block: &Block<T>, order: Ordering) -> Result<u32, HandlerErrors> {
+        match self
+            .matrix()
+            .checked_query(self.base_ptr(), block.pointer.offset())
+        {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(HandlerErrors::InvalidOffset {
+                    offset: block.pointer.offset(),
+                });
+            }
+        };
+
         let unpadded_block =
             Block::<T>::from_offset(block.pointer.offset() - TAG_SIZE, self.base_ptr() as usize);
         unsafe {
-            unpadded_block
+            Ok(unpadded_block
                 .pointer
                 .resolve_header(self.base_ptr())
                 .state
-                .load(order)
+                .load(order))
         }
     }
 
     /// Atomically transitions a block from one state to another.
     ///
-    /// Succeeds only if the block is currently in `expected`. `next` must
-    /// be >= [`USER_STATE_MIN`] — transitioning into an internal state is
-    /// not permitted.
+    /// Succeeds only if the block is currently in `expected`, and `next` must be >= [`USER_STATE_MIN`],
+    /// transitioning into an internal state is not permitted. Failed transition attempts are always
+    /// executed as Ordering::Relaxed.
     ///
-    /// `success_order` controls the memory ordering on success. Use
-    /// `Ordering::AcqRel` for the general case. The failure ordering is
-    /// always `Ordering::Relaxed`.
+    /// ### Params:
+    /// @block: The block on which to apply the state transition. \
+    /// @expected: The current expected state of the block. \
+    /// @next: The state to apply in case exchange succeeds. \
+    /// @success_ordering: Atomic ordering to execute the transition if it succeeds.
     ///
-    /// Returns `Ok(expected)` on success — the value that was replaced.
-    ///
-    /// # Errors
-    /// - [`HandlerError::ReservedStatus`] if `next < USER_STATE_MIN`.
-    /// - [`HandlerError::TransitionFailed`] if the block was not in the
-    ///   expected state.
+    /// ### Returns:
+    /// A result containing either the expected state, or a HandlerErrors.
     fn transition_state<T>(
         &self,
         block: &Block<T>,
@@ -656,6 +790,18 @@ pub trait HandlerFunctions {
         next: u32,
         success_order: Ordering,
     ) -> Result<u32, HandlerErrors> {
+        match self
+            .matrix()
+            .checked_query(self.base_ptr(), block.pointer.offset())
+        {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(HandlerErrors::InvalidOffset {
+                    offset: block.pointer.offset(),
+                });
+            }
+        };
+
         if next < USER_STATE_MIN {
             return Err(HandlerErrors::ReservedState { state: next });
         }
@@ -663,30 +809,24 @@ pub trait HandlerFunctions {
         let unpadded_block =
             Block::<T>::from_offset(block.pointer.offset() - TAG_SIZE, self.base_ptr() as usize);
         let header = unsafe { unpadded_block.pointer.resolve_header_mut(self.base_ptr()) };
-            match header
-                .state
-                .compare_exchange(expected, next, success_order, Ordering::Relaxed)
-            {
-                Err(_) => Err(HandlerErrors::TransitionFailed {
-                    requested_state: expected,
-                    current_state: header.state.load(Ordering::Relaxed)
-                }),
-                Ok(v) => Ok(v),
-            }
+        match header
+            .state
+            .compare_exchange(expected, next, success_order, Ordering::Relaxed)
+        {
+            Err(_) => Err(HandlerErrors::TransitionFailed {
+                requested_state: expected,
+                current_state: header.state.load(Ordering::Relaxed),
+            }),
+            Ok(v) => Ok(v),
+        }
     }
 
     /// Returns a raw reference to the underlying [`AtomicMatrix`].
-    ///
-    /// For `internals` framework authors who need allocator primitives
-    /// directly. Bypasses all handler abstractions — use with care.
     fn raw_matrix(&self) -> &AtomicMatrix {
         self.matrix()
     }
 
     /// Returns the raw SHM base pointer for this process's mapping.
-    ///
-    /// Use alongside [`raw_matrix()`] when building `internals` that need
-    /// direct access to block memory beyond what the typed API provides.
     fn raw_base_ptr(&self) -> *const u8 {
         self.base_ptr()
     }
@@ -700,6 +840,9 @@ pub trait HandlerFunctions {
     ///
     /// ### Params:
     /// @id: The ID to be hashed.
+    ///
+    /// ### Returns:
+    /// The 16 byte array derived from the provided ID.
     fn hash_id(&self, id: &str) -> [u8; 16] {
         let mut h1: u64 = 0x9368517673b203ef;
         let mut h2: u64 = 0x5851f42d4c957f2d;
@@ -722,13 +865,5 @@ pub trait HandlerFunctions {
         out[..8].copy_from_slice(&h1.to_le_bytes());
         out[8..].copy_from_slice(&h2.to_le_bytes());
         out
-    }
-}
-
-impl Drop for MatrixHandler {
-    fn drop(&mut self) {
-        for block_md in self.blocks.iter() {
-            self.free_at(block_md.offset - HEADER_SPACE);
-        }
     }
 }
