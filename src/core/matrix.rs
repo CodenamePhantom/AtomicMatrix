@@ -13,6 +13,7 @@
 //!
 //! 2. **Monotonicity:** Ripples only move backward (towards the sector origin)
 //! to prevent circular atomic dependencies and deadlocks.
+//!
 //! 3. **Permissive Concurrency:** If a thread encounters contention, it skips the
 //! block rather than blocking, relying on the high frequency of future operations
 //! to complete the healing.
@@ -51,45 +52,38 @@ pub mod helpers {
     pub const HEADER_SPACE: u32 = std::mem::size_of::<BlockHeader>() as u32;
     pub const HEADER_SIGNATURE: u32 = 0xCADAFACE;
 
-    /// A helper struct that provided the O(1) calculations to find the coordinates of
-    /// a block that suits exactly the requested buffer size, or the next available one
-    /// that can fit the message as well.
-    pub struct Mapping;
-
-    impl Mapping {
-        /// Maps a block size to its corresponding (First-Level, Second-Level) indices.
-        ///
-        /// This function implements a two-level mapping strategy used for O(1) free-block
-        /// lookup, optimized for both high-velocity small allocations and logarithmic
-        /// scaling of large blocks.
-        ///
-        /// ### Mapping Logic:
-        ///
-        /// - **Linear (Small):** For sizes < 128, it uses a fixed FL (0) and 16-byte SL
-        ///   subdivisions. This minimizes fragmentation for tiny objects.
-        /// - **Logarithmic (Large):** For sizes >= 128, FL is the power of 2 (determined via
-        ///   `leading_zeros`), and SL is a 3-bit subdivider of the range between 2^n and 2^(n+1).
-        ///
-        /// ### Mathematical Transformation:
-        /// - `FL = log2(size)`
-        /// - `SL = (size - 2^FL) / (2^(FL - 3))`
-        ///
-        /// ### Bounds:
-        /// Indices are clamped to `(31, 7)` to prevent overflow in the matrix bitmask.
-        ///
-        /// # Arguments
-        /// @size: The total byte size of the memory block.
-        ///
-        /// # Returns
-        /// A tuple of `(fl, sl)` indices.
-        pub fn find_indices(size: u32) -> (u32, u32) {
-            if size < 128 {
-                (0, (size / 16).min(7))
-            } else {
-                let fl = 31 - size.leading_zeros();
-                let sl = ((size >> (fl - 3)) & 0x7).min(7);
-                (fl.min(31), sl)
-            }
+    /// Maps a block size to its corresponding (First-Level, Second-Level) indices.
+    ///
+    /// This function implements a two-level mapping strategy used for O(1) free-block
+    /// lookup, optimized for both high-velocity small allocations and logarithmic
+    /// scaling of large blocks.
+    ///
+    /// ### Mapping Logic:
+    ///
+    /// - **Linear (Small):** For sizes < 128, it uses a fixed FL (0) and 16-byte SL
+    ///   subdivisions. This minimizes fragmentation for tiny objects.
+    /// - **Logarithmic (Large):** For sizes >= 128, FL is the power of 2 (determined via
+    ///   `leading_zeros`), and SL is a 3-bit subdivider of the range between 2^n and 2^(n+1).
+    ///
+    /// ### Mathematical Transformation:
+    /// - `FL = log2(size)`
+    /// - `SL = (size - 2^FL) / (2^(FL - 3))`
+    ///
+    /// ### Bounds:
+    /// Indices are clamped to `(31, 7)` to prevent overflow in the matrix bitmask.
+    ///
+    /// # Arguments
+    /// @size: The total byte size of the memory block.
+    ///
+    /// # Returns
+    /// A tuple of `(fl, sl)` indices.
+    pub fn find_indices(size: u32) -> (u32, u32) {
+        if size < 128 {
+            (0, (size / 16).min(7))
+        } else {
+            let fl = 31 - size.leading_zeros();
+            let sl = ((size >> (fl - 3)) & 0x7).min(7);
+            (fl.min(31), sl)
         }
     }
 }
@@ -191,41 +185,27 @@ impl AtomicMatrix {
     pub fn bootstrap(id: Option<String>, size: usize) -> Result<MatrixHandler, MatrixErrors> {
         let mut retry_count = 0;
 
-        let path_id = id.unwrap_or_else(|| generate_uuid());
+        let path_id = id.unwrap_or_else(generate_uuid);
         let path = format!("/dev/shm/matrix-{}", path_id);
-        let file = match OpenOptions::new()
+        let file = OpenOptions::new()
             .read(true)
             .write(true)
             .create(true)
             .open(&path)
-        {
-            Ok(v) => v,
-            Err(e) => {
-                return Err(MatrixErrors::MatrixInitializationError {
-                    reason: format!("Failed to create SHM file: {}", e),
-                });
-            }
-        };
+            .map_err(|e| MatrixErrors::MatrixInitializationError {
+                reason: format!("Failed to create SHM file: {}", e),
+            })?;
 
-        match file.set_len(size as u64) {
-            Ok(_) => {}
-            Err(e) => {
-                return Err(MatrixErrors::MatrixInitializationError {
-                    reason: format!("Failed to set matrix physical length: {}", e),
-                });
-            }
-        };
+        file.set_len(size as u64).map_err(|e| MatrixErrors::MatrixInitializationError {
+            reason: format!("Failed to set matrix physical length: {}", e),
+        })?;
 
         let mut mmap = unsafe {
-            match MmapMut::map_mut(&file) {
-                Ok(v) => v,
-                Err(e) => {
-                    return Err(MatrixErrors::MatrixInitializationError {
-                        reason: format!("Failed to create vmem map from the SHM file: {}", e),
-                    });
-                }
-            }
+            MmapMut::map_mut(&file).map_err(|e| MatrixErrors::MatrixInitializationError {
+                reason: format!("Failed to create vmem map from the SHM file: {}", e),
+            })?
         };
+
         let base_ptr = mmap.as_mut_ptr();
 
         let init_guard = unsafe { &*(base_ptr as *const AtomicU32) };
@@ -247,7 +227,7 @@ impl AtomicMatrix {
             current_offset = (16 + (matrix_size as u32) + 15) & !15;
             let remaining_size = size - (current_offset as usize);
 
-            let (fl, sl) = helpers::Mapping::find_indices(remaining_size as u32);
+            let (fl, sl) = helpers::find_indices(remaining_size as u32);
 
             let header: &mut BlockHeader;
             unsafe {
@@ -309,14 +289,16 @@ impl AtomicMatrix {
     ) -> Result<RelativePtr<u8>, MatrixErrors> {
         let size = (size + 15) & !15;
         let size = size.max(32);
-        let (fl, sl) = helpers::Mapping::find_indices(size);
+        let (fl, sl) = helpers::find_indices(size);
 
         for _ in 0..512 {
             if let Some((f_fl, f_sl)) = self.find_suitable_block(fl, sl) {
                 if let Ok(offset) = self.remove_free_block(base_ptr, f_fl, f_sl) {
                     let header =
                         unsafe { &mut *(base_ptr.add(offset as usize) as *mut BlockHeader) };
-                    header.state.store(STATE_ALLOCATED, Ordering::Release);
+                    header
+                        .state
+                        .store(helpers::STATE_ALLOCATED, Ordering::Release);
 
                     let total_size = header.size.load(Ordering::Acquire);
 
@@ -344,7 +326,7 @@ impl AtomicMatrix {
                             .store(size + helpers::HEADER_SPACE, Ordering::Release);
                         fence(Ordering::SeqCst);
 
-                        let (r_fl, r_sl) = helpers::Mapping::find_indices(rem_size);
+                        let (r_fl, r_sl) = helpers::find_indices(rem_size);
                         self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
                     }
 
@@ -451,7 +433,7 @@ impl AtomicMatrix {
                     break;
                 }
 
-                let (fl, sl) = helpers::Mapping::find_indices(size_to_add);
+                let (fl, sl) = helpers::find_indices(size_to_add);
 
                 total_size = total_size
                     .checked_add(size_to_add)
@@ -479,7 +461,7 @@ impl AtomicMatrix {
             .store(helpers::STATE_FREE, Ordering::Release);
         current_header.created_at.set_now();
 
-        let (fl, sl) = helpers::Mapping::find_indices(total_size);
+        let (fl, sl) = helpers::find_indices(total_size);
         self.insert_free_block(base_ptr, final_offset, fl, sl);
     }
 
@@ -515,6 +497,10 @@ impl AtomicMatrix {
         base_ptr: *const u8,
         offset: u32,
     ) -> Result<RelativePtr<u8>, MatrixErrors> {
+        if offset % 16 != 0 {
+            return Err(MatrixErrors::MisalignedHeader);
+        }
+
         let matadata_section = (16 + std::mem::size_of::<AtomicMatrix>() as u32 + 15) & !15;
 
         if offset >= self.sector_boundaries.load(Ordering::Relaxed) || offset < matadata_section {
@@ -527,7 +513,8 @@ impl AtomicMatrix {
         if header
             .state
             .load_if_not_any(&[STATE_COALESCING, STATE_ACKED], Ordering::Acquire)
-            .is_err() || header.signature != helpers::HEADER_SIGNATURE
+            .is_err()
+            || header.signature != helpers::HEADER_SIGNATURE
         {
             return Err(MatrixErrors::InvalidBlock);
         }
@@ -779,11 +766,11 @@ mod tests {
     /// Test if the mapping function can return the correct indexes.
     #[test]
     fn test_mapping() {
-        assert_eq!(helpers::Mapping::find_indices(16), (0, 1));
-        assert_eq!(helpers::Mapping::find_indices(64), (0, 4));
-        assert_eq!(helpers::Mapping::find_indices(128), (7, 0));
+        assert_eq!(helpers::find_indices(16), (0, 1));
+        assert_eq!(helpers::find_indices(64), (0, 4));
+        assert_eq!(helpers::find_indices(128), (7, 0));
 
-        let (fl, sl) = helpers::Mapping::find_indices(1024);
+        let (fl, sl) = helpers::find_indices(1024);
         assert_eq!(fl, 10);
         assert_eq!(sl, 0);
     }

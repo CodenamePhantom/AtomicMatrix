@@ -33,10 +33,11 @@ pub fn make<T>() -> u32 {
 ///
 /// ### Returns:
 /// A bool stating if the types matches or not.
-pub fn compare<T>(block: &Block<T>) -> bool {
-    let base = block.pointer.offset() - TAG_SIZE;
+pub fn compare<T>(block: &Block<T>, base_ptr: *const u8) -> bool {
+    let offset = block.pointer().offset() - TAG_SIZE;
+    let addr = unsafe { base_ptr.add(offset as usize) };
 
-    let stored_tag = unsafe { (base as *const u32).read() };
+    let stored_tag = unsafe { (addr as *const u32).read() };
     let expected_tag = make::<T>();
 
     stored_tag == expected_tag

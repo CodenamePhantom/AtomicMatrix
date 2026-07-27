@@ -280,7 +280,7 @@ impl<'a> AtomicRingBuffer {
             return None;
         }
 
-        let block = Block::<T>::from_offset(current_tail);
+        let block = Block::<T>::from_offset(current_tail, self.handler_ref.base_ptr() as usize);
         unsafe {
             match self.handler_ref.read(&block) {
                 Ok(v) => data = Some(v),
@@ -313,7 +313,7 @@ impl<'a> AtomicRingBuffer {
             return None;
         }
 
-        let block = Block::<T>::from_offset(current_tail);
+        let block = Block::<T>::from_offset(current_tail, self.handler_ref.base_ptr() as usize);
         let data = unsafe {
             match self.handler_ref.read(&block) {
                 Ok(v) => v,

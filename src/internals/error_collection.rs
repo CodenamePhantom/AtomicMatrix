@@ -25,11 +25,12 @@ better_error! {
     #[derive(Debug)]
     pub enum MatrixErrors {
         MatrixInitializationError { reason: String } => "Failed to initialized matrix: {reason}",
-        MatrixAttachingError => "",
-        OutOfMemory => "",
-        EmptyBitmapError => "",
-        OutOfBounds => "",
-        InvalidBlock => "",
+        MatrixAttachingError => "Failed to attach to the specified AtomicMatrix",
+        OutOfMemory => "The SHM segment ran out of memory",
+        EmptyBitmapError => "The TLSF bitmap has no available segments to allocate this request",
+        OutOfBounds => "The requested offset lies out of the AtomicMatrix bounds",
+        InvalidBlock => "The block requested is in an invalid state, or doesn't exist",
+        MisalignedHeader => "The offset provided is not aligned within header constraints",
     }
 }
 

@@ -428,7 +428,7 @@ impl Cartographer {
             current_offset = (16 + (matrix_size as u32) + 15) & !15;
             let remaining_size = size - (current_offset as usize);
 
-            let (fl, sl) = Mapping::find_indices(remaining_size as u32);
+            let (fl, sl) = find_indices(remaining_size as u32);
 
             let header: &mut BlockHeader;
             unsafe {

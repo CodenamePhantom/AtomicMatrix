@@ -21,7 +21,7 @@
 //! [`Looper`] itself is not thread-safe (it holds mutable iteration state).
 //! To iterate from multiple threads, create one iterator per thread or collect
 //! data into a [`vec`] first.
-use std::{any::Any, sync::atomic::Ordering};
+use std::sync::atomic::Ordering;
 
 use crate::prelude::*;
 
@@ -107,7 +107,7 @@ impl Looper {
 
         Self {
             handler_ref,
-            prev_offset: 0,
+            prev_offsets: Vec::new(),
             current_offset: len as u32,
             end_offset: end,
         }
