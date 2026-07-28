@@ -407,6 +407,9 @@ pub trait HandlerFunctions {
         value: T,
         target: u32,
     ) -> Result<(), HandlerErrors> {
+        self.matrix().checked_query(self.base_ptr(), block.header())
+            .map_err(|_| HandlerErrors::InvalidOffset { offset: block.pointer().offset() })?;
+
         let header = unsafe { block.tagless_ptr().resolve_header_mut(self.base_ptr()) };
         let state = &header.state;
         let total_size = header.size.load(Ordering::Acquire) - HEADER_SPACE;
@@ -463,6 +466,9 @@ pub trait HandlerFunctions {
         next: u32,
         success_order: Ordering,
     ) -> Result<(), HandlerErrors> {
+        self.matrix().checked_query(self.base_ptr(), block.header())
+            .map_err(|_| HandlerErrors::InvalidOffset { offset: block.pointer().offset() })?;
+
         let header = unsafe { block.tagless_ptr().resolve_header(self.base_ptr()) };
         let state = &header.state;
         let total_size = header.size.load(Ordering::Acquire) - HEADER_SPACE;
@@ -620,7 +626,7 @@ pub trait HandlerFunctions {
             Err(e) => return Err(HandlerErrors::InnerMatrixError(e))
         };
 
-        let block = Block::<T>::from_offset(v.offset(), self.base_ptr() as usize);
+        let block = Block::<T>::from_offset(v.offset() + TAG_SIZE, self.base_ptr() as usize);
 
         if type_tag::compare::<T>(&block, self.base_ptr()) {
             return Ok(block);
@@ -650,7 +656,7 @@ pub trait HandlerFunctions {
         for o in offset_list {
             match self.matrix().checked_query(self.base_ptr(), *o) {
                 Ok(v) => {
-                    let block = Block::<T>::from_offset(v.offset(), self.base_ptr() as usize);
+                    let block = Block::<T>::from_offset(v.offset() + TAG_SIZE, self.base_ptr() as usize);
 
                     if !type_tag::compare(&block, self.base_ptr()) {
                         failed_query.push(*o);
@@ -671,16 +677,15 @@ pub trait HandlerFunctions {
     /// The block is invalid after this call — using it in any way is
     /// undefined behaviour.
     fn free<T>(&self, block: Block<T>) -> Result<(), HandlerErrors> {
-        match self
-            .matrix()
-            .checked_query(self.base_ptr(), block.header())
+        self.matrix().checked_query(self.base_ptr(), block.header())
+            .map_err(|_| HandlerErrors::InvalidOffset { offset: block.pointer.offset() })?;
+
+        let header = unsafe { block.tagless_ptr().resolve_header(self.base_ptr()) };
+        if header.state
+            .load_if_any(&[STATE_ACKED, STATE_COALESCING, STATE_FREE], Ordering::Acquire)
+            .is_ok()
         {
-            Ok(_) => {}
-            Err(_) => {
-                return Err(HandlerErrors::InvalidOffset {
-                    offset: block.pointer.offset(),
-                });
-            }
+            return Err(HandlerErrors::InvalidOffset { offset: block.pointer.offset() })
         };
 
         let header_ptr = RelativePtr::<BlockHeader>::new(block.header());
@@ -929,6 +934,8 @@ mod tests {
 
         assert_eq!(res.is_ok(), true);
         assert_eq!(val, 1);
+
+        unsafe { handler.die().unwrap() };
     }
 
     #[test]
@@ -941,6 +948,8 @@ mod tests {
 
         assert_eq!(res.is_ok(), false);
         assert_eq!(val, 0);
+
+        unsafe { handler.die().unwrap() };
     }
 
     #[test]
@@ -952,5 +961,42 @@ mod tests {
 
         assert_eq!(mismatched_block.is_ok(), false);
         assert!(matches!(mismatched_block, Err(HandlerErrors::TypeMismatchError)));
+
+        unsafe { handler.die().unwrap() };
+    }
+
+    #[test]
+    fn test_use_after_free() {
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+        let block = handler.allocate::<u32>().unwrap();
+        let mut cloned_block = handler.get_block::<u32>(block.header()).unwrap();
+        let _err: Result<(), HandlerErrors> = Err(HandlerErrors::InvalidOffset { offset: cloned_block.pointer().offset() });
+
+        handler.free(block).unwrap();
+        std::thread::sleep(std::time::Duration::from_nanos(100));
+
+        let res = handler.write_if(&mut cloned_block, 10, 1);
+
+        assert_eq!(res.is_ok(), false);
+        assert!(matches!(res, _err));
+
+        unsafe { handler.die().unwrap() };
+    }
+
+    #[test]
+    fn test_double_free() {
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+        let block = handler.allocate::<u32>().unwrap();
+        let cloned_block = handler.get_block::<u32>(block.header()).unwrap();
+        let _err: Result<(), HandlerErrors> = Err(HandlerErrors::InvalidOffset { offset: cloned_block.pointer().offset() });
+
+        handler.free(block).unwrap();
+        std::thread::sleep(std::time::Duration::from_nanos(100));
+        let res = handler.free(cloned_block);
+
+        assert_eq!(res.is_ok(), false);
+        assert!(matches!(res, _err));
+
+        unsafe { handler.die().unwrap() };
     }
 }

@@ -343,6 +343,11 @@ impl AtomicMatrix {
     /// ### Params:
     /// @ptr: The relative pointer of the block to acknowledge \
     /// @base_ptr: The offset from the start of the SHM segment.
+    ///
+    /// TODO: In this current state, ack allows multiple processes to double-free the same block. It
+    /// is ok, since the kinetic coalescing handles double-free gracefully without blowing
+    /// everything up, but it needs to be fixed to ensure a correct ownership contract on higher
+    /// levels.
     pub fn ack(&self, ptr: &RelativePtr<BlockHeader>, base_ptr: *const u8) {
         let header = unsafe { ptr.resolve_mut(base_ptr) };
 
@@ -440,7 +445,7 @@ impl AtomicMatrix {
                     .expect("TidalRippleCoalescingError");
                 final_offset = prev_phys_offset;
                 current_header = prev_header;
-                self.remove_free_block(base_ptr, fl, sl).is_ok();
+                let _ = self.remove_free_block(base_ptr, fl, sl).is_ok();
             } else {
                 break;
             }
@@ -809,6 +814,8 @@ mod tests {
                 helpers::STATE_ALLOCATED
             );
         }
+
+        unsafe { handler.die().unwrap() };
     }
 
     /// Test coalesce logic to see if blocks will merge correctly.
