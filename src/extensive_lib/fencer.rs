@@ -448,7 +448,7 @@ impl<'a> RouteGuard<'a> {
             Err(e) => return Err(FencerErrors::SectorError(format!("{:?}", e))),
         };
 
-        unsafe { self.sector_handler.write(&mut block, msg) };
+        unsafe { self.sector_handler.write(&mut block, msg).unwrap() };
 
         match self.inbox.enqueue::<u32>(block.pointer().offset()) {
             Ok(_) => return Ok(()),
