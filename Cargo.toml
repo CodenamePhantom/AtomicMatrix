@@ -14,4 +14,6 @@ readme = "README.md"
 default = []
 
 [dependencies]
+better_result = "0.3"
 memmap2 = "0.9.10"
+libc = "0.2.186"

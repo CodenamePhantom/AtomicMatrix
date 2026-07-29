@@ -68,8 +68,8 @@ impl<T, const N: usize> AtomicArray<T, N> {
     }
 
     pub unsafe fn from(handler: &MatrixHandler, src: u32) -> &Self {
-        let block = Block::<AtomicArray<T, N>>::from_offset(src);
-        let atomic_array = unsafe { block.pointer.resolve(handler.base_ptr()) };
+        let block = Block::<AtomicArray<T, N>>::from_offset(src, handler.base_ptr() as usize);
+        let atomic_array = unsafe { block.pointer().resolve(handler.base_ptr()) };
 
         atomic_array
     }
