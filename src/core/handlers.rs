@@ -54,6 +54,16 @@
 //! [`MatrixHandler`] owns the mmap and is not `Clone`. Use `share()` to produce a [`SharedHandler`] 
 //! that can be sent to other threads. The original handler must outlive all shared handles derived 
 //! from it.
+//!
+//! # Safety
+//!
+//! All the operations assumes that each participant follows the safety contract proposed by the
+//! high-level API. Adversarial behaviours that directly forge blocks, poison already existing
+//! payloads, or just zero out the entire segment are undetectable at compile time.
+//!
+//! Although the API provides typed errors that can be treated locally if anything fails, more
+//! safety surfaces must be implemented to ensure an attacker cannot reach the matrix SHM arena
+//! directly (LSM protection, server hardening, infrastructure security, etc).
 
 use crate::internals::error_collection::HandlerErrors;
 use crate::prelude::*;
@@ -145,14 +155,35 @@ impl<T> Block<T> {
         }
     }
 
+    /// Returns the underlying RelativePtr for this block.
+    ///
+    /// ### Safety:
+    /// All operations inside the RelativePtr are raw pointer arithmetics, and considered unsafe by
+    /// default. MatrixHandler abstracts these unsafe behaviours with a barrage of checks to ensure
+    /// ops are valid at the surface of the call.
+    ///
+    /// ### Returns:
+    /// The RelativePtr typed to T.
     pub fn pointer(&self) -> &RelativePtr<T> {
         return &self.pointer
     }
 
+    /// Returns the direct header offset for the block.
+    ///
+    /// This makes the pointer arithmetic for the header standard across all the codebase.
+    ///
+    /// ### Returns:
+    /// The direct header offset as an u32 integer.
     pub fn header(&self) -> u32 {
         self.pointer.offset() - HEADER_SPACE - TAG_SIZE
     }
 
+    /// Returns an offset to the block start, without the type_tag.
+    ///
+    /// This makes the pointer arithmetic for the clean block state standard across the codebase.
+    ///
+    /// ### Returns:
+    /// A generic RelativePtr of the block, without the type_tag offset.
     pub fn tagless_ptr(&self) -> RelativePtr<u8>{
         RelativePtr::<u8>::new(self.pointer.offset() - TAG_SIZE)
     }
@@ -674,8 +705,13 @@ pub trait HandlerFunctions {
     /// Frees a typed block.
     ///
     /// Marks the block `STATE_ACKED` and immediately triggers coalescing.
-    /// The block is invalid after this call — using it in any way is
-    /// undefined behaviour.
+    /// The block is invalid after this call.
+    ///
+    /// ### Params:
+    /// @block: The block to be freed.
+    ///
+    /// ### Returns:
+    /// A result containing an empty Ok, or a HandlerErrors
     fn free<T>(&self, block: Block<T>) -> Result<(), HandlerErrors> {
         self.matrix().checked_query(self.base_ptr(), block.header())
             .map_err(|_| HandlerErrors::InvalidOffset { offset: block.pointer.offset() })?;
@@ -732,10 +768,12 @@ pub trait HandlerFunctions {
 
     /// Returns the current state of a block.
     ///
-    /// `order` controls the memory ordering of the atomic load. Use
-    /// `Ordering::Acquire` for the general case. Use `Ordering::Relaxed`
-    /// only if you do not need to synchronize with writes to the block's
-    /// payload.
+    /// ### Params:
+    /// @block: The block to apply the desired state. \
+    /// @order: The atomic ordering for the operation.
+    ///
+    /// ### Returns:
+    /// A result containing either the requested state, or a HandlerErrors.
     fn get_state<T>(&self, block: &Block<T>, order: Ordering) -> Result<u32, HandlerErrors> {
         match self
             .matrix()
@@ -996,6 +1034,79 @@ mod tests {
 
         assert_eq!(res.is_ok(), false);
         assert!(matches!(res, _err));
+
+        unsafe { handler.die().unwrap() };
+    }
+
+    #[test]
+    fn test_successful_state_transition() {
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+        let block = handler.allocate::<u32>().unwrap();
+
+        let res = handler.transition_state(&block, STATE_ALLOCATED, 100, Ordering::Release);
+        let state = handler.get_state(&block, Ordering::Acquire).unwrap();
+
+        assert_eq!(res.is_ok(), true);
+        assert_eq!(state, 100);
+
+        unsafe { handler.die().unwrap() };
+    }
+
+    #[test]
+    fn test_fail_transition_to_reserved_states() {
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+        let block = handler.allocate::<u32>().unwrap();
+
+        let res = handler.transition_state(&block, STATE_ALLOCATED, 6, Ordering::Release);
+
+        assert_eq!(res.is_ok(), false);
+        assert!(matches!(res, Err(HandlerErrors::ReservedState { state: 6 })));
+
+        unsafe { handler.die().unwrap() };
+    }
+
+    #[test]
+    fn test_successful_state_setting() {
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+        let block = handler.allocate::<u32>().unwrap();
+
+        let res = handler.set_state(&block, 100);
+        let state = handler.get_state(&block, Ordering::Acquire).unwrap();
+
+        assert_eq!(res.is_ok(), true);
+        assert_eq!(state, 100);
+
+        unsafe { handler.die().unwrap() };
+    }
+
+    #[test]
+    fn test_fail_setting_reserved_state() {
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+        let block = handler.allocate::<u32>().unwrap();
+
+        let res = handler.set_state(&block, 10);
+
+        assert_eq!(res.is_ok(), false);
+        assert!(matches!(res, Err(HandlerErrors::ReservedState { state: 10 })));
+
+        unsafe { handler.die().unwrap() };
+    }
+
+    #[test]
+    fn test_mutref_usability() {
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+        let mut block = handler.allocate::<u32>().unwrap();
+
+        unsafe { handler.write(&mut block, 50).unwrap() };
+        let real_time_ref = unsafe { handler.read(&block).unwrap() };
+
+        let mutable_ref = unsafe { handler.read_mut(&block).unwrap() };
+
+        assert_eq!(*real_time_ref, 50);
+
+        *mutable_ref += 50;
+
+        assert_eq!(*real_time_ref, 100);
 
         unsafe { handler.die().unwrap() };
     }

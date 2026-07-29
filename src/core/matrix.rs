@@ -50,6 +50,8 @@ pub mod helpers {
     pub const STATE_COALESCING: u32 = 3;
 
     pub const HEADER_SPACE: u32 = std::mem::size_of::<BlockHeader>() as u32;
+    pub const METADATA_SPACE: u32 = (16 + std::mem::size_of::<AtomicMatrix>() as u32 + 15) & !15;
+
     pub const HEADER_SIGNATURE: u32 = 0xCADAFACE;
 
     /// Maps a block size to its corresponding (First-Level, Second-Level) indices.
@@ -196,7 +198,9 @@ impl AtomicMatrix {
                 reason: format!("Failed to create SHM file: {}", e),
             })?;
 
-        file.set_len(size as u64).map_err(|e| MatrixErrors::MatrixInitializationError {
+        let total_size = size + helpers::METADATA_SPACE as usize;
+
+        file.set_len(total_size as u64).map_err(|e| MatrixErrors::MatrixInitializationError {
             reason: format!("Failed to set matrix physical length: {}", e),
         })?;
 
@@ -210,7 +214,7 @@ impl AtomicMatrix {
 
         let init_guard = unsafe { &*(base_ptr as *const AtomicU32) };
         let matrix_ptr = unsafe { base_ptr.add(16) as *mut AtomicMatrix };
-        let mut current_offset: u32 = 0;
+        let current_offset: u32 = helpers::METADATA_SPACE;
 
         if init_guard
             .compare_exchange(
@@ -221,11 +225,9 @@ impl AtomicMatrix {
             )
             .is_ok()
         {
-            let matrix = AtomicMatrix::init(matrix_ptr, size as u32);
+            let matrix = AtomicMatrix::init(matrix_ptr, total_size as u32);
 
-            let matrix_size = std::mem::size_of::<AtomicMatrix>();
-            current_offset = (16 + (matrix_size as u32) + 15) & !15;
-            let remaining_size = size - (current_offset as usize);
+            let remaining_size = total_size - (current_offset as usize);
 
             let (fl, sl) = helpers::find_indices(remaining_size as u32);
 
@@ -407,7 +409,7 @@ impl AtomicMatrix {
 
         let mut final_offset = current_offset;
 
-        while current_offset > 16 + std::mem::size_of::<AtomicMatrix>() as u32 {
+        while current_offset > helpers::METADATA_SPACE as u32 {
             let prev_phys_offset = current_header.prev_phys.load(Ordering::Acquire);
 
             if prev_phys_offset == 0 {
@@ -506,9 +508,7 @@ impl AtomicMatrix {
             return Err(MatrixErrors::MisalignedHeader);
         }
 
-        let matadata_section = (16 + std::mem::size_of::<AtomicMatrix>() as u32 + 15) & !15;
-
-        if offset >= self.sector_boundaries.load(Ordering::Relaxed) || offset < matadata_section {
+        if offset >= self.sector_boundaries.load(Ordering::Relaxed) || offset < METADATA_SPACE {
             return Err(MatrixErrors::OutOfBounds);
         }
 
@@ -858,6 +858,20 @@ mod tests {
         };
 
         unsafe { handler.die().unwrap() };
+    }
+
+    #[test]
+    fn test_allocation_size_plus_md_section() {
+        let size = memory_scale::two::KB;
+        let handler = AtomicMatrix::bootstrap(None, size).unwrap();
+        let init_block = handler.matrix()
+            .checked_query(handler.base_ptr() as *const u8, helpers::METADATA_SPACE).unwrap();
+
+        let header = unsafe { init_block.resolve_header(handler.base_ptr()) };
+
+        assert_eq!(header.size.load(Ordering::Relaxed), size as u32);
+
+        unsafe { handler.die().unwrap() }
     }
 
     /// ----------------------------------------------------------------------------
