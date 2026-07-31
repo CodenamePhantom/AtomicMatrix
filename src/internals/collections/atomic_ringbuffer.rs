@@ -82,6 +82,7 @@ pub struct AtomicRingBuffer {
     tail: AtomicU32,
     has_message: AtomicBool,
     handler_ref: SharedHandler,
+    address: u32,
 }
 
 // Safety: as the buffer inherits the zero-copy, lock-free traits from
@@ -140,13 +141,8 @@ impl<'a> AtomicRingBuffer {
         let struct_size = size_of::<AtomicRingBuffer>();
         let size = struct_size + buf_size * slots;
 
-        let rel_ptr = match handler_ref.allocate_raw(size as u32) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("Failed to allocate ring_buffer: {:?}", e);
-                return None;
-            }
-        };
+        let rel_ptr = handler_ref.allocate_raw(size as u32).unwrap();
+
         let rb_start = rel_ptr.offset() + struct_size as u32;
         let rb_end = rb_start + size as u32;
         let header = unsafe { rel_ptr.resolve_header_mut(handler_ref.base_ptr()) };
@@ -170,6 +166,7 @@ impl<'a> AtomicRingBuffer {
                     tail: AtomicU32::new(rb_start),
                     has_message: AtomicBool::new(false),
                     handler_ref,
+                    address: rel_ptr.offset(),
                 },
             );
             Some(&*atomic_rb_ptr)
@@ -273,7 +270,9 @@ impl<'a> AtomicRingBuffer {
     /// # Returns
     /// Either a life time specified reference to the block data, or
     /// None if the block is empty
-    pub fn dequeue<T>(&self) -> Option<&'a T> {
+    pub fn dequeue<T>(&self) -> Option<type_guard::TypeGuard<T>> {
+        let data: Option<type_guard::TypeGuard<T>>;
+
         let current_tail = self.tail.load(Ordering::Relaxed);
         let next_tail = self.advance(current_tail);
 
@@ -281,8 +280,13 @@ impl<'a> AtomicRingBuffer {
             return None;
         }
 
-        let block = Block::<T>::from_offset(current_tail);
-        let data = unsafe { self.handler_ref.read(&block) };
+        let block = Block::<T>::from_offset(current_tail, self.handler_ref.base_ptr() as usize);
+        unsafe {
+            match self.handler_ref.read(&block) {
+                Ok(v) => data = Some(v),
+                Err(_) => data = None,
+            }
+        };
 
         self.tail.store(next_tail, Ordering::Release);
 
@@ -290,7 +294,7 @@ impl<'a> AtomicRingBuffer {
             self.has_message.store(false, Ordering::Release);
         }
 
-        Some(data)
+        return data
     }
 
     /// Returns the current head from the buffer without moving the pointer
@@ -302,15 +306,20 @@ impl<'a> AtomicRingBuffer {
     /// # Returns
     /// Either a reference to the block data, or None if the block is
     /// empty
-    pub fn peek<T>(&self) -> Option<&T> {
+    pub fn peek<T>(&self) -> Option<type_guard::TypeGuard<T>> {
         let current_tail = self.tail.load(Ordering::Acquire);
 
         if current_tail == self.commited_head.load(Ordering::Acquire) {
             return None;
         }
 
-        let block = Block::<T>::from_offset(current_tail);
-        let data = unsafe { self.handler_ref.read(&block) };
+        let block = Block::<T>::from_offset(current_tail, self.handler_ref.base_ptr() as usize);
+        let data = unsafe {
+            match self.handler_ref.read(&block) {
+                Ok(v) => v,
+                Err(_) => return None,
+            }
+        };
 
         Some(data)
     }
@@ -328,5 +337,9 @@ impl<'a> AtomicRingBuffer {
     /// Returns the current tail available to read.
     pub fn current_tail(&self) -> u32 {
         self.tail.load(Ordering::Relaxed)
+    }
+
+    pub fn address(&self) -> u32 {
+        self.address
     }
 }

@@ -1,65 +1,66 @@
 # AtomicMatrix
 
-AtomicMatrix is a lock-free shared-memory allocator for zero-copy IPC between processes on the same machine. No native mutexes and no kernel involvement on the hot path.
+### *To lock or not to lock. That is the question* - Shakespear... probably
 
-## What it is
+AtomicMatrix is a lock-free shared memory arena based on Linux SHM scope. It enables separate processes to acess and manage the same memory state concurrently, while avoiding kernel involvement.
 
-AtomicMatrix is a general-purpose lock-free memory allocator that lives in `/dev/shm`. Multiple independent processes map the same segment and allocate, read, and free blocks through a unified API with no copying and no kernel involvement on the hot path.
+# What it is
 
-It is designed as the memory fabric for low-latency IPC pipelines - the kind of infrastructure that sits underneath a database write buffer, a real-time event bus, or a shared state mesh across microservices.
+AtomicMatrix works as a general purpose memory allocator that can be mapped independently by multiple threads on the same scope, or separate processes. The arena is backed by a linux file stored at `/dev/shm` dynamically generated at bootstrap, although callers can name it whatever their use case requires. At this point, all allocation and deallocation procedures between processes are handled safely through atomic operators, data manipulation on allocated cells can also take advantage of this atomic safety by using the header state machine to synchronize access through the `MatrixHandler` object.
 
-## What makes it different
+# What makes it different
 
-Most high-performance allocators make one of three sacrifices: they are fast but not general (fixed-size ring buffers), general but not fast (mutex-based), or fast and general but operationally complex (DPDK mempool, requiring specific NICs and a full DPDK stack).
+The matrix provides all the synchronization necessary for safely allocating and deallocating without getting in the way of other processes, while giving enough access to the caller to make it adaptable to a wide variety of use cases without imposing its own opinion on how your program should work. The phylosophy is that the internal operations should be fast, safe, and unopinionated enough that manage states between processes is not a problem the caller has to deal with. With this ideas in mind, we provide the following features:
 
-AtomicMatrix is a general-purpose allocator with built in arbitrary sizes, O(1) allocation and free, running at wire speed on commodity hardware, deployable as a single Rust crate.
+- Blocks have no arbitrary sizes. The caller can allocate a cell to whatever size its data requires.
+- Data blocks can be accessed simultaneously regardless of synchronization. Callers can synchronize threads and processes in any way their use case requires.
+- The arena is completelly type agnostic. Whatever you throw in will be converted to bytes and written within the segment.
+- MatrixHandler abstracts a lot of the manual work required to both write data, and validate written types and block validity without getting in the way
 
-| | Lock-free | Arbitrary sizes | SHM-backed | Commodity hardware |
-|---|---|---|---|---|
-| **AtomicMatrix** | ✓ | ✓ | ✓ | ✓ |
-| LMAX Disruptor | ✓ | ✗ (fixed) | ✗ | ✓ |
-| Intel DPDK mempool | ✓ | ✗ (fixed) | ✗ | ✗ |
-| Boost.Interprocess | ✗ | ✓ | ✓ | ✓ |
+# How it works
 
----
+## Memory layout
 
-## How it works
-
-### Memory layout
-
-```
-[ Init Guard (16b) ] [ AtomicMatrix struct ] [ Padding ] [ Allocation Sector ]
+```text
+[ Init Guard (16b) ] [ AtomicMatrix Struct (bitmaps, metadata, etc) ] [ padding ] [ Memory Arena ]
 ```
 
-All metadata related to the matrix is stored at the very beginning to be globally accessible across modules, acting as a shared state manager coordinating actions between concurrent requests.
+The arena starts with a 16b atomic init guard. Participants that attach to an arena will either create the file and initialize all the structures required, or loop until the first arriving participant finishes bootstraping everything.
 
-### Allocation: O(1)
+The AtomicMatrix struct is written right after the init guard and works as the metadata all participants will use to get or insert free offsets.
 
-Allocation uses a two-level segregated fit (TLSF) inspired bitmap. A first-level bitmap indexes power-of-two size classes. A second-level bitmap subdivides each class into 8 linear steps. Finding a suitable block is two bitmap operations and one CAS. No scanning, no sorting, no locks.
+All subsequent segments are the free memory arena that participants will use to allocate data.
 
-### Memory Healing
+## O(1) Allocation
 
-Freeing a block triggers a backward **Ripple**. A coalescing traversal that merges the freed block with its left physical neighbours as long as they are free or acknowledged. Three properties make this safe under concurrent access:
+The allocation algorithm uses a two-level segregated fit (TLSF) inspired atomic bitmap. The first level indexes power-of-two size classes, and the second level subdivides each class into 8 linear buckets until the next size class. If more than one block of the same size bucket is freed simultaneously, it adds the head of the bucket to the freed chain in the block header and pushes the current block as the new head of the bucket. This ensures that allocations are O(1) time complexity and fully thread safe with CAS (Compare and Swap) operations.
 
-- **Monotonicity**: Ripples only propagate backward toward the sector origin, eliminating circular dependencies and deadlock.
-- **Permissive concurrency**: If a thread encounters contention on a neighbour, it stops the ripple and moves on. A future operation will complete the merge.
-- **Pressure-driven healing**: `ack()` marks a block free and immediately attempts coalescing. No background thread, no shared queue, no coordination overhead.
+## Memory Healing
 
-### Process-independent addressing
+AtomicMatrix uses a custom coalescing engine we call **Kinetic Coalescing**. Each `ack` call triggers a *ripple* that travels leftwards towards the sector beginning, merging with all physically adjacent neighbours that are marked in a free state. Kinetic Coalescing follow 4 properties to make it safe under concurrent access:
 
-All pointers are stored as `u32` offsets relative to the base of the SHM segment. Each process resolves offsets against its own mapping. The same offset is valid in every process that has mapped the segment, regardless of where the OS placed the mapping in virtual address space.
+- **Monotonicity**: Merging only travels backwards to the sector origin, eliminating circular dependencies, deadlocks, and merge-stop synchronization.
+- **Permissive Concurrency**: If a process encounters contention on merging a neighbour, it stops the coalescing, merge whatever it got up to that point and complete the operation. If contention happens on allocation, it simply moves to the next block in the available chain or get a new one from the bitmap instead of locking or waiting.
+- **Pressure-driven healing**: `ack()` marks a block free and immediately starts the coalescing procedure, instead of relying on background cleanup threads or shared queues.
+- **Local failures only**: If any failures arises from the operations (corrupted data, arena out of memory, etc), processes fail locally instead of blowing everything up (borrowed directly from the Actor Model).
 
-### Block lifecycle
+## Process independent addressing
 
+All pointers are stored as `u32` offsets relative to the base of the SHM segment, and wrapped in a `RelativePtr` struct. Each process can use this to resolve coordinates against its own mapping.
+
+## Block lifecycle
+
+```text
+STATE_FREE -> (block is allocated) -> STATE_ALLOCATED -> (ack is called) -> STATE_ACKED -> STATE_COALESCING -> STATE_FREE
 ```
-STATE_FREE → STATE_ALLOCATED → STATE_ACKED → STATE_COALESCING → STATE_FREE
-```
 
-- `allocate()` — transitions a block from FREE to ALLOCATED
-- `ack()` — transitions ALLOCATED to ACKED and immediately triggers coalescing
-- `coalesce()` — merges ACKED/FREE neighbours, transitions merged block to FREE
+Blocks relies on an atomic state machine stored in the header. Each allocation/deallocation op moves the state machine forward, granting that blocks live exactly the way the caller intended to.
 
----
+### Correctness
+
+The state machine grants that the data in the block cannot be overwritten or cleaned up by processes that do not have ownership over that specific block. If a neighbour is freed, it will not touch the current block, unless it is in STATE_FREE or STATE_ACKED. Coalescing also ignores the data section of blocks, jumping directly into the previous block header instead, using the physical neighbour chain present in each header.
+
+It also grants that no coalescing procedures overlap each other, since it only considers the two aformentioned states for merging.
 
 ## Benchmarks
 
@@ -96,8 +97,6 @@ cargo test --lib matrix::tests::test_long_term_fragmentation_healing -- --includ
 | 16 | 994,983,604 | 16.58 | 60.3 | 3.65x | 23% |
 
 
-
-
 > **Attention**
 > The long term healing test is a stress test that produces a lot of workload in the CPU. It is recommended to adapt the quantity of concurrent threads to the declared number of vThreads provided by your manufacturer.
 
@@ -105,80 +104,80 @@ cargo test --lib matrix::tests::test_long_term_fragmentation_healing -- --includ
 
 ## Usage
 
+AtomicMatrix is in its early stages of development, and its not available in crates.io yet. Using it requires getting it directly from github for now
 
 ```toml
 [dependencies]
-atomic-matrix = "0.1"
+atomic-matrix = { git = "https://github.com/CodenamePhantom/AtomicMatrix" }
 ```
 
 ```rust
 use atomic_matrix::prelude::*;
 
 // Bootstrap a 50MB matrix in /dev/shm
+
 let handler = AtomicMatrix::bootstrap(
     uid_lite::generate_uuid(), // internal uid generator because i hate have to import UUID to every other project.
-    memory_scale::custom::mb::<7>(), // memory layout creator because i love semantic sugar.
+    memory_scale::custom::mb::<50>(), // memory layout creator because i love semantic sugar.
 ).unwrap();
 
-// Allocate a 128-byte block
-let mut block = handler.allocate::<[u8; 128]>().unwrap();
+// Allocate a u64 block
 
-// Write the message
-let msg = b"Hello World!";
-let mut payload = [0u8; 128];
-payload[..msg.len()].copy_from_slice(msg);
+let mut block = handler.allocate::<u64>().unwrap();
 
-unsafe { handler.write(&mut block, payload) }
+// Write the message. This will dump the bytes regardless of the block state.
+
+unsafe { handler.write(&mut block, 2000).unwrap() };
+
+// You can also safe write using atomic states (States from 0 to 49 are reserved and will fail if tried)
+
+handler.write_if(&mut block, 2000, MyCustomState).unwrap();
+// or
+handler.write_transition(&mut block, 2000, TargetState, MyCustomState, Ordering::Whatever).unwrap();
 
 // Read it back
-let data = unsafe { handler.read(&block) }
-println!("{}", std::str::from_utf8(&data[..12]).unwrap());
+
+let data = handler.read_copy(&block).unwrap();
+println!("{data}");
+
+// You can also read type guarded references directly
+
+let rt_ref = handler.read(&block).unwrap() // reference to T
+let rt_mut_ref = handler.read_mut(&block).unwrap() // mutable reference to T
+
+// references can be deref
+
+match unwind!({ *rt_mut_ref = heavy_math_equation(*rt_mut_ref) }) { // unwind! casts panics into a HandlerErrors
+    Ok(_) => {
+        println!("{}", *rt_ref);
+    },
+    Err(_) => {
+        println!("Block deallocated");
+    }
+}
 
 // Free it
+
 handler.free(block);
+
+// Kill the arena
+
+unsafe { handler.die().unwrap() }
 ```
 
 Multiple processes can map the same segment by passing the same UUID to `bootstrap`. The init guard ensures only one process performs the initial formatting regardless of how many processes call `bootstrap` simultaneously.
 
----
-
-## Roadmap
-
-### v0.6 (under development) — Internals and Extensive Library for the matrix.
-A set of pre-baked data structures and frameworks that can be used with the matrix to execute high-level actions (Iteration, IPC Semantics, etc).
-
-> The following have already been implemented or is activelly under development:
-
-- AtomicRingbuffer.
-- MemoryScaler.
-- UIDLite.
-- AtomicExtensions.
-- Fencer.
-- Looper
-
-For more information on how these works, check the documentation section (currently under development).
-
----
-
 ## Safety
 
-AtomicMatrix is `unsafe` at the boundary layer — pointer arithmetic over a raw SHM segment is inherently unsafe. The public API contains that unsafety behind `RelativePtr<T>` abstractions that enforce offset validity within segment bounds.
+AtomicMatrix is `unsafe` at the boundary layer. The MatrixHandler API contains that unsafety behind `Block<T>` abstractions that enforce offset validity within segment bounds with checked queries, caller state validations and data transitions. Although, unsafe layers are also provided for strict caller synchronization when needed.
 
-All state transitions use atomic operations with explicit memory ordering. No mutexes. No `UnsafeCell` wrappers. All shared state is `AtomicU32`.
+We also provide a direct escape hatch into the raw matrix struct for direct arena manipulation (use with caution).
 
-The allocator has been tested under:
-- 8.8 billion operations over 600 seconds across 8 threads
-- Concurrent allocation and deallocation with randomized sizes
-- Randomized free ordering to stress the coalescing engine
-- Race condition detection via unique offset tracking across threads
+## Disclaimer
 
----
+This project is not in a state that i would consider safe for production usage. It is a very new crate and concept that would require many tests and iterations to be considered battle-hardened. I wont stop you from doing it (although i'll judge you... a lot), but i'll refrain from any issues acquired from using it.
 
-## Contributing
-
-The standard library is the immediate area where contributions are welcome, as well as FFI bindings for other languages. If you want to build on top of the core allocator or have ideas for the API/Library design, open an issue.
-
----
+Also, pardon my french in some of the code comments. I have a personality and i'm not afraid of using it lol.
 
 ## License
 

@@ -32,6 +32,7 @@ use crate::prelude::*;
 /// inside the matrix life-cycle.
 pub struct Looper {
     handler_ref: SharedHandler,
+    prev_offsets: Vec<u32>,
     current_offset: u32,
     end_offset: u32,
 }
@@ -59,11 +60,25 @@ impl<'a> Iterator for Looper {
     /// # Returns
     /// Either the [`LoopWindow`] of the current record, or None.
     fn next(&mut self) -> Option<Self::Item> {
+        let matrix = self.handler_ref.matrix();
+        let prev_offset = self.prev_offsets.get(self.prev_offsets.len() - 1).unwrap();
+        
         if self.current_offset >= self.end_offset {
             return None;
         }
 
-        let rel_ptr = self.handler_ref.matrix().query(self.current_offset);
+        let rel_ptr = match matrix.checked_query(self.handler_ref.base_ptr(), self.current_offset) {
+            Ok(v) => v,
+            Err(crate::internals::error_collection::MatrixErrors::InvalidBlock) => {
+                // TODO: we gotta rollback and check where is the next block.
+                // we'll do this by iterating backwards through all previous blocks until we find one that has the info.
+                // Scratch that. We try to move forward by header size until one matches maybe? Have to test both
+                let prev_ptr = matrix.checked_query(self.handler_ref.base_ptr(), *prev_offset).unwrap();
+                let prev_h = unsafe { prev_ptr.resolve_header(self.handler_ref.base_ptr()) };
+                return None
+            },
+            Err(_) => panic!("Something went very wrong here.")
+        };
         let header = unsafe { rel_ptr.resolve_header(self.handler_ref.base_ptr()) };
 
         let size = header.size.load(Ordering::Acquire);
@@ -71,6 +86,7 @@ impl<'a> Iterator for Looper {
             return None;
         }
 
+        self.prev_offsets.push(self.current_offset);
         self.current_offset = self
             .current_offset
             .checked_add(size)
@@ -86,12 +102,13 @@ impl Looper {
     /// # Returns:
     /// An instance of Self.
     pub fn new(handler_ref: SharedHandler) -> Self {
-        let len = (16 + (std::mem::size_of::<AtomicMatrix>() as u32) + 15) & !15;
+        let len = (16 + std::mem::size_of::<AtomicMatrix>() + 15) & !15;
         let end = handler_ref.matrix().sector_boundaries.load(Ordering::Acquire);
 
         Self {
             handler_ref,
-            current_offset: len,
+            prev_offsets: Vec::new(),
+            current_offset: len as u32,
             end_offset: end,
         }
     }
@@ -119,9 +136,9 @@ impl<'a> LoopWindow {
     }
 
     /// Returns a reference to the current record data typed as T.
-    pub fn view_data_as<T>(&self) -> &'a T {
-        let block = Block::<T>::from_offset(self.rel_ptr.offset());
-        let res = unsafe { self.handler.read(&block) };
+    pub fn view_data_as<T>(&self) -> type_guard::TypeGuard<T> {
+        let block = Block::<T>::from_offset(self.rel_ptr.offset(), self.handler.base_ptr() as usize);
+        let res = unsafe { self.handler.read(&block).unwrap() };
 
         res
     }

@@ -1,0 +1,204 @@
+{
+  "main": {
+    "id": "4d637e9a449f1378",
+    "type": "split",
+    "children": [
+      {
+        "id": "3ddf5e54787ae739",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "91135edc0e567af6",
+            "type": "leaf",
+            "state": {
+              "type": "markdown",
+              "state": {
+                "file": "Atomic Matrix.md",
+                "mode": "source",
+                "source": false
+              },
+              "icon": "lucide-file",
+              "title": "Atomic Matrix"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "vertical"
+  },
+  "left": {
+    "id": "09a0e82b97d2fb3d",
+    "type": "split",
+    "children": [
+      {
+        "id": "9b927c671123499c",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "8cab5d8ae4d30d6a",
+            "type": "leaf",
+            "state": {
+              "type": "file-explorer",
+              "state": {
+                "sortOrder": "alphabetical",
+                "autoReveal": false
+              },
+              "icon": "lucide-folder-closed",
+              "title": "Files"
+            }
+          },
+          {
+            "id": "e8167f92a5d11a9a",
+            "type": "leaf",
+            "state": {
+              "type": "search",
+              "state": {
+                "query": "",
+                "matchingCase": false,
+                "explainSearch": false,
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical"
+              },
+              "icon": "lucide-search",
+              "title": "Search"
+            }
+          },
+          {
+            "id": "308dde3aee8e8b74",
+            "type": "leaf",
+            "state": {
+              "type": "bookmarks",
+              "state": {},
+              "icon": "lucide-bookmark",
+              "title": "Bookmarks"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300
+  },
+  "right": {
+    "id": "402496175e356011",
+    "type": "split",
+    "children": [
+      {
+        "id": "72774d54ce535c25",
+        "type": "tabs",
+        "children": [
+          {
+            "id": "f528ff0da572329f",
+            "type": "leaf",
+            "state": {
+              "type": "backlink",
+              "state": {
+                "file": "Atomic Matrix.md",
+                "collapseAll": false,
+                "extraContext": false,
+                "sortOrder": "alphabetical",
+                "showSearch": false,
+                "searchQuery": "",
+                "backlinkCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-coming-in",
+              "title": "Backlinks for Atomic Matrix"
+            }
+          },
+          {
+            "id": "359cd9a4cd15e259",
+            "type": "leaf",
+            "state": {
+              "type": "outgoing-link",
+              "state": {
+                "file": "Atomic Matrix.md",
+                "linksCollapsed": false,
+                "unlinkedCollapsed": true
+              },
+              "icon": "links-going-out",
+              "title": "Outgoing links from Atomic Matrix"
+            }
+          },
+          {
+            "id": "53767f709fa975b3",
+            "type": "leaf",
+            "state": {
+              "type": "tag",
+              "state": {
+                "sortOrder": "frequency",
+                "useHierarchy": true,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-tags",
+              "title": "Tags"
+            }
+          },
+          {
+            "id": "7e268714146ef32f",
+            "type": "leaf",
+            "state": {
+              "type": "all-properties",
+              "state": {
+                "sortOrder": "frequency",
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-archive",
+              "title": "All properties"
+            }
+          },
+          {
+            "id": "9a9e01c96238100c",
+            "type": "leaf",
+            "state": {
+              "type": "outline",
+              "state": {
+                "file": "Atomic Matrix.md",
+                "followCursor": false,
+                "showSearch": false,
+                "searchQuery": ""
+              },
+              "icon": "lucide-list",
+              "title": "Outline of Atomic Matrix"
+            }
+          }
+        ]
+      }
+    ],
+    "direction": "horizontal",
+    "width": 300,
+    "collapsed": true
+  },
+  "left-ribbon": {
+    "hiddenItems": {
+      "switcher:Open quick switcher": false,
+      "graph:Open graph view": false,
+      "canvas:Create new canvas": false,
+      "daily-notes:Open today's daily note": false,
+      "templates:Insert template": false,
+      "command-palette:Open command palette": false,
+      "bases:Create new base": false
+    }
+  },
+  "active": "91135edc0e567af6",
+  "lastOpenFiles": [
+    "Core/Matrix.md",
+    "Atomic Matrix.md",
+    "Core/Handlers.md",
+    "Core/Cartographer.md",
+    "Internals/AtomicRingbuffer.md",
+    "Internals/AtomicArray.md",
+    "Internals",
+    "Extensive Lib/Guardian.md",
+    "Extensive Lib/Fencer.md",
+    "Extensive Lib/Looper.md",
+    "Extensive Lib",
+    "Core/AtomicMatrix.md",
+    "core.md",
+    "Core",
+    "create a link.md"
+  ]
+}

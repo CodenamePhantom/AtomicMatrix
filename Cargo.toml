@@ -1,6 +1,6 @@
 [package]
 name = "atomic-matrix"
-version = "0.3.2"
+version = "0.4.1"
 edition = "2024"
 authors = ['Dottsss']
 description = "A lock-free, high end allocator primitive for high-performance IPC."
@@ -14,4 +14,6 @@ readme = "README.md"
 default = []
 
 [dependencies]
+better_result = "0.3"
 memmap2 = "0.9.10"
+libc = "0.2.186"
