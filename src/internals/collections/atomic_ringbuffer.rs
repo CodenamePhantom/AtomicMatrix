@@ -270,8 +270,8 @@ impl<'a> AtomicRingBuffer {
     /// # Returns
     /// Either a life time specified reference to the block data, or
     /// None if the block is empty
-    pub fn dequeue<T>(&self) -> Option<&'a T> {
-        let data: Option<&T>;
+    pub fn dequeue<T>(&self) -> Option<type_guard::TypeGuard<T>> {
+        let data: Option<type_guard::TypeGuard<T>>;
 
         let current_tail = self.tail.load(Ordering::Relaxed);
         let next_tail = self.advance(current_tail);
@@ -306,7 +306,7 @@ impl<'a> AtomicRingBuffer {
     /// # Returns
     /// Either a reference to the block data, or None if the block is
     /// empty
-    pub fn peek<T>(&self) -> Option<&T> {
+    pub fn peek<T>(&self) -> Option<type_guard::TypeGuard<T>> {
         let current_tail = self.tail.load(Ordering::Acquire);
 
         if current_tail == self.commited_head.load(Ordering::Acquire) {

@@ -66,7 +66,9 @@
 //! directly (LSM protection, server hardening, infrastructure security, etc).
 
 use crate::internals::error_collection::HandlerErrors;
+use crate::helpers::type_guard::*;
 use crate::prelude::*;
+use crate::unwind;
 use memmap2::MmapMut;
 use std::sync::atomic::Ordering;
 
@@ -538,25 +540,28 @@ pub trait HandlerFunctions {
         Ok(())
     }
 
-    /// Reads a shared reference to `T` from an allocated block.
+    /// Reads a Type Guarded shared reference to `T` from an allocated block.
     ///
     /// The value of T stays live inside the matrix as long as the segment exists.
     ///
     /// ### Safety:
-    /// The validity of this lifetime cannot be enforced at runtime, as the block can be freed by
-    /// another participant, and reading the freed data would cause an undefined behaviour. Therefore,
-    /// reference checking should be validated by the caller before attempting any operations uppon
-    /// it. 
+    /// Deferencing this value checks if it still exists inside the matrix before returning the
+    /// value. If the value has been deallocated, the call will panic. It also does not ensure
+    /// exclusive access to the value.
+    ///
+    /// TypeGuard provides a safer method called `try_get()` that returns None if the value has been
+    /// deallocated instead of panicking.
+    ///
+    /// ### Unwinding
+    /// The macro [`unwind!`] shipped with the crate helps convert the panic into a treatable
+    /// MatrixErrors, so raw deferencing doesn't crash everything into the ground.
     ///
     /// ### Params:
     /// @block: The block to get a reference from.
     ///
     /// ### Returns:
-    /// A result containing either a reference to T, or a HandlerErrors.
-    unsafe fn read<'a, T>(&self, block: &Block<T>) -> Result<&'a T, HandlerErrors> {
-        if !type_tag::compare::<T>(&block, self.base_ptr()) {
-            return Err(HandlerErrors::TypeMismatchError);
-        }
+    /// A result containing either a TypeGuard<T>, or a HandlerErrors.
+    fn read<'a, T>(&self, block: &Block<T>) -> Result<TypeGuard<T>, HandlerErrors> {
         match self
             .matrix()
             .checked_query(self.base_ptr(), block.header())
@@ -569,7 +574,11 @@ pub trait HandlerFunctions {
             }
         };
 
-        let data = unsafe { block.pointer.resolve(self.base_ptr()) };
+        if !type_tag::compare::<T>(&block, self.base_ptr()) {
+            return Err(HandlerErrors::TypeMismatchError);
+        }
+
+        let data = TypeGuard::<T>::new(block.pointer().offset(), block.header(), block.base_ref as *const u8);
 
         return Ok(data);
     }
@@ -577,21 +586,23 @@ pub trait HandlerFunctions {
     /// Reads a mutable reference to `T` from an allocated block.
     ///
     /// ### Safety:
-    /// The validity of this lifetime cannot be enforced at runtime, as the block can be freed by
-    /// another participant, and reading the freed data would cause an undefined behaviour. Therefore,
-    /// reference checking should be validated by the caller before attempting any operations uppon
-    /// it. Also, having a mutable reference to a shared value in runtime may cause undefined behaviour
-    /// on other participants, so careful synchronization is required.
+    /// Deferencing this value checks if it still exists inside the matrix before returning the
+    /// value. If the value has been deallocated, the call will panic. It also does not ensure
+    /// exclusive access to the value.
+    ///
+    /// TypeGuard provides a safer method called `try_get()` that returns None if the value has been
+    /// deallocated instead of panicking
+    ///
+    /// ### Unwinding
+    /// The macro [`unwind!`] shipped with the crate helps convert the panic into a treatable
+    /// MatrixErrors, so raw deferencing doesn't crash everything into the ground.
     ///
     /// ### Params:
     /// @block: The block to get a reference from.
     ///
     /// ### Returns:
     /// A result containing either a mutable reference to T, or a HandlerErrors.
-    unsafe fn read_mut<'a, T>(&self, block: &Block<T>) -> Result<&'a mut T, HandlerErrors> {
-        if !type_tag::compare::<T>(&block, self.base_ptr()) {
-            return Err(HandlerErrors::TypeMismatchError);
-        }
+    fn read_mut<'a, T>(&self, block: &Block<T>) -> Result<TypeGuardMut<T>, HandlerErrors> {
         match self
             .matrix()
             .checked_query(self.base_ptr(), block.header())
@@ -604,7 +615,11 @@ pub trait HandlerFunctions {
             }
         };
 
-        let mut_data = unsafe { block.pointer.resolve_mut(self.base_ptr()) };
+        if !type_tag::compare::<T>(&block, self.base_ptr()) {
+            return Err(HandlerErrors::TypeMismatchError);
+        }
+
+        let mut_data = TypeGuardMut::<T>::new(block.pointer().offset(), block.header(), block.base_ref as *const u8);
 
         return Ok(mut_data);
     }
@@ -621,9 +636,6 @@ pub trait HandlerFunctions {
     /// ### Returns:
     /// A result containing either a copy of T, or a HandlerErrors.
     fn read_copy<T>(&self, block: &Block<T>) -> Result<T, HandlerErrors> {
-        if !type_tag::compare::<T>(&block, self.base_ptr()) {
-            return Err(HandlerErrors::TypeMismatchError);
-        }
         match self
             .matrix()
             .checked_query(self.base_ptr(), block.header())
@@ -635,6 +647,10 @@ pub trait HandlerFunctions {
                 });
             }
         };
+
+        if !type_tag::compare::<T>(&block, self.base_ptr()) {
+            return Err(HandlerErrors::TypeMismatchError);
+        }
 
         let data_cp = unsafe { std::ptr::read(block.pointer.resolve(self.base_ptr())) };
 
@@ -1098,9 +1114,9 @@ mod tests {
         let mut block = handler.allocate::<u32>().unwrap();
 
         unsafe { handler.write(&mut block, 50).unwrap() };
-        let real_time_ref = unsafe { handler.read(&block).unwrap() };
 
-        let mutable_ref = unsafe { handler.read_mut(&block).unwrap() };
+        let real_time_ref = handler.read(&block).unwrap();
+        let mut mutable_ref = handler.read_mut(&block).unwrap();
 
         assert_eq!(*real_time_ref, 50);
 
@@ -1109,5 +1125,28 @@ mod tests {
         assert_eq!(*real_time_ref, 100);
 
         unsafe { handler.die().unwrap() };
+    }
+
+    #[test]
+    fn test_type_guard_panic() {
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+        let block = handler.allocate::<u32>().unwrap();
+
+        let real_time_ref = handler.read(&block).unwrap();
+        let mut mutable_ref = handler.read_mut(&block).unwrap();
+
+        let success = unwind!({ *mutable_ref += 2000 });
+
+        assert!(success.is_ok());
+        assert!(*real_time_ref == 2000);
+
+        handler.free(block).unwrap();
+
+        let fail = unwind!({ *mutable_ref += 2000 });
+
+        assert!(fail.is_err());
+        assert!(matches!(fail, Err(HandlerErrors::PanicRecovery)));
+
+        unsafe { handler.die().unwrap() }
     }
 }

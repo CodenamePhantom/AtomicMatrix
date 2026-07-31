@@ -38,6 +38,7 @@ better_error! {
     #[derive(Debug)]
     pub enum HandlerErrors {
         TypeMismatchError => "The provided type doesn't match the block type tag.",
+        PanicRecovery => "Invalid deref yielded a panic.",
         AllocationFailed { reason: String } => "Failed to allocate: {reason}",
         ReservedState { state: u32 } => "State {state} is reserved for matrix ops.",
         InvalidOffset { offset: u32 } => "Offset {offset} not found.",

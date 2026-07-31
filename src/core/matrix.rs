@@ -102,7 +102,7 @@ use crate::prelude::*;
 #[derive(Debug)]
 #[repr(C, align(16))]
 pub struct BlockHeader {
-    signature: u32,
+    pub(crate) signature: u32,
     pub size: AtomicU32,
     pub state: AtomicU32,
     pub prev_phys: AtomicU32,

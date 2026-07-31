@@ -27,4 +27,5 @@ pub mod prelude {
     pub use crate::internals::collections::*;
     pub use crate::helpers::atomic_ext::AtomicExtensions;
     pub use crate::helpers::type_tag;
+    pub use crate::helpers::type_guard;
 }

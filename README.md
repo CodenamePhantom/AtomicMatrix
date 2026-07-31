@@ -140,10 +140,21 @@ handler.write_transition(&mut block, 2000, TargetState, MyCustomState, Ordering:
 let data = handler.read_copy(&block).unwrap();
 println!("{data}");
 
-// You can also read unsafe references directly
+// You can also read type guarded references directly
 
-let rt_ref = unsafe { handler.read(&block).unwrap() } // reference to T
-let rt_mut_ref = unsafe { handler.read_mut(&block).unwrap() } // mutable reference to T
+let rt_ref = handler.read(&block).unwrap() // reference to T
+let rt_mut_ref = handler.read_mut(&block).unwrap() // mutable reference to T
+
+// references can be deref
+
+match unwind!({ *rt_mut_ref = heavy_math_equation(*rt_mut_ref) }) { // unwind! casts panics into a HandlerErrors
+    Ok(_) => {
+        println!("{}", *rt_ref);
+    },
+    Err(_) => {
+        println!("Block deallocated");
+    }
+}
 
 // Free it
 

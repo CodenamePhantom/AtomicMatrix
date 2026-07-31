@@ -136,7 +136,7 @@ impl<'a> LoopWindow {
     }
 
     /// Returns a reference to the current record data typed as T.
-    pub fn view_data_as<T>(&self) -> &'a T {
+    pub fn view_data_as<T>(&self) -> type_guard::TypeGuard<T> {
         let block = Block::<T>::from_offset(self.rel_ptr.offset(), self.handler.base_ptr() as usize);
         let res = unsafe { self.handler.read(&block).unwrap() };
 

@@ -133,9 +133,9 @@ pub struct Fencer {
 /// unauthorized operations.
 pub struct RouteGuard<'a> {
     private_id: &'a str,
-    acl: &'static ACL,
+    acl: type_guard::TypeGuard<ACL>,
     acl_offset: u32,
-    inbox: &'a AtomicRingBuffer,
+    inbox: type_guard::TypeGuard<AtomicRingBuffer>,
     sector_handler: MatrixHandler,
 }
 
@@ -276,15 +276,15 @@ impl Fencer {
             }
         };
 
-        let guard = RouteGuard {
-            private_id: priv_id,
-            acl: unsafe { dataplane.read::<ACL>(&block).unwrap() },
-            acl_offset: block.pointer().offset(),
-            sector_handler: handler,
-            inbox: rb,
-        };
+        //let guard = RouteGuard {
+        //    private_id: priv_id,
+        //    acl: unsafe { dataplane.read::<ACL>(&block).unwrap() },
+        //    acl_offset: block.pointer().offset(),
+        //    sector_handler: handler,
+        //    inbox: rb,
+        //};
 
-        Ok(guard)
+        unimplemented!()
     }
 
     /// Create and write a new ACL at the tail of the Dataplane.
@@ -469,7 +469,7 @@ impl<'a> RouteGuard<'a> {
     /// # Returns
     ///
     /// A result containing either Option<msg>, or a [`FencerErrors`]
-    pub fn load_msg<T>(&self) -> Result<Option<&T>, FencerErrors> {
+    pub fn load_msg<T>(&self) -> Result<Option<type_guard::TypeGuard<T>>, FencerErrors> {
         if !self.check_permissions(PERM_READ) {
             return Err(FencerErrors::UnauthorizedRead);
         };
