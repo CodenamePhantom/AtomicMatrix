@@ -5,7 +5,7 @@
 //! the matrix, as well as some safe pre-baked functions that add more extensibility over what can 
 //! be done generally.
 //!
-//! # Abstraction Layers
+//! ## Abstraction Layers
 //!
 //! ```text
 //! [ extensive_lib -> Matrix Internal Frameworks]  * fencer, guardian, looper ...
@@ -19,7 +19,7 @@
 //! [ /dev/shm ]                                    * physical shared memory
 //! ```
 //!
-//! # Handler Scope
+//! ## Handler Scope
 //!
 //! The handler owns the SHM mapping and provides:
 //! - Typed block allocation (`allocate<T>`) and deallocation (`free<T>`)
@@ -49,13 +49,13 @@
 //! **Note:** States 4–48 are reserved for future internal state management implementations that have 
 //! not been planned yet. Better safe than sorry.
 //!
-//! # Thread Sharing
+//! ## Thread Sharing
 //!
 //! [`MatrixHandler`] owns the mmap and is not `Clone`. Use `share()` to produce a [`SharedHandler`] 
 //! that can be sent to other threads. The original handler must outlive all shared handles derived 
 //! from it.
 //!
-//! # Safety
+//! ## Safety
 //!
 //! All the operations assumes that each participant follows the safety contract proposed by the
 //! high-level API. Adversarial behaviours that directly forge blocks, poison already existing
@@ -78,6 +78,7 @@ use std::sync::atomic::Ordering;
 /// for future internal lifecycle states without breaking user code.
 pub const USER_STATE_MIN: u32 = 49;
 pub const TAG_SIZE: u32 = std::mem::size_of::<u32>() as u32;
+pub const STATE_LOCK: u32 = 4;
 
 /// A typed handle to an allocated block in the matrix.
 ///
@@ -393,7 +394,7 @@ pub trait HandlerFunctions {
 
         if state
             .load_if_any(
-                &[STATE_ACKED, STATE_COALESCING, STATE_FREE],
+                &[STATE_ACKED, STATE_COALESCING, STATE_FREE, STATE_LOCK],
                 Ordering::Relaxed,
             )
             .is_ok()
@@ -440,6 +441,9 @@ pub trait HandlerFunctions {
         value: T,
         target: u32,
     ) -> Result<(), HandlerErrors> {
+        if target < USER_STATE_MIN || target == STATE_LOCK {
+            return Err(HandlerErrors::ReservedState { state: target })
+        }
         self.matrix().checked_query(self.base_ptr(), block.header())
             .map_err(|_| HandlerErrors::InvalidOffset { offset: block.pointer().offset() })?;
 
@@ -499,6 +503,9 @@ pub trait HandlerFunctions {
         next: u32,
         success_order: Ordering,
     ) -> Result<(), HandlerErrors> {
+        if next < USER_STATE_MIN || next == STATE_LOCK {
+            return Err(HandlerErrors::ReservedState { state: next })
+        }
         self.matrix().checked_query(self.base_ptr(), block.header())
             .map_err(|_| HandlerErrors::InvalidOffset { offset: block.pointer().offset() })?;
 
@@ -539,6 +546,8 @@ pub trait HandlerFunctions {
 
         Ok(())
     }
+
+
 
     /// Reads a Type Guarded shared reference to `T` from an allocated block.
     ///
@@ -657,6 +666,102 @@ pub trait HandlerFunctions {
         Ok(data_cp)
     }
 
+    /// Locks the block while inside a provided expression scope, giving a reference to the 
+    /// underlying value.
+    ///
+    /// This function ensures an exclusive read operation on the block data inside the MatrixHandler
+    /// contract, as it transitions the block to STATE_LOCK, and every participant that adheres to
+    /// the handler API respect the block present state.
+    ///
+    /// ### Warning
+    ///
+    /// If a participant crashes holding this block inline ref, the segment will stale inside
+    /// STATE_LOCK unless some action is taken. Callers are required to manage their own block
+    /// recovery logic, as blocks can still have their state transitioned even when set to LOCK
+    ///
+    /// ### Params:
+    /// @block: The block to execute the expression on. \
+    /// @expr: The inline closure to execute.
+    ///
+    /// ### Returns:
+    /// An Option stating the success of the execution.
+    fn inline<T, F>(&self, block: &Block<T>, expr: F) -> Option<()> 
+    where
+        F: FnOnce(TypeGuard<T>)
+    {
+        self.matrix().checked_query(self.base_ptr(), block.header()).unwrap();
+
+        loop {
+            let curr_state = self.get_state(block, Ordering::AcqRel).ok()?;
+
+            if curr_state != STATE_LOCK {
+                match self.transition_state(block, curr_state, STATE_LOCK, Ordering::Release) {
+                    Ok(_) => {},
+                    Err(_) => continue,
+                };
+
+                let exec_res = match self.read(block) {
+                    Ok(rt_ref) => unwind!(expr(rt_ref)),
+                    Err(e) => Err(e),
+                };
+                self.set_state(block, curr_state).ok()?;
+                exec_res.ok()?;
+
+                break;
+            }
+        }
+
+        return Some(())
+    }
+
+    /// Locks the block while inside a provided expression scope, giving a mutable reference to the
+    /// underlying value.
+    ///
+    /// This function ensures an exclusive read/write operation on the block data inside the 
+    /// MatrixHandler contract, as it transitions the block to STATE_LOCK, and every participant that 
+    /// adheres to the handler API respect the block present state.
+    ///
+    /// ### Warning
+    ///
+    /// If a participant crashes holding this block inline ref, the segment will stale inside
+    /// STATE_LOCK unless some action is taken. Callers are required to manage their own block
+    /// recovery logic, as blocks can still have their state transitioned even when set to LOCK
+    ///
+    /// ### Params:
+    /// @block: The block to execute the expression on. \
+    /// @expr: The inline closure to execute.
+    ///
+    /// ### Returns:
+    /// An Option stating the success of the execution.
+    fn inline_mut<T, F: FnOnce()>(&self, block: &Block<T>, expr: F) -> Option<()> 
+    where
+        F: FnOnce(TypeGuardMut<T>)
+    {
+        self.matrix().checked_query(self.base_ptr(), block.header()).ok()?;
+
+        loop {
+            let curr_state = self.get_state(block, Ordering::AcqRel).ok()?;
+
+            if curr_state != STATE_LOCK {
+                match self.transition_state(block, curr_state, STATE_LOCK, Ordering::Release) {
+                    Ok(_) => {},
+                    Err(_) => continue,
+                };
+
+                let exec_res = match self.read_mut(block) {
+                    Ok(rt_ref_mut) => unwind!(expr(rt_ref_mut)),
+                    Err(e) => Err(e),
+                };
+                self.set_state(block, curr_state).ok()?;
+                exec_res.ok()?;
+
+                break;
+            }
+        }
+
+        return Some(())
+    }
+
     /// Tries to query a block through a checked query.
     ///
     /// If the query fails, an error is return signaling why the query failed.
@@ -734,7 +839,7 @@ pub trait HandlerFunctions {
 
         let header = unsafe { block.tagless_ptr().resolve_header(self.base_ptr()) };
         if header.state
-            .load_if_any(&[STATE_ACKED, STATE_COALESCING, STATE_FREE], Ordering::Acquire)
+            .load_if_any(&[STATE_ACKED, STATE_COALESCING, STATE_FREE, STATE_LOCK], Ordering::Acquire)
             .is_ok()
         {
             return Err(HandlerErrors::InvalidOffset { offset: block.pointer.offset() })
@@ -814,7 +919,7 @@ pub trait HandlerFunctions {
     /// Atomically transitions a block from one state to another.
     ///
     /// Succeeds only if the block is currently in `expected`, and `next` must be >= [`USER_STATE_MIN`],
-    /// transitioning into an internal state is not permitted. Failed transition attempts are always
+    /// as transitioning into an internal state is not permitted. Failed transition attempts are always
     /// executed as Ordering::Relaxed.
     ///
     /// ### Params:

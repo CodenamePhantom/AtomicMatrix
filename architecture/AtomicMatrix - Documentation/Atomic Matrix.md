@@ -110,3 +110,5 @@ handler.free(block);
 
 unsafe { handler.die().unwrap() }
 ```
+
+## 4 - Design Theory

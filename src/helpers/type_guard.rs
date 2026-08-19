@@ -12,7 +12,7 @@ pub struct TypeGuard<T> {
     val_offset: u32,
     offset: u32,
     base_ptr: *const u8,
-    _marker: std::marker::PhantomData<T>
+    _marker: std::marker::PhantomData<*const T>
 }
 
 /// Runtime safe type wrapper for deref a matrix mutable value reference.
@@ -25,7 +25,7 @@ pub struct TypeGuardMut<T> {
     val_offset: u32,
     offset: u32,
     base_ptr: *const u8,
-    _marker: std::marker::PhantomData<T>
+    _marker: std::marker::PhantomData<*const T>
 }
 
 impl<T> TypeGuard<T> {
@@ -35,7 +35,7 @@ impl<T> TypeGuard<T> {
     /// An optional reference to the BlockHeader, if it passes all the checks.
     fn get_header(&self) -> Option<&BlockHeader> {
         let header_ptr = unsafe { self.base_ptr.add(self.offset as usize) as *const BlockHeader };
-        let header = unsafe { &*header_ptr };
+        let header = unsafe { header_ptr.as_ref()? };
 
         if header.signature != HEADER_SIGNATURE { return None };
         if header.state.load_if_any(&[STATE_ACKED, STATE_FREE, STATE_COALESCING], Ordering::Acquire).is_ok() {
@@ -85,7 +85,7 @@ impl<T> std::ops::Deref for TypeGuard<T> {
 
     fn deref(&self) -> &T {
         self.try_get()
-            .expect("TypeGuard: access to invadated, freed, or corrupted block")
+            .expect("TypeGuard: access to invalidated, freed, or corrupted block")
     }
 }
 
@@ -96,7 +96,7 @@ impl<T> TypeGuardMut<T> {
     /// An optional reference to the BlockHeader, if it passes all the checks.
     fn get_header(&self) -> Option<&BlockHeader> {
         let header_ptr = unsafe { self.base_ptr.add(self.offset as usize) as *const BlockHeader };
-        let header = unsafe { &*header_ptr };
+        let header = unsafe { header_ptr.as_ref()? };
 
         if header.signature != HEADER_SIGNATURE { return None };
         if header.state.load_if_any(&[STATE_ACKED, STATE_FREE, STATE_COALESCING], Ordering::Acquire).is_ok() {
@@ -144,7 +144,7 @@ impl<T> TypeGuardMut<T> {
     /// ### Returns:
     /// An optional mutable reference to the data, if the block header is valid.
     pub fn try_get_mut(&mut self) -> Option<&mut T> {
-        self.try_get()?;
+        self.get_header()?;
 
         unsafe {
             let val_ptr = self.base_ptr.add(self.val_offset as usize) as *mut T;
@@ -160,7 +160,7 @@ impl<T> std::ops::Deref for TypeGuardMut<T> {
 
     fn deref(&self) -> &T {
         self.try_get()
-            .expect("TypeGuard: access to invadated, freed, or corrupted block")
+            .expect("TypeGuard: access to invalidated, freed, or corrupted block")
     }
 }
 
@@ -169,7 +169,7 @@ impl<T> std::ops::Deref for TypeGuardMut<T> {
 impl<T> std::ops::DerefMut for TypeGuardMut<T> {
     fn deref_mut(&mut self) -> &mut T {
         self.try_get_mut()
-                .expect("TypeGuard: access to invadated, freed, or corrupted block")
+                .expect("TypeGuard: access to invalidated, freed, or corrupted block")
     }
 }
 

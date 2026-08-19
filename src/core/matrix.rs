@@ -517,7 +517,7 @@ impl AtomicMatrix {
 
         if header
             .state
-            .load_if_not_any(&[STATE_COALESCING, STATE_ACKED], Ordering::Acquire)
+            .load_if_not_any(&[STATE_COALESCING, STATE_ACKED, STATE_FREE], Ordering::Acquire)
             .is_err()
             || header.signature != helpers::HEADER_SIGNATURE
         {

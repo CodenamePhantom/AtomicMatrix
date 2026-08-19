@@ -1,14 +1,14 @@
 # AtomicMatrix
 
-### *To lock or not to lock. That is the question* - Shakespear... probably
+### *To lock or not to lock. That is the question* - Shakespeare... probably
 
 AtomicMatrix is a lock-free shared memory arena based on Linux SHM scope. It enables separate processes to acess and manage the same memory state concurrently, while avoiding kernel involvement.
 
-# What it is
+## What it is
 
 AtomicMatrix works as a general purpose memory allocator that can be mapped independently by multiple threads on the same scope, or separate processes. The arena is backed by a linux file stored at `/dev/shm` dynamically generated at bootstrap, although callers can name it whatever their use case requires. At this point, all allocation and deallocation procedures between processes are handled safely through atomic operators, data manipulation on allocated cells can also take advantage of this atomic safety by using the header state machine to synchronize access through the `MatrixHandler` object.
 
-# What makes it different
+## What makes it different
 
 The matrix provides all the synchronization necessary for safely allocating and deallocating without getting in the way of other processes, while giving enough access to the caller to make it adaptable to a wide variety of use cases without imposing its own opinion on how your program should work. The phylosophy is that the internal operations should be fast, safe, and unopinionated enough that manage states between processes is not a problem the caller has to deal with. With this ideas in mind, we provide the following features:
 
@@ -17,9 +17,9 @@ The matrix provides all the synchronization necessary for safely allocating and 
 - The arena is completelly type agnostic. Whatever you throw in will be converted to bytes and written within the segment.
 - MatrixHandler abstracts a lot of the manual work required to both write data, and validate written types and block validity without getting in the way
 
-# How it works
+## How it works
 
-## Memory layout
+### Memory layout
 
 ```text
 [ Init Guard (16b) ] [ AtomicMatrix Struct (bitmaps, metadata, etc) ] [ padding ] [ Memory Arena ]
@@ -31,11 +31,11 @@ The AtomicMatrix struct is written right after the init guard and works as the m
 
 All subsequent segments are the free memory arena that participants will use to allocate data.
 
-## O(1) Allocation
+### O(1) Allocation
 
 The allocation algorithm uses a two-level segregated fit (TLSF) inspired atomic bitmap. The first level indexes power-of-two size classes, and the second level subdivides each class into 8 linear buckets until the next size class. If more than one block of the same size bucket is freed simultaneously, it adds the head of the bucket to the freed chain in the block header and pushes the current block as the new head of the bucket. This ensures that allocations are O(1) time complexity and fully thread safe with CAS (Compare and Swap) operations.
 
-## Memory Healing
+### Memory Healing
 
 AtomicMatrix uses a custom coalescing engine we call **Kinetic Coalescing**. Each `ack` call triggers a *ripple* that travels leftwards towards the sector beginning, merging with all physically adjacent neighbours that are marked in a free state. Kinetic Coalescing follow 4 properties to make it safe under concurrent access:
 
@@ -44,11 +44,11 @@ AtomicMatrix uses a custom coalescing engine we call **Kinetic Coalescing**. Eac
 - **Pressure-driven healing**: `ack()` marks a block free and immediately starts the coalescing procedure, instead of relying on background cleanup threads or shared queues.
 - **Local failures only**: If any failures arises from the operations (corrupted data, arena out of memory, etc), processes fail locally instead of blowing everything up (borrowed directly from the Actor Model).
 
-## Process independent addressing
+### Process independent addressing
 
 All pointers are stored as `u32` offsets relative to the base of the SHM segment, and wrapped in a `RelativePtr` struct. Each process can use this to resolve coordinates against its own mapping.
 
-## Block lifecycle
+### Block lifecycle
 
 ```text
 STATE_FREE -> (block is allocated) -> STATE_ALLOCATED -> (ack is called) -> STATE_ACKED -> STATE_COALESCING -> STATE_FREE
@@ -58,9 +58,30 @@ Blocks relies on an atomic state machine stored in the header. Each allocation/d
 
 ### Correctness
 
-The state machine grants that the data in the block cannot be overwritten or cleaned up by processes that do not have ownership over that specific block. If a neighbour is freed, it will not touch the current block, unless it is in STATE_FREE or STATE_ACKED. Coalescing also ignores the data section of blocks, jumping directly into the previous block header instead, using the physical neighbour chain present in each header.
+#### Data integrity
+
+The state machine grants that the data in the block cannot be overwritten or cleaned up by processes that do not participate on the lifecycle of that specific block. If a neighbour is freed, it will not touch the current block, unless it is in STATE_FREE or STATE_ACKED. Coalescing also ignores the data section of blocks, jumping directly into the previous block header instead, using the physical neighbour chain present in each header.
 
 It also grants that no coalescing procedures overlap each other, since it only considers the two aformentioned states for merging.
+
+#### Lock freedom
+
+AtomicMatrix follows the Herlihy operational definition for lock freedom architectures. As the whole scope of critical operations uses a single-word CAS, all operations are bound to either fail or succeed, ensuring that the global state of the environment always moves forwards regardless of the ordering of operations.
+
+Notice however, that this does not ensure wait freedom, as allocation does not guarantee a block on the first try, causing participants to spin around and try again with another segment, or the wait spin on attach if another participant is bootstraping the matrix for the first time. Both these wait cycles on the other hand, are finite and bounded to 512 retries before failing locally.
+
+#### Merge linearizability
+
+The first step of every coalesce when a block is acquired for merging is swaping its current size to 0, then comparing the size acquired from the swap to the minimum size a block should have. If the size acquired is larger than the minimum, we can assume we sucessfully claimed this block for merging and proceed with the operation, if the size is zero, we can assume another participant beat us to merge this block and there is nothing else we must do other than finish merging our current set of acquired blocks and conclude the operation. This ensures that coalescing happens linearly through all participant processes and that no merge shall happen on the same block twice, simultaneously.
+
+Inside the merge scope, there is a second linearization point that happens right before cleaning up the entire segment, where the state of the header is atomically swapped to `STATE_COALESCING`, but only if the current state is `STATE_FREE` or `STATE_ACKED`. This ensures that if this block has been allocated to another participant during our merge operation, we do not corrupt the environment, coalescing our current acquired blocks and concluding the operation instead.
+
+Both these checkpoints ensures that:
+
+1 - Coalescing always completes successfully
+2 - Merging a neighbour will never corrupt the environment
+3 - Freeing a block twice never triggers a double-free
+4 - The environment clean up is organized and ordered
 
 ## Benchmarks
 
@@ -156,6 +177,13 @@ match unwind!({ *rt_mut_ref = heavy_math_equation(*rt_mut_ref) }) { // unwind! c
     }
 }
 
+// You can query a block allocated from different process//thread targeting the offset directly. There will be data structures to share them
+let foreign_block = handler.get_block::<u32>(30035).unwrap(); // it will fail if the offset is not a valid block
+
+let foreign_ref = handler.read(&foreign_block).unwrap();
+
+println!("Foreign data: {}", *foreign_ref);
+
 // Free it
 
 handler.free(block);
@@ -172,6 +200,12 @@ Multiple processes can map the same segment by passing the same UUID to `bootstr
 AtomicMatrix is `unsafe` at the boundary layer. The MatrixHandler API contains that unsafety behind `Block<T>` abstractions that enforce offset validity within segment bounds with checked queries, caller state validations and data transitions. Although, unsafe layers are also provided for strict caller synchronization when needed.
 
 We also provide a direct escape hatch into the raw matrix struct for direct arena manipulation (use with caution).
+
+### Thread Safety
+
+AtomicMatrix provides the building blocks for safely allocating, accessing, and manipulating data across separate threads/processes, without imposing an opinion about how your code should synchronize its own events on the data. This allows the arena to work as a flexible memory runtime that can adapt to a variety of use cases without hacking too much away. With the downside of having a steep learning curve and development surface, as the caller will need to worry about access/manipulation ordering, use-after-free recoveries, offset re-routing, and many other fun concurrency problems that comes with the package.
+
+This means that you can implement anything from a fully transparent fast streaming node to a event cache full of semaphores and mutexes everywhere. Providing you have the patience to do so, and the knowledge to do it from scratch lol.
 
 ## Disclaimer
 
