@@ -864,12 +864,60 @@ mod tests {
     fn test_allocation_size_plus_md_section() {
         let size = memory_scale::two::KB;
         let handler = AtomicMatrix::bootstrap(None, size).unwrap();
-        let init_block = handler.matrix()
-            .checked_query(handler.base_ptr() as *const u8, helpers::METADATA_SPACE).unwrap();
+        let init_block = unsafe { handler.matrix().query(helpers::METADATA_SPACE) };
 
         let header = unsafe { init_block.resolve_header(handler.base_ptr()) };
 
         assert_eq!(header.size.load(Ordering::Relaxed), size as u32);
+
+        unsafe { handler.die().unwrap() }
+    }
+
+    #[test]
+    fn test_out_of_bounds_query() {
+        let size = memory_scale::two::KB;
+        let overshot = memory_scale::four::KB as u32;
+        let handler = AtomicMatrix::bootstrap(None, size).unwrap();
+
+        let res_undershoot = handler.matrix().checked_query(handler.base_ptr(), 0);
+        let res_overshoot = handler.matrix().checked_query(handler.base_ptr(), overshot);
+
+        assert!(matches!(res_undershoot, Err(MatrixErrors::OutOfBounds)));
+        assert!(matches!(res_overshoot, Err(MatrixErrors::OutOfBounds)));
+
+        unsafe { handler.die().unwrap() }
+    }
+
+    #[test]
+    fn test_misaligned_header_query() {
+        let size = memory_scale::two::KB;
+        let handler = AtomicMatrix::bootstrap(None, size).unwrap();
+
+        let res = handler.matrix().checked_query(handler.base_ptr(), 10);
+
+        assert!(matches!(res, Err(MatrixErrors::MisalignedHeader)));
+
+        unsafe { handler.die().unwrap() }
+    }
+
+    #[test]
+    fn test_invalid_block_query() {
+        let size = memory_scale::two::KB;
+        let handler = AtomicMatrix::bootstrap(None, size).unwrap();
+
+        let res_free = handler.matrix().checked_query(handler.base_ptr(), helpers::METADATA_SPACE);
+
+        assert!(matches!(res_free, Err(MatrixErrors::InvalidBlock)));
+
+        let block = handler.allocate::<u32>().unwrap();
+        let header = RelativePtr::<BlockHeader>::new(block.header());
+        unsafe { handler.matrix().fast_ack(&header, handler.base_ptr()) };
+
+        let res_ack = handler.matrix().checked_query(handler.base_ptr(), block.header());
+        let state = unsafe { header.resolve(handler.base_ptr()).state.load(Ordering::Relaxed) };
+
+        assert_eq!(state, STATE_ACKED);
+        assert!(matches!(res_ack, Err(MatrixErrors::InvalidBlock)));
 
         unsafe { handler.die().unwrap() }
     }
