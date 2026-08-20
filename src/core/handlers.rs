@@ -693,39 +693,44 @@ pub trait HandlerFunctions {
     fn inline<T, F>(&self, block: &Block<T>, expr: F) -> Option<()> where F: FnOnce(TypeGuard<T>) {
         let mut retry_count = 0;
         self.matrix().checked_query(self.base_ptr(), block.header()).ok()?;
+            
+        let header_ptr = RelativePtr::<BlockHeader>::new(block.header());
+        let header = unsafe { header_ptr.resolve_mut(self.base_ptr()) };
 
         loop {
             let curr_state = self.get_state(block, Ordering::Acquire).ok()?;
 
-            if curr_state != STATE_LOCK {
-                let header_ptr = RelativePtr::<BlockHeader>::new(block.header());
-                let header = unsafe { header_ptr.resolve_mut(self.base_ptr()) };
-                match
-                    header.state.compare_exchange(
-                        curr_state,
-                        STATE_LOCK,
-                        Ordering::Release,
-                        Ordering::Relaxed
-                    )
-                {
-                    Ok(_) => {},
-                    Err(_) => { continue },
-                }
-
-                let exec_res = match self.read(block) {
-                    Ok(rt_ref) => unwind!(expr(rt_ref)),
-                    Err(e) => Err(e),
-                };
-                header.state.store(curr_state, Ordering::Release);
-                exec_res.ok()?;
-
-                break;
-            } else {
+            if curr_state == STATE_LOCK {
                 retry_count += 1;
-                if retry_count >= 512 {
-                    return None
-                } else {
-                    continue
+                if retry_count >= 512 { return None };
+                continue;
+            }
+
+            match
+                header.state.compare_exchange(
+                    curr_state,
+                    STATE_LOCK,
+                    Ordering::Acquire,
+                    Ordering::Relaxed
+                )
+            {
+                Ok(_) => {
+                    let exec_res = match self.read(block) {
+                        Ok(rt_ref) => unwind!(expr(rt_ref)),
+                        Err(e) => Err(e),
+                    };
+                    header.state.store(curr_state, Ordering::Release);
+                    exec_res.ok()?;
+
+                    break;
+                },
+                Err(_) => {
+                    retry_count += 1;
+                    if retry_count >= 512 {
+                        return None
+                    } else {
+                        continue
+                    }
                 }
             }
         }
@@ -761,41 +766,43 @@ pub trait HandlerFunctions {
     {
         let mut retry_count = 0;
         self.matrix().checked_query(self.base_ptr(), block.header()).ok()?;
+            
+        let header_ptr = RelativePtr::<BlockHeader>::new(block.header());
+        let header = unsafe { header_ptr.resolve_mut(self.base_ptr()) };
 
         loop {
-            let curr_state = self.get_state(block, Ordering::Acquire).ok()?;
+            let curr_state = header.state.load(Ordering::Acquire);
 
-            if curr_state != STATE_LOCK {
-                let header_ptr = RelativePtr::<BlockHeader>::new(block.header());
-                let header = unsafe { header_ptr.resolve_mut(self.base_ptr()) };
-                match
-                    header.state.compare_exchange(
-                        curr_state,
-                        STATE_LOCK,
-                        Ordering::Release,
-                        Ordering::Relaxed
-                    )
-                {
-                    Ok(_) => {},
-                    Err(_) => { continue }
-                }
-
-                let exec_res = match self.read_mut(block) {
-                    Ok(rt_ref_mut) => unwind!(expr(rt_ref_mut)),
-                    Err(e) => Err(e),
-                };
-                header.state.store(curr_state, Ordering::Release);
-                exec_res.ok()?;
-
-                break;
-            } else {
+            if curr_state == STATE_LOCK {
                 retry_count += 1;
-                if retry_count >= 512 {
-                    return None
-                } else {
-                    continue
-                }
+                if retry_count >= 512 { return None };
+                continue;
             }
+
+            match
+                header.state.compare_exchange(
+                    curr_state,
+                    STATE_LOCK,
+                    Ordering::Acquire,
+                    Ordering::Relaxed
+                )
+            {
+                Ok(_) => {
+                    let exec_res = match self.read_mut(block) {
+                        Ok(rt_ref_mut) => unwind!(expr(rt_ref_mut)),
+                        Err(e) => Err(e),
+                    };
+                    header.state.store(curr_state, Ordering::Release);
+                    exec_res.ok()?;
+
+                    break;
+                },
+                Err(_) => {
+                    retry_count += 1;
+                    if retry_count >= 512 { return None };
+                    continue;
+                }
+            }        
         }
 
         return Some(());
