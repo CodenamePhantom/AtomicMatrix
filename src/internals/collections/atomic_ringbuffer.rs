@@ -40,10 +40,7 @@
 
 use crate::internals::error_collection::BufferErrors;
 use crate::prelude::*;
-use std::{
-    sync::atomic::{AtomicBool, AtomicU32, Ordering},
-    cell::UnsafeCell,
-};
+use std::{ sync::atomic::{ AtomicBool, AtomicU32, Ordering }, cell::UnsafeCell };
 
 /// The header state for the [`AtomicRingBuffer`]. It isolates the block
 /// from any other context present in the matrix.
@@ -107,7 +104,11 @@ impl<'a, T: Default + Copy, const N: usize> AtomicRingBuffer<T, N> {
     #[inline]
     fn advance(&self, slot: u32) -> u32 {
         let next = slot + 1;
-        if next >= self.end { self.start } else { next }
+        if next >= self.end {
+            self.start
+        } else {
+            next
+        }
     }
 
     /// Returns a new [`AtomicRingBuffer`] reference.
@@ -131,31 +132,32 @@ impl<'a, T: Default + Copy, const N: usize> AtomicRingBuffer<T, N> {
     ///
     /// # Panic!
     /// The code will panic if it fails to allocate a block for the buffer.
-    pub fn new(
-        handler_ref: SharedHandler,
-        behaviour: Behaviour,
-    ) -> Option<&'a Self> {
+    pub fn new(handler_ref: SharedHandler, behaviour: Behaviour) -> Option<&'a Self> {
         let block = handler_ref.allocate::<AtomicRingBuffer<T, N>>().ok()?;
 
         let slots: [UnsafeCell<T>; N] = std::array::from_fn(|_| UnsafeCell::new(T::default()));
 
         handler_ref.set_state(&block, STATE_RINGBUFFER).ok()?;
 
-        if handler_ref.inline_mut(&block, |mut rb| {
-            *rb = Self {
-                behaviour,
-                start: 0,
-                end: slots.len() as u32 - 1,
-                reserved_head: AtomicU32::new(0),
-                commited_head: AtomicU32::new(0),
-                slots,
-                tail: AtomicU32::new(0),
-                has_message: AtomicBool::new(false),
-                address: block.header_offset(),
-            }
-        }).is_none() {
+        if
+            handler_ref
+                .inline_mut(&block, |mut rb| {
+                    *rb = Self {
+                        behaviour,
+                        start: 0,
+                        end: (slots.len() as u32) - 1,
+                        reserved_head: AtomicU32::new(0),
+                        commited_head: AtomicU32::new(0),
+                        slots,
+                        tail: AtomicU32::new(0),
+                        has_message: AtomicBool::new(false),
+                        address: block.header_offset(),
+                    };
+                })
+                .is_none()
+        {
             return None;
-        };
+        }
 
         let rb_guard = handler_ref.read(&block).ok()?;
         let rb: &'a Self = unsafe { &*(&*rb_guard as *const Self) };
@@ -202,7 +204,9 @@ impl<'a, T: Default + Copy, const N: usize> AtomicRingBuffer<T, N> {
 
             if next_head == current_tail {
                 match self.behaviour {
-                    Behaviour::Drop => return Err(BufferErrors::DropBehaviour),
+                    Behaviour::Drop => {
+                        return Err(BufferErrors::DropBehaviour);
+                    }
                     Behaviour::Wait(i) => {
                         for _ in 0..i {
                             std::hint::spin_loop();
@@ -214,18 +218,22 @@ impl<'a, T: Default + Copy, const N: usize> AtomicRingBuffer<T, N> {
                         continue;
                     }
                     Behaviour::Overwrite => {
-                        unimplemented!()
+                        unimplemented!();
                     }
                 }
             }
 
-            match self.reserved_head.compare_exchange_weak(
-                current_head,
-                next_head,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break current_head,
+            match
+                self.reserved_head.compare_exchange_weak(
+                    current_head,
+                    next_head,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed
+                )
+            {
+                Ok(_) => {
+                    break current_head;
+                }
                 Err(_) => {
                     std::hint::spin_loop();
                     cas_retries += 1;
@@ -239,8 +247,8 @@ impl<'a, T: Default + Copy, const N: usize> AtomicRingBuffer<T, N> {
 
         unsafe {
             let slot_ptr = self.slots[slot as usize].get();
-            std::ptr::write(slot_ptr, item) 
-        };
+            std::ptr::write(slot_ptr, item);
+        }
 
         while self.commited_head.load(Ordering::Acquire) != slot {
             std::hint::spin_loop();
@@ -263,22 +271,40 @@ impl<'a, T: Default + Copy, const N: usize> AtomicRingBuffer<T, N> {
     /// Either a life time specified reference to the block data, or
     /// None if the block is empty
     pub fn dequeue(&self) -> Option<T> {
-        let current_tail = self.tail.load(Ordering::Relaxed);
-        let next_tail = self.advance(current_tail);
+        let mut cas_retries = 0;
 
-        if current_tail == self.commited_head.load(Ordering::Acquire) {
-            return None;
+        loop {
+            let current_tail = self.tail.load(Ordering::Relaxed);
+            let next_tail = self.advance(current_tail);
+
+            if current_tail == self.commited_head.load(Ordering::Acquire) {
+                return None;
+            }
+
+            if
+                self.tail
+                    .compare_exchange(current_tail, next_tail, Ordering::Release, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let data = unsafe { self.slots[current_tail as usize].get().read() };
+
+                self.tail.store(next_tail, Ordering::Release);
+
+                if next_tail == self.commited_head.load(Ordering::Acquire) {
+                    self.has_message.store(false, Ordering::Release);
+                }
+
+                return Some(data);
+            } else {
+                cas_retries += 1;
+
+                if cas_retries <= CAS_RETRIES_CAP {
+                    continue;
+                } else {
+                    return None;
+                }
+            }
         }
-
-        let data = unsafe { self.slots[current_tail as usize].get().read() };
-
-        self.tail.store(next_tail, Ordering::Release);
-
-        if next_tail == self.commited_head.load(Ordering::Acquire) {
-            self.has_message.store(false, Ordering::Release);
-        }
-
-        return Some(data)
     }
 
     /// Returns the current head from the buffer without moving the pointer
