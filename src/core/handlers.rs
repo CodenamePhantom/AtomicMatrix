@@ -177,8 +177,22 @@ impl<T> Block<T> {
     ///
     /// ### Returns:
     /// The direct header offset as an u32 integer.
-    pub fn header(&self) -> u32 {
+    pub fn header_offset(&self) -> u32 {
         self.pointer.offset() - HEADER_SPACE - TAG_SIZE
+    }
+
+    /// Returns an instance to this block header object.
+    ///
+    /// ### Safety
+    ///
+    /// Manipulating header states directly is a dangerous operations and should be done with
+    /// caution.
+    ///
+    /// ### Returns
+    /// This block's header instance
+    pub unsafe fn header(&self) -> &BlockHeader {
+        let header_ptr = RelativePtr::<BlockHeader>::new(self.header_offset());
+        unsafe { header_ptr.resolve(self.base_ref as *const u8) }
     }
 
     /// Returns an offset to the block start, without the type_tag.
@@ -386,7 +400,7 @@ pub trait HandlerFunctions {
     /// ### Returns:
     /// A result containing an empty Ok, or a HandlerErrors
     unsafe fn write<T>(&self, block: &mut Block<T>, value: T) -> Result<(), HandlerErrors> {
-        let header = unsafe { block.tagless_ptr().resolve_header_mut(self.base_ptr()) };
+        let header = unsafe { block.header() };
         let state = &header.state;
         let total_size = header.size.load(Ordering::Acquire) - HEADER_SPACE;
 
@@ -444,15 +458,15 @@ pub trait HandlerFunctions {
         value: T,
         target: u32
     ) -> Result<(), HandlerErrors> {
-        if target < USER_STATE_MIN || target == STATE_LOCK {
+        if target == STATE_LOCK {
             return Err(HandlerErrors::ReservedState { state: target });
         }
         self
             .matrix()
-            .checked_query(self.base_ptr(), block.header())
+            .checked_query(self.base_ptr(), block.header_offset())
             .map_err(|_| HandlerErrors::InvalidOffset { offset: block.pointer().offset() })?;
 
-        let header = unsafe { block.tagless_ptr().resolve_header_mut(self.base_ptr()) };
+        let header = unsafe { block.header() };
         let state = &header.state;
         let total_size = header.size.load(Ordering::Acquire) - HEADER_SPACE;
 
@@ -513,7 +527,7 @@ pub trait HandlerFunctions {
         }
         self
             .matrix()
-            .checked_query(self.base_ptr(), block.header())
+            .checked_query(self.base_ptr(), block.header_offset())
             .map_err(|_| HandlerErrors::InvalidOffset { offset: block.pointer().offset() })?;
 
         let header = unsafe { block.tagless_ptr().resolve_header(self.base_ptr()) };
@@ -573,7 +587,7 @@ pub trait HandlerFunctions {
     /// ### Returns:
     /// A result containing either a TypeGuard<T>, or a HandlerErrors.
     fn read<'a, T>(&self, block: &Block<T>) -> Result<TypeGuard<T>, HandlerErrors> {
-        match self.matrix().checked_query(self.base_ptr(), block.header()) {
+        match self.matrix().checked_query(self.base_ptr(), block.header_offset()) {
             Ok(_) => {}
             Err(_) => {
                 return Err(HandlerErrors::InvalidOffset {
@@ -588,7 +602,7 @@ pub trait HandlerFunctions {
 
         let data = TypeGuard::<T>::new(
             block.pointer().offset(),
-            block.header(),
+            block.header_offset(),
             block.base_ref as *const u8
         );
 
@@ -615,7 +629,7 @@ pub trait HandlerFunctions {
     /// ### Returns:
     /// A result containing either a mutable reference to T, or a HandlerErrors.
     fn read_mut<'a, T>(&self, block: &Block<T>) -> Result<TypeGuardMut<T>, HandlerErrors> {
-        match self.matrix().checked_query(self.base_ptr(), block.header()) {
+        match self.matrix().checked_query(self.base_ptr(), block.header_offset()) {
             Ok(_) => {}
             Err(_) => {
                 return Err(HandlerErrors::InvalidOffset {
@@ -630,7 +644,7 @@ pub trait HandlerFunctions {
 
         let mut_data = TypeGuardMut::<T>::new(
             block.pointer().offset(),
-            block.header(),
+            block.header_offset(),
             block.base_ref as *const u8
         );
 
@@ -649,7 +663,7 @@ pub trait HandlerFunctions {
     /// ### Returns:
     /// A result containing either a copy of T, or a HandlerErrors.
     fn read_copy<T>(&self, block: &Block<T>) -> Result<T, HandlerErrors> {
-        match self.matrix().checked_query(self.base_ptr(), block.header()) {
+        match self.matrix().checked_query(self.base_ptr(), block.header_offset()) {
             Ok(_) => {}
             Err(_) => {
                 return Err(HandlerErrors::InvalidOffset {
@@ -692,14 +706,13 @@ pub trait HandlerFunctions {
     /// An Option stating the success of the execution.
     fn inline<T, F>(&self, block: &Block<T>, expr: F) -> Option<()> where F: FnOnce(TypeGuard<T>) {
         let mut retry_count = 0;
-        self.matrix().checked_query(self.base_ptr(), block.header()).ok()?;
+        self.matrix().checked_query(self.base_ptr(), block.header_offset()).ok()?;
 
         loop {
             let curr_state = self.get_state(block, Ordering::Acquire).ok()?;
 
             if curr_state != STATE_LOCK {
-                let header_ptr = RelativePtr::<BlockHeader>::new(block.header());
-                let header = unsafe { header_ptr.resolve_mut(self.base_ptr()) };
+                let header = unsafe { block.header() };
                 match
                     header.state.compare_exchange(
                         curr_state,
@@ -760,14 +773,13 @@ pub trait HandlerFunctions {
         where F: FnOnce(TypeGuardMut<T>)
     {
         let mut retry_count = 0;
-        self.matrix().checked_query(self.base_ptr(), block.header()).ok()?;
+        self.matrix().checked_query(self.base_ptr(), block.header_offset()).ok()?;
 
         loop {
             let curr_state = self.get_state(block, Ordering::Acquire).ok()?;
 
             if curr_state != STATE_LOCK {
-                let header_ptr = RelativePtr::<BlockHeader>::new(block.header());
-                let header = unsafe { header_ptr.resolve_mut(self.base_ptr()) };
+                let header = unsafe { block.header() };
                 match
                     header.state.compare_exchange(
                         curr_state,
@@ -880,8 +892,8 @@ pub trait HandlerFunctions {
     fn free<T>(&self, block: Block<T>) -> Result<(), HandlerErrors> {
         self
             .matrix()
-            .checked_query(self.base_ptr(), block.header())
-            .map_err(|_| HandlerErrors::InvalidOffset { offset: block.pointer.offset() })?;
+            .checked_query(self.base_ptr(), block.header_offset())
+            .map_err(|_| HandlerErrors::InvalidOffset { offset: block.header_offset() })?;
 
         let header = unsafe { block.tagless_ptr().resolve_header(self.base_ptr()) };
         if
@@ -895,7 +907,7 @@ pub trait HandlerFunctions {
             return Err(HandlerErrors::InvalidOffset { offset: block.pointer.offset() });
         }
 
-        let header_ptr = RelativePtr::<BlockHeader>::new(block.header());
+        let header_ptr = RelativePtr::<BlockHeader>::new(block.header_offset());
         self.matrix().ack(&header_ptr, self.base_ptr());
 
         Ok(())
@@ -912,7 +924,7 @@ pub trait HandlerFunctions {
     /// ### Returns:
     /// A result containing either an empty Ok, or a HandlerErrors.
     fn set_state<T>(&self, block: &Block<T>, state: u32) -> Result<(), HandlerErrors> {
-        match self.matrix().checked_query(self.base_ptr(), block.header()) {
+        match self.matrix().checked_query(self.base_ptr(), block.header_offset()) {
             Ok(_) => {}
             Err(_) => {
                 return Err(HandlerErrors::InvalidOffset {
@@ -943,7 +955,7 @@ pub trait HandlerFunctions {
     /// ### Returns:
     /// A result containing either the requested state, or a HandlerErrors.
     fn get_state<T>(&self, block: &Block<T>, order: Ordering) -> Result<u32, HandlerErrors> {
-        match self.matrix().checked_query(self.base_ptr(), block.header()) {
+        match self.matrix().checked_query(self.base_ptr(), block.header_offset()) {
             Ok(_) => {}
             Err(_) => {
                 return Err(HandlerErrors::InvalidOffset {
@@ -976,7 +988,7 @@ pub trait HandlerFunctions {
         next: u32,
         success_order: Ordering
     ) -> Result<u32, HandlerErrors> {
-        match self.matrix().checked_query(self.base_ptr(), block.header()) {
+        match self.matrix().checked_query(self.base_ptr(), block.header_offset()) {
             Ok(_) => {}
             Err(_) => {
                 return Err(HandlerErrors::InvalidOffset {
@@ -1047,6 +1059,7 @@ pub trait HandlerFunctions {
     }
 }
 
+// lots of testing things
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -1056,6 +1069,7 @@ mod tests {
 
     const SIZE: usize = memory_scale::two::KB;
 
+    /// Test whether allocate actually register the block with the correct type
     #[test]
     fn test_typed_block_allocation() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
@@ -1069,6 +1083,7 @@ mod tests {
         unsafe { handler.die().unwrap() }
     }
 
+    /// Test whether writting casts the value correctly within the specified type
     #[test]
     fn test_typed_write() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
@@ -1087,6 +1102,7 @@ mod tests {
         unsafe { handler.die().unwrap() }
     }
 
+    /// Test if write_transition works with user defined values.
     #[test]
     fn test_write_transition() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
@@ -1104,6 +1120,7 @@ mod tests {
         unsafe { handler.die().unwrap() }
     }
 
+    /// Test if write_transition fails with a state value that doesn't match.
     #[test]
     fn test_write_transition_fail() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
@@ -1120,6 +1137,7 @@ mod tests {
         unsafe { handler.die().unwrap() }
     }
 
+    /// Test if write_if actually captures the correct value and execute the write
     #[test]
     fn test_write_if() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
@@ -1134,7 +1152,8 @@ mod tests {
 
         unsafe { handler.die().unwrap() }
     }
-
+    
+    /// Test if write_if fails the write with the wrong state value
     #[test]
     fn test_write_if_fail() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
@@ -1149,12 +1168,13 @@ mod tests {
         unsafe { handler.die().unwrap() }
     }
 
+    /// Test wheter type tag can capture queries with the incorrect type
     #[test]
     fn test_type_mismatch_detection() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
         let block = handler.allocate::<u32>().unwrap();
 
-        let mismatched_block = handler.get_block::<&str>(block.header());
+        let mismatched_block = handler.get_block::<&str>(block.header_offset());
 
         assert_eq!(mismatched_block.is_ok(), false);
         assert!(matches!(mismatched_block, Err(HandlerErrors::TypeMismatchError)));
@@ -1162,11 +1182,12 @@ mod tests {
         unsafe { handler.die().unwrap() }
     }
 
+    /// Test if trying to manipulate a block after it has been freed returns an error
     #[test]
     fn test_use_after_free() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
         let block = handler.allocate::<u32>().unwrap();
-        let mut cloned_block = handler.get_block::<u32>(block.header()).unwrap();
+        let mut cloned_block = handler.get_block::<u32>(block.header_offset()).unwrap();
         let _err: Result<(), HandlerErrors> = Err(HandlerErrors::InvalidOffset {
             offset: cloned_block.pointer().offset(),
         });
@@ -1182,11 +1203,12 @@ mod tests {
         unsafe { handler.die().unwrap() }
     }
 
+    /// Test if freeing a block twice causes a double free UB
     #[test]
     fn test_double_free() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
         let block = handler.allocate::<u32>().unwrap();
-        let cloned_block = handler.get_block::<u32>(block.header()).unwrap();
+        let cloned_block = handler.get_block::<u32>(block.header_offset()).unwrap();
         let _err: Result<(), HandlerErrors> = Err(HandlerErrors::InvalidOffset {
             offset: cloned_block.pointer().offset(),
         });
@@ -1201,6 +1223,7 @@ mod tests {
         unsafe { handler.die().unwrap() }
     }
 
+    /// Test a successful state transition with transition_state
     #[test]
     fn test_successful_state_transition() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
@@ -1215,6 +1238,7 @@ mod tests {
         unsafe { handler.die().unwrap() }
     }
 
+    /// Test a failed state transition with reserved state values with transition_state
     #[test]
     fn test_fail_transition_to_reserved_states() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
@@ -1228,6 +1252,7 @@ mod tests {
         unsafe { handler.die().unwrap() }
     }
 
+    /// Test if set_state can successfully define states above 49
     #[test]
     fn test_successful_state_setting() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
@@ -1242,6 +1267,7 @@ mod tests {
         unsafe { handler.die().unwrap() }
     }
 
+    /// Test if set_state fails when defining states bellow 49
     #[test]
     fn test_fail_setting_reserved_state() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
@@ -1255,6 +1281,8 @@ mod tests {
         unsafe { handler.die().unwrap() }
     }
 
+    /// Test if Typeguards actually provide a live ref from the value that can be dereferenced with
+    /// *
     #[test]
     fn test_mutref_usability() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
@@ -1276,6 +1304,7 @@ mod tests {
         unsafe { handler.die().unwrap() }
     }
 
+    /// Test if Typeguards panic when dereferencing dead data
     #[test]
     fn test_type_guard_panic() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
@@ -1303,6 +1332,8 @@ mod tests {
         unsafe { handler.die().unwrap() }
     }
 
+    /// Test if inline lock with multiple producers actually lock and returns none to producers left
+    /// out.
     #[test]
     fn test_inline_mut_multi_producer() {
         use std::thread;
@@ -1316,7 +1347,7 @@ mod tests {
         }
 
         thread::scope(|s| {
-            let coord = block.header();
+            let coord = block.header_offset();
             let s_handler = handler.share();
 
             s.spawn(move || {
@@ -1413,6 +1444,89 @@ mod tests {
         let val_ref = handler.read(&block).unwrap();
 
         assert!(*val_ref >= increment);
+
+        unsafe { handler.die().unwrap() }
+    }
+
+    #[test]
+    fn test_inline_block_writing() {
+        use std::thread;
+
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+        let s_handler = handler.share();
+        let mut block = handler.allocate::<u32>().unwrap();
+        let c_block = handler.get_block::<u32>(block.header_offset()).unwrap();
+
+        thread::spawn(move || {
+            thread::sleep(Duration::from_secs(3));        
+            s_handler.inline(&c_block, |_| {
+                thread::sleep(Duration::from_secs(1))
+            });
+        });
+
+        let val_ref = handler.read(&block).unwrap();
+        let got_error;
+        let mut res;
+
+        loop {
+            res = handler.write_if(&mut block, *val_ref + 10, STATE_ALLOCATED); 
+            if res.is_ok() {
+                continue;
+            } else {
+                break;
+            }
+        }
+        
+        got_error = true;
+
+        println!("Final value: {}", *val_ref);
+        assert!(got_error);
+        assert!(matches!(res, Err(HandlerErrors::ReservedState { state: STATE_LOCK })));
+
+        unsafe { handler.die().unwrap() }
+    }
+
+    #[test]
+    fn test_inline_error_recovery() {
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+        let block = handler.allocate::<u32>().unwrap();
+        let free_block = handler.get_block::<u32>(block.header_offset()).unwrap();
+
+        handler.free(free_block).unwrap();
+
+        let res = handler.inline(&block, |_| {
+            // some very important code that will fail.
+        });
+
+        assert!(res.is_none());
+        
+        unsafe { handler.die().unwrap() }
+    }
+
+    #[test]
+    fn test_inline_unwind_during_lock() {
+        use std::thread;
+
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+        let s_handler = handler.share();
+        let block = handler.allocate::<u32>().unwrap();
+        let offset = block.header_offset();
+
+        // The handler free call will not allow freeing this block as it is in STATE_LOCK.
+        // We drop to the raw matrix to execute the process.
+        thread::spawn(move || {
+            let header_ptr = RelativePtr::<BlockHeader>::new(offset);
+            thread::sleep(Duration::from_secs(1));
+            
+            s_handler.matrix().ack(&header_ptr, s_handler.base_ptr());
+        });
+
+        let res = handler.inline(&block, |v| {
+            thread::sleep(Duration::from_secs(2));
+            let _some_val = *v;
+        });
+
+        assert!(res.is_none());
 
         unsafe { handler.die().unwrap() }
     }

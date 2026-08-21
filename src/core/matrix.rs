@@ -910,10 +910,10 @@ mod tests {
         assert!(matches!(res_free, Err(MatrixErrors::InvalidBlock)));
 
         let block = handler.allocate::<u32>().unwrap();
-        let header = RelativePtr::<BlockHeader>::new(block.header());
+        let header = RelativePtr::<BlockHeader>::new(block.header_offset());
         unsafe { handler.matrix().fast_ack(&header, handler.base_ptr()) };
 
-        let res_ack = handler.matrix().checked_query(handler.base_ptr(), block.header());
+        let res_ack = handler.matrix().checked_query(handler.base_ptr(), block.header_offset());
         let state = unsafe { header.resolve(handler.base_ptr()).state.load(Ordering::Relaxed) };
 
         assert_eq!(state, STATE_ACKED);

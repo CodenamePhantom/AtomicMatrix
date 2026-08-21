@@ -135,7 +135,7 @@ pub struct RouteGuard<'a> {
     private_id: &'a str,
     acl: type_guard::TypeGuard<ACL>,
     acl_offset: u32,
-    inbox: type_guard::TypeGuard<AtomicRingBuffer>,
+    inbox: type_guard::TypeGuard<AtomicRingBuffer<u32, 1024>>,
     sector_handler: MatrixHandler,
 }
 
@@ -267,7 +267,7 @@ impl Fencer {
         }
 
         let handler = AtomicMatrix::bootstrap(Some(id.to_string()), size).unwrap();
-        let rb = match AtomicRingBuffer::new::<u32>(1024, handler.share(), Behaviour::Drop) {
+        let _rb = match AtomicRingBuffer::<u32, 1024>::new(handler.share(), Behaviour::Drop) {
             Some(v) => v,
             None => {
                 return Err(FencerErrors::SectorSpawnError(String::from(
@@ -360,7 +360,7 @@ impl Fencer {
         let block = unsafe { Block::<ACL>::from_offset(dataplane.matrix().query(sec_id).offset(), dataplane.base_ptr() as usize) };
         let module_tag = dataplane.hash_id(priv_id);
 
-        let acl_data = unsafe { dataplane.read(&block).unwrap() };
+        let acl_data = dataplane.read(&block).unwrap();
 
         let entry = acl_data
             .entries
@@ -396,10 +396,10 @@ impl Fencer {
 
         Ok(RouteGuard {
             private_id: priv_id,
-            acl: unsafe { dataplane.read::<ACL>(&block).unwrap() },
+            acl: dataplane.read::<ACL>(&block).unwrap(),
             acl_offset: block.pointer().offset(),
             sector_handler: sect_handler,
-            inbox: rb.view_data_as::<AtomicRingBuffer>(),
+            inbox: rb.view_data_as::<AtomicRingBuffer<u32, 1024>>(),
         })
     }
 
@@ -450,7 +450,7 @@ impl<'a> RouteGuard<'a> {
 
         unsafe { self.sector_handler.write(&mut block, msg).unwrap() };
 
-        match self.inbox.enqueue::<u32>(block.pointer().offset()) {
+        match self.inbox.enqueue(block.pointer().offset()) {
             Ok(_) => return Ok(()),
             Err(e) => return Err(FencerErrors::SectorError(format!("{:?}", e))),
         };
@@ -474,13 +474,13 @@ impl<'a> RouteGuard<'a> {
             return Err(FencerErrors::UnauthorizedRead);
         };
 
-        let msg_offset = match self.inbox.dequeue::<u32>() {
+        let msg_offset = match self.inbox.dequeue() {
             Some(v) => v,
             None => return Ok(None),
         };
 
-        let msg_block = Block::<T>::from_offset(*msg_offset, self.sector_handler.base_ptr() as usize);
-        let msg = unsafe { self.sector_handler.read(&msg_block).unwrap() };
+        let msg_block = Block::<T>::from_offset(msg_offset, self.sector_handler.base_ptr() as usize);
+        let msg = self.sector_handler.read(&msg_block).unwrap();
 
         return Ok(Some(msg));
     }

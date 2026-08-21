@@ -41,8 +41,8 @@
 use crate::internals::error_collection::BufferErrors;
 use crate::prelude::*;
 use std::{
-    mem::size_of,
     sync::atomic::{AtomicBool, AtomicU32, Ordering},
+    cell::UnsafeCell,
 };
 
 /// The header state for the [`AtomicRingBuffer`]. It isolates the block
@@ -64,7 +64,7 @@ pub enum Behaviour {
     Overwrite,
     /// Wait for an amount of time specified by the user before
     /// retrying.
-    Wait(u8),
+    Wait(u32),
 }
 
 /// The coordination structure for the ring buffer.
@@ -72,16 +72,15 @@ pub enum Behaviour {
 /// It holds all the metadata related to the ring buffer registered in
 /// the block, as well as High-Level functions to safely read/write data
 /// in the buffer itself.
-pub struct AtomicRingBuffer {
-    buf_size: usize,
+pub struct AtomicRingBuffer<T, const N: usize> {
     behaviour: Behaviour,
     start: u32,
     end: u32,
     reserved_head: AtomicU32,
     commited_head: AtomicU32,
+    slots: [UnsafeCell<T>; N],
     tail: AtomicU32,
     has_message: AtomicBool,
-    handler_ref: SharedHandler,
     address: u32,
 }
 
@@ -89,10 +88,10 @@ pub struct AtomicRingBuffer {
 // the matrix by default, and not allowing direct manipulation through a
 // mut reference, it is safe to be shared across different threads with-
 // out causing race conditions (contentions are still implied).
-unsafe impl Send for AtomicRingBuffer {}
-unsafe impl Sync for AtomicRingBuffer {}
+unsafe impl<T, const N: usize> Send for AtomicRingBuffer<T, N> {}
+unsafe impl<T, const N: usize> Sync for AtomicRingBuffer<T, N> {}
 
-impl<'a> AtomicRingBuffer {
+impl<'a, T: Default + Copy, const N: usize> AtomicRingBuffer<T, N> {
     /// Internal helper function to move the current pointer forward in
     /// the buffer.
     ///
@@ -106,8 +105,8 @@ impl<'a> AtomicRingBuffer {
     /// # Returns
     /// A pointer value to the next slot to be used.
     #[inline]
-    fn advance(&self, offset: u32) -> u32 {
-        let next = offset + self.buf_size as u32;
+    fn advance(&self, slot: u32) -> u32 {
+        let next = slot + 1;
         if next >= self.end { self.start } else { next }
     }
 
@@ -132,45 +131,36 @@ impl<'a> AtomicRingBuffer {
     ///
     /// # Panic!
     /// The code will panic if it fails to allocate a block for the buffer.
-    pub fn new<T>(
-        slots: usize,
+    pub fn new(
         handler_ref: SharedHandler,
         behaviour: Behaviour,
     ) -> Option<&'a Self> {
-        let buf_size = size_of::<T>();
-        let struct_size = size_of::<AtomicRingBuffer>();
-        let size = struct_size + buf_size * slots;
+        let block = handler_ref.allocate::<AtomicRingBuffer<T, N>>().ok()?;
 
-        let rel_ptr = handler_ref.allocate_raw(size as u32).unwrap();
+        let slots: [UnsafeCell<T>; N] = std::array::from_fn(|_| UnsafeCell::new(T::default()));
 
-        let rb_start = rel_ptr.offset() + struct_size as u32;
-        let rb_end = rb_start + size as u32;
-        let header = unsafe { rel_ptr.resolve_header_mut(handler_ref.base_ptr()) };
+        handler_ref.set_state(&block, STATE_RINGBUFFER).ok()?;
 
-        let atomic_rb_ptr = unsafe {
-            handler_ref.base_ptr().add(rel_ptr.offset() as usize) as *mut AtomicRingBuffer
+        if handler_ref.inline_mut(&block, |mut rb| {
+            *rb = Self {
+                behaviour,
+                start: 0,
+                end: slots.len() as u32 - 1,
+                reserved_head: AtomicU32::new(0),
+                commited_head: AtomicU32::new(0),
+                slots,
+                tail: AtomicU32::new(0),
+                has_message: AtomicBool::new(false),
+                address: block.header_offset(),
+            }
+        }).is_none() {
+            return None;
         };
 
-        header.state.store(STATE_RINGBUFFER, Ordering::Relaxed);
+        let rb_guard = handler_ref.read(&block).ok()?;
+        let rb: &'a Self = unsafe { &*(&*rb_guard as *const Self) };
 
-        unsafe {
-            std::ptr::write(
-                atomic_rb_ptr,
-                AtomicRingBuffer {
-                    buf_size,
-                    behaviour,
-                    start: rb_start,
-                    end: rb_end,
-                    reserved_head: AtomicU32::new(rb_start),
-                    commited_head: AtomicU32::new(rb_start),
-                    tail: AtomicU32::new(rb_start),
-                    has_message: AtomicBool::new(false),
-                    handler_ref,
-                    address: rel_ptr.offset(),
-                },
-            );
-            Some(&*atomic_rb_ptr)
-        }
+        Some(rb)
     }
 
     /// Adds a new message to the [`AtomicRingBuffer`] and updates the
@@ -201,7 +191,7 @@ impl<'a> AtomicRingBuffer {
     /// iterations \
     /// @TooManyProducers: There are too many producers attached to this buffer
     /// and its not possible to allocate a slot before the buffer fills up.
-    pub fn enqueue<T>(&self, item: T) -> Result<(), BufferErrors> {
+    pub fn enqueue(&self, item: T) -> Result<(), BufferErrors> {
         let mut cas_retries: u16 = 0;
         let mut wait_iterations: u16 = 0;
 
@@ -247,8 +237,10 @@ impl<'a> AtomicRingBuffer {
             }
         };
 
-        let ptr = RelativePtr::<T>::new(slot);
-        unsafe { ptr.write(self.handler_ref.base_ptr(), item) };
+        unsafe {
+            let slot_ptr = self.slots[slot as usize].get();
+            std::ptr::write(slot_ptr, item) 
+        };
 
         while self.commited_head.load(Ordering::Acquire) != slot {
             std::hint::spin_loop();
@@ -270,9 +262,7 @@ impl<'a> AtomicRingBuffer {
     /// # Returns
     /// Either a life time specified reference to the block data, or
     /// None if the block is empty
-    pub fn dequeue<T>(&self) -> Option<type_guard::TypeGuard<T>> {
-        let data: Option<type_guard::TypeGuard<T>>;
-
+    pub fn dequeue(&self) -> Option<T> {
         let current_tail = self.tail.load(Ordering::Relaxed);
         let next_tail = self.advance(current_tail);
 
@@ -280,13 +270,7 @@ impl<'a> AtomicRingBuffer {
             return None;
         }
 
-        let block = Block::<T>::from_offset(current_tail, self.handler_ref.base_ptr() as usize);
-        unsafe {
-            match self.handler_ref.read(&block) {
-                Ok(v) => data = Some(v),
-                Err(_) => data = None,
-            }
-        };
+        let data = unsafe { self.slots[current_tail as usize].get().read() };
 
         self.tail.store(next_tail, Ordering::Release);
 
@@ -294,7 +278,7 @@ impl<'a> AtomicRingBuffer {
             self.has_message.store(false, Ordering::Release);
         }
 
-        return data
+        return Some(data)
     }
 
     /// Returns the current head from the buffer without moving the pointer
@@ -306,20 +290,14 @@ impl<'a> AtomicRingBuffer {
     /// # Returns
     /// Either a reference to the block data, or None if the block is
     /// empty
-    pub fn peek<T>(&self) -> Option<type_guard::TypeGuard<T>> {
+    pub fn peek(&self) -> Option<T> {
         let current_tail = self.tail.load(Ordering::Acquire);
 
         if current_tail == self.commited_head.load(Ordering::Acquire) {
             return None;
         }
 
-        let block = Block::<T>::from_offset(current_tail, self.handler_ref.base_ptr() as usize);
-        let data = unsafe {
-            match self.handler_ref.read(&block) {
-                Ok(v) => v,
-                Err(_) => return None,
-            }
-        };
+        let data = unsafe { self.slots[current_tail as usize].get().read() };
 
         Some(data)
     }
