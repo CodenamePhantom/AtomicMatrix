@@ -1,51 +1,204 @@
+//! Peer checked Atomic RingBuffer example.
+//!
+//! It creates a single ringbuffer and attaches 4 producers and 2 consumers on top of it. Each
+//! producer is tasked with publishing a random u16 number from 200 to 2048, together with a thread
+//! id and a sequence counter. 
+//!
+//! Consumers will then, dequeue the values from the ringbuffer and pass it to each other for peer 
+//! validation. If an identical dequeue'd value is detected, the colision is registered in a global
+//! duplicate counter that both consumers have access to.
+//!
+//! The stats of the run are logged at the end with:
+//!
+//! - Processed messages from each consumer.
+//! - Run timer.
+//! - Duplicate count.
+//!
+//! This code is merely a proof of concept of how the atomic matrix works and should be used as an
+//! example.
+
 use atomic_matrix::{
     internals::collections::atomic_ringbuffer::{AtomicRingBuffer, Behaviour},
     prelude::*,
 };
-use std::{thread, time::Instant};
+use std::{
+    thread, 
+    time::{Instant, Duration},
+    sync::atomic::{AtomicU8, Ordering},
+};
+use rand::prelude::*;
 
-fn sender(loops: u32, rb: &AtomicRingBuffer<u16, 1024>) {
+const LOOPS: u32 = 1_000_000;
+const SENDER_NUM: u32 = 4;
+const RB_SIZE: usize = 8192;
+
+struct Mesg {
+    thread_id: u8,
+    num: u16,
+    seq: u32,
+    status: AtomicU8,
+}
+
+fn sender(rb: &AtomicRingBuffer<(u8, u16, u32), RB_SIZE>, id: u8) {
     let mut count: u32 = 0;
-    for _ in 0..loops {
-        rb.enqueue(276).unwrap();
-        count = count.checked_add(1).unwrap();
+    let mut rng = rand::rng();
+    let mut seq: u32 = 0;
+
+    while count < LOOPS {
+        let num = rng.random_range(200..2048);
+        match rb.enqueue((id, num, seq)) {
+            Ok(_) => {
+                count = count.checked_add(1).unwrap();
+                seq = seq.checked_add(1).unwrap();
+                continue;
+            },
+            Err(_) => {
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+        };
+
     }
 
     println!("Sent: {} messages", count);
 }
 
-fn receiver(loops: u32, rb: &AtomicRingBuffer<u16, 1024>) {
+fn receiver(
+    rb: &AtomicRingBuffer<(u8, u16, u32), RB_SIZE>, 
+    recv_block: &Block<Mesg>, 
+    peer_block: &Block<Mesg>,
+    race_counter: &Block<u32>,
+    s_handler: SharedHandler,
+    recv_id: u8,
+) {
+    let mut none_guard: u32 = 0;
+    let mut none_breach: u32 = 0;
     let mut count: u32 = 0;
-    while count < loops * 3 {
-        let _ = match rb.dequeue() {
-            Some(_) => {
+
+    let mut my_ref = s_handler.read_mut(recv_block).unwrap();
+    *my_ref = Mesg {
+        thread_id: 0,
+        num: 0,
+        seq: 0,
+        status: AtomicU8::new(3),
+    };
+
+    let mesg = &*s_handler.read(recv_block).unwrap();
+    let peer_ref = s_handler.read(peer_block).unwrap();
+
+    loop {
+        match rb.dequeue() {
+            Some((id, num, seq)) => {
+                let mut ops_count = 0;
+
+                my_ref.thread_id = id;
+                my_ref.num = num;
+                my_ref.seq = seq;
+                mesg.status.store(0, Ordering::Release);
+                
+                let mut matched = false;
+                let mut peer_matched = false;
+
+                loop {
+                    if !matched {
+                        match mesg.status.load(Ordering::Acquire) {
+                            0 => {},
+                            1 => {
+                                mesg.status.store(3, Ordering::Release);
+                                ops_count += 1;
+                                matched = true;
+                            },
+                            2 => {
+                                mesg.status.store(3, Ordering::Release);
+                                s_handler.inline_mut(race_counter, |mut count| {
+                                    *count += 1;
+                                }).unwrap();
+                                ops_count += 1;
+                                matched = true;
+                            },
+                            _ => {
+                                println!("Fail mine on {recv_id}: {}", mesg.status.load(Ordering::Relaxed))
+                            }
+                        }
+                    }
+
+                    match peer_ref.status.load(Ordering::Acquire) {
+                        0 => {
+                            let val = &mut *s_handler.read_mut(peer_block).unwrap();
+                            if peer_ref.num == 0 {
+                                val.status.store(1, Ordering::Release);
+                            } else if peer_ref.thread_id == id && peer_ref.num == num && peer_ref.seq == seq {
+                                val.status.store(2, Ordering::Release);
+                            } else {
+                                val.status.store(1, Ordering::Release);
+                            }
+
+                            ops_count += 1;
+                        },
+                        4 => {
+                            mesg.status.store(1, Ordering::Release);
+                            ops_count += 1;
+                        },
+                        _ => {},
+                    }
+
+                    if ops_count == 2 {
+                        break;
+                    }
+                }
+
                 count = count.checked_add(1).unwrap();
             }
-            None => {}
+            None => {
+                none_guard = none_guard.checked_add(1).unwrap();
+
+                if none_breach > 10 {
+                    mesg.status.store(4, Ordering::Release);
+                    break;
+                } else if none_guard > 20_000 {
+                    my_ref.thread_id = 0;
+                    my_ref.num = 0;
+                    my_ref.seq = 0;
+                    mesg.status.store(0, Ordering::Release);
+                    println!("None guard!");
+                    println!("Received: {} | Duplicates: {} | id: {recv_id}", count, *s_handler.read(race_counter).unwrap());
+                    thread::sleep(Duration::from_millis(300));
+                    none_breach += 1;
+                    none_guard = 0;
+                } 
+            }
         };
     }
 
-    println!("Received: {} messages", count);
+    println!("Received {count} messages on recv {recv_id}");
 }
 
 fn main() {
-    const LOOPS: u32 = 1_000_000;
+    let handler = AtomicMatrix::bootstrap(None, memory_scale::custom::mb::<5>()).unwrap();
+    let ring_buffer = AtomicRingBuffer::<(u8, u16, u32), RB_SIZE>::new(handler.share(), Behaviour::Wait(300)).unwrap();
 
-    let handler = AtomicMatrix::bootstrap(None, 5 * 1024 * 1024).unwrap();
-    let ring_buffer = AtomicRingBuffer::<u16, 1024>::new(handler.share(), Behaviour::Wait(300)).unwrap();
+    let recv_a_block = handler.allocate::<Mesg>().unwrap();
+    let recv_b_block = handler.allocate::<Mesg>().unwrap();
+    let global_race_counter = handler.allocate::<u32>().unwrap();
 
     let instant = Instant::now();
 
     thread::scope(|s| {
-        s.spawn(|| sender(LOOPS, ring_buffer));
-        s.spawn(|| sender(LOOPS, ring_buffer));
-        s.spawn(|| sender(LOOPS, ring_buffer));
-        s.spawn(|| receiver(LOOPS, ring_buffer));
+        let mut sender_count = 0;
+
+        while sender_count < SENDER_NUM {
+            let id = sender_count + 1;
+            s.spawn(move || sender(ring_buffer, id as u8));
+            sender_count += 1;
+        }
+        s.spawn(|| receiver(ring_buffer, &recv_a_block, &recv_b_block, &global_race_counter, handler.share(), 1));
+        s.spawn(|| receiver(ring_buffer, &recv_b_block, &recv_a_block, &global_race_counter, handler.share(), 2));
     });
 
     let end = instant.elapsed();
 
     println!("Done in {} us", end.as_micros());
+    println!("Caught {} duplicates", *handler.read(&global_race_counter).unwrap());
 
     unsafe { handler.die().unwrap() };
 }
