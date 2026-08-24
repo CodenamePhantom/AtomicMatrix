@@ -93,11 +93,14 @@ better_error! {
     }
 }
 
-#[derive(Debug)]
-pub enum AtomicArrayErrors {
-    EmptyIndexError,
-    NotAnArrayError,
-    BlockedSlotError(String),
-    AtomicWriteFailed,
-    SetOpError(String),
+better_error! {
+    #[derive(Debug)]
+    pub enum AtomicArrayErrors {
+        EmptyIndexError { slot_idx: u32 } => "The index {slot_idx} is empty",
+        NotAnArrayError => "The requested offset is not an AtomicArray",
+        BlockedSlotError { slot_idx: u32 } => "The slot {slot_idx} could not be locked",
+        AtomicWriteFailed { slot_idx: u32 } => "Failed to write into slot {slot_idx}",
+        ArrayFull => "The array is completely full",
+        ArrayEmpty => "The array is completely empty",
+    }
 }

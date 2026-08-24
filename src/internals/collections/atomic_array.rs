@@ -9,6 +9,7 @@ const S_OPEN: u8 = 0;
 const S_CLOSED: u8 = 1;
 const S_WRITING: u8 = 2;
 const S_READING: u8 = 3;
+const S_FREE: u8 = 4;
 
 #[repr(C)]
 pub struct Slot<T> {
@@ -27,51 +28,59 @@ pub struct AtomicArray<T, const N: usize> {
 }
 
 impl<T, const N: usize> AtomicArray<T, N> {
-    pub fn new(handler: &MatrixHandler) -> &Self {
-        let size = std::mem::size_of::<Self>();
+    pub fn new(handler: &MatrixHandler) -> Option<&Self> {
+        let block = handler.allocate::<AtomicArray<T, N>>().ok()?;
 
-        let block = handler.allocate_raw(size as u32).unwrap();
-
-        let atomic_array =
-            unsafe { *handler.base_ptr().add(block.offset() as usize) as *mut AtomicArray<T, N> };
+        handler.set_state(&block, STATE_ARRAY).ok()?;
 
         let slots: [Slot<T>; N] = std::array::from_fn(|_| Slot {
-            flag: AtomicU8::new(S_OPEN),
+            flag: AtomicU8::new(S_FREE),
             data: UnsafeCell::new(None),
         });
 
-        unsafe {
-            std::ptr::write(atomic_array, AtomicArray { slots });
+        match handler.inline_mut(&block, |mut arr| {
+            *arr = AtomicArray { slots };
+        }) {
+            Some(_) => {},
+            None => return None,
+        };
 
-            &*atomic_array
-        }
+        let arr_guard = handler.read(&block).unwrap();
+        let arr: &Self = unsafe { &*(&*arr_guard as *const Self) };
+
+        return Some(arr)
     }
 
-    pub fn new_from_map<F>(handler: &MatrixHandler, f: F) -> &Self
+    pub fn new_from_map<F>(handler: &MatrixHandler, f: F) -> Option<&Self>
     where
         F: Fn() -> Slot<T>,
     {
-        let size = std::mem::size_of::<Self>();
+        let block = handler.allocate::<AtomicArray<T, N>>().ok()?;
 
-        let block = handler.allocate_raw(size as u32).unwrap();
-
-        let atomic_array =
-            unsafe { *handler.base_ptr().add(block.offset() as usize) as *mut AtomicArray<T, N> };
+        handler.set_state(&block, STATE_ARRAY).ok()?;
 
         let slots: [Slot<T>; N] = std::array::from_fn(|_| f());
 
-        unsafe {
-            std::ptr::write(atomic_array, AtomicArray { slots });
+        match handler.inline_mut(&block, |mut arr| {
+            *arr = AtomicArray { slots };
+        }) {
+            Some(_) => {},
+            None => return None,
+        };
 
-            &*atomic_array
-        }
+        let arr_guard = handler.read(&block).ok()?;
+        let arr: &Self = unsafe { &*(&*arr_guard as *const Self) };
+
+        return Some(arr)
     }
 
-    pub unsafe fn from(handler: &MatrixHandler, src: u32) -> &Self {
-        let block = Block::<AtomicArray<T, N>>::from_offset(src, handler.base_ptr() as usize);
-        let atomic_array = unsafe { block.pointer().resolve(handler.base_ptr()) };
+    pub fn from(handler: &MatrixHandler, src: u32) -> Option<&Self> {
+        let block = handler.get_block::<AtomicArray<T, N>>(src).ok()?;
 
-        atomic_array
+        let arr_guard = handler.read(&block).ok()?;
+        let atomic_array: &Self = unsafe { &*(&*arr_guard as *const Self) };
+
+        Some(atomic_array)
     }
 
     /// Get a stale copy of the value within the informed index without locking.
@@ -83,7 +92,7 @@ impl<T, const N: usize> AtomicArray<T, N> {
 
         match unsafe { *slot.data.get() } {
             Some(v) => Ok(v),
-            None => Err(AtomicArrayErrors::EmptyIndexError),
+            None => Err(AtomicArrayErrors::EmptyIndexError { slot_idx: idx }),
         }
     }
 
@@ -96,7 +105,7 @@ impl<T, const N: usize> AtomicArray<T, N> {
 
         match unsafe { &*slot.data.get() } {
             Some(v) => Ok(v),
-            None => Err(AtomicArrayErrors::EmptyIndexError),
+            None => Err(AtomicArrayErrors::EmptyIndexError { slot_idx: idx }),
         }
     }
 
@@ -105,11 +114,6 @@ impl<T, const N: usize> AtomicArray<T, N> {
     /// This can ideally be used to isolate a single slot inside a closed loop,
     /// since sharing the reference allows other threads to manipulate it even
     /// when locked.
-    ///
-    /// TODO: make it return a new struct with a drop trait to unlock the slot
-    /// when the value is explicitly droped or goes out of scope to avoid ADHD
-    /// slugs like me forgetting to unlocking the data and crashing the whole
-    /// data structure in the process.
     pub fn strict_get<'a>(&'a self, idx: u32) -> Result<StrictRefMut<'a, T>, AtomicArrayErrors>
     where
         T: Copy,
@@ -127,14 +131,11 @@ impl<T, const N: usize> AtomicArray<T, N> {
                 Some(v) => Ok(StrictRefMut { data: v, slot }),
                 None => {
                     slot.flag.store(S_OPEN, Ordering::Release);
-                    Err(AtomicArrayErrors::EmptyIndexError)
+                    Err(AtomicArrayErrors::EmptyIndexError { slot_idx: idx })
                 }
             }
         } else {
-            Err(AtomicArrayErrors::BlockedSlotError(
-                "The slot could not be read-locked because its already locked by another process"
-                    .into(),
-            ))
+            Err(AtomicArrayErrors::BlockedSlotError { slot_idx: idx })
         }
     }
 
@@ -158,7 +159,7 @@ impl<T, const N: usize> AtomicArray<T, N> {
 
             return Ok(());
         } else {
-            return Err(AtomicArrayErrors::AtomicWriteFailed);
+            return Err(AtomicArrayErrors::AtomicWriteFailed { slot_idx: idx});
         }
     }
 
@@ -166,33 +167,116 @@ impl<T, const N: usize> AtomicArray<T, N> {
     /// to successfully set the slot, or it acheives the maximum defined number of tries.
     ///
     /// Fails at N given retries
-    pub fn strict_set(&self, idx: u32, value: T, retries: u32) -> Result<u32, AtomicArrayErrors> {
-        unimplemented!()
+    pub fn strict_set(&self, idx: u32, value: T, retries: u32) -> Result<(), AtomicArrayErrors> {
+        let slot = &self[idx];
+        let f_list = [S_CLOSED, S_WRITING];
+        let mut retry_counter = 0;
+
+        loop {
+            if slot.flag.store_if_not_any(
+                &f_list, 
+                S_WRITING, 
+                Ordering::Release, 
+                Ordering::Relaxed
+            ) {
+                let data = unsafe {&mut *slot.data.get() };
+                data.replace(value);
+
+                slot.flag.store(S_OPEN, Ordering::Release);
+
+                return Ok(())
+            } else {
+                retry_counter += 1;
+
+                if retry_counter > retries {
+                    return Err(AtomicArrayErrors::AtomicWriteFailed { slot_idx: idx});
+                }
+            }
+        }
     }
 
     /// Tries to set a slot opportunistically.
     ///
     /// It either set the first empty slot, or returns a ArrayFull error.
-    pub fn push() {
-        unimplemented!()
+    pub fn push(&self, value: T) -> Result<u32, AtomicArrayErrors> {
+        for idx in 0..N - 1 {
+            let slot = &self[idx as u32];
+            
+            if slot.flag.load(Ordering::Acquire) == S_FREE {
+                slot.flag.store(S_WRITING, Ordering::Release);
+
+                let data = unsafe { &mut *slot.data.get() };
+                data.replace(value);
+
+                slot.flag.store(S_OPEN, Ordering::Release);
+
+                return Ok(idx as u32);
+            }
+        }
+
+        return Err(AtomicArrayErrors::ArrayFull);
     }
 
     /// Tries to set a slot opportunistically and keep it locked.
-    pub fn strict_push() {
-        unimplemented!()
+    pub fn strict_push<'a>(&'a self, value: T) -> Result<StrictRefMut<'a, T>, AtomicArrayErrors> {
+        for idx in 0..N - 1 {
+            let slot: &'a Slot<T> = &self[idx as u32];
+            
+            if slot.flag.load(Ordering::Acquire) == S_FREE {
+                slot.flag.store(S_WRITING, Ordering::Release);
+
+                let data: &'a mut Option<T> = unsafe { &mut *slot.data.get() };
+                data.replace(value);
+
+
+                match data {
+                    Some(v) => {
+                        slot.flag.store(S_CLOSED, Ordering::Release);
+                        return Ok(StrictRefMut { data: v, slot });
+                    },
+                    None => {
+                        slot.flag.store(S_FREE, Ordering::Release);
+                        return Err(AtomicArrayErrors::EmptyIndexError { slot_idx: idx as u32 });
+                    }
+                }
+            }
+        }
+
+        return Err(AtomicArrayErrors::ArrayFull);
     }
 
     /// Set all values inside the array to [`None`]
     ///
     /// This function completelly ignores the state machine and resets the
     /// whole array
-    pub fn clear(&self, idx: u32) {
-        unimplemented!()
+    pub fn clear(&self) {
+        for idx in 0..N - 1 {
+            let slot = &self[idx as u32];
+
+            slot.flag.store(S_FREE, Ordering::Release);
+
+            let data = unsafe { &mut *slot.data.get() };
+            let _ = data.take();
+        }
     }
 
     /// removes the last value in the array and return it
-    pub fn pop(&self) -> &T {
-        unimplemented!()
+    pub fn pop(&self) -> Result<T, AtomicArrayErrors> {
+        for idx in 0..N - 1 {
+            let slot = &self[idx as u32];
+
+            if slot.flag.load(Ordering::Acquire) == S_FREE {
+                let prev_slot = &self[idx as u32 - 1];
+                let data = unsafe {&mut *prev_slot.data.get() };
+                if let Some(return_data) = data.take() {
+                    return Ok(return_data);
+                } else {
+                    return Err(AtomicArrayErrors::EmptyIndexError { slot_idx: idx as u32 });
+                };
+            }
+        }
+
+        return Err(AtomicArrayErrors::ArrayEmpty);
     }
 
     /// removes a value from the array and moves all subsequent slots
@@ -203,17 +287,73 @@ impl<T, const N: usize> AtomicArray<T, N> {
 
     /// Removes a value from the array without reorganizing slots.
     pub fn clean(&self, idx: u32) {
-        unimplemented!()
+        let slot = &self[idx];
+
+        slot.flag.store(S_FREE, Ordering::Release);
+
+        let data = unsafe { &mut *slot.data.get() };
+        let _ = data.take();
     }
 
     /// unlock a slot without clearing its value
-    pub fn unlock(&self, idx: u32) {
-        unimplemented!()
+    pub fn unlock(&self, idx: u32) -> Option<()> {
+        let slot = &self[idx];
+
+        if slot.flag.compare_exchange(
+            S_CLOSED, 
+            S_OPEN, 
+            Ordering::Release, 
+            Ordering::Acquire
+        ).is_ok() {
+            return Some(());
+        } else {
+            return None
+        }
     }
 
     /// Swap the place of two values
-    pub fn swap(&self, idx1: u32, idx2: u32) {
-        unimplemented!()
+    pub fn swap(&self, idx1: u32, idx2: u32) -> Option<()> {
+        // you seriously gonna try that?
+        if idx1 == idx2 {
+            return Some(())
+        }
+
+        let smallest = std::cmp::min(idx1, idx2);
+        let largest = std::cmp::max(idx1, idx2);
+        let slot_one = &self[smallest];
+        let slot_two = &self[largest];
+        let f_list = [S_CLOSED, S_READING, S_WRITING];
+
+        let flag_one = match slot_one.flag.swap_if_not_any(
+            &f_list, 
+            S_CLOSED, 
+            Ordering::Acquire, 
+            Ordering::Relaxed
+        ) {
+            Ok(v) => v,
+            Err(_) => return None,
+        };
+        let flag_two = match slot_two.flag.swap_if_not_any(
+            &f_list, 
+            S_CLOSED, 
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
+            Ok(v) => v,
+            Err(_) => {
+                slot_one.flag.store(flag_one, Ordering::Release);
+                return None
+            },
+        };
+        let data_one = unsafe { &mut *slot_one.data.get() };
+        let data_two = unsafe { &mut *slot_two.data.get() };
+
+        std::mem::swap(data_one, data_two);
+
+        slot_two.flag.store(flag_one, Ordering::Release);
+        slot_one.flag.store(flag_two, Ordering::Release);
+        
+        Some(())
     }
 }
 

@@ -227,7 +227,7 @@ impl<'a, T: Default + Copy, const N: usize> AtomicRingBuffer<T, N> {
                 self.reserved_head.compare_exchange_weak(
                     current_head,
                     next_head,
-                    Ordering::Relaxed,
+                    Ordering::Release,
                     Ordering::Relaxed
                 )
             {
