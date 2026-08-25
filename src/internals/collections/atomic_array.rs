@@ -202,7 +202,7 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
     ///
     /// It either set the first empty slot, or returns a ArrayFull error.
     pub fn push(&self, value: T) -> Result<u32, AtomicArrayErrors> {
-        for idx in 0..N - 1 {
+        for idx in 0..N {
             let slot = &self[idx as u32];
             
             if slot.flag.load(Ordering::Acquire) == S_FREE {
@@ -222,7 +222,7 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
 
     /// Tries to set a slot opportunistically and keep it locked.
     pub fn strict_push<'a>(&'a self, value: T) -> Result<StrictRefMut<'a, T>, AtomicArrayErrors> {
-        for idx in 0..N - 1 {
+        for idx in 0..N {
             let slot: &'a Slot<T> = &self[idx as u32];
             
             if slot.flag.load(Ordering::Acquire) == S_FREE {
@@ -253,7 +253,7 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
     /// This function completelly ignores the state machine and resets the
     /// whole array
     pub fn clear(&self) {
-        for idx in 0..N - 1 {
+        for idx in 0..N {
             let slot = &self[idx as u32];
 
             slot.flag.store(S_FREE, Ordering::Release);
@@ -265,17 +265,26 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
 
     /// removes the last value in the array and return it
     pub fn pop(&self) -> Result<T, AtomicArrayErrors> {
-        for idx in 0..N - 1 {
+        for idx in (0..N).rev() {
             let slot = &self[idx as u32];
 
             if slot.flag.load(Ordering::Acquire) == S_FREE {
-                let prev_slot = &self[idx as u32 - 1];
-                let data = unsafe {&mut *prev_slot.data.get() };
-                if let Some(return_data) = data.take() {
-                    return Ok(return_data);
+                continue;
+            }
+
+            if slot.flag.swap_if(S_OPEN, S_CLOSED, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                let data = unsafe { &mut *slot.data.get() };
+                let val = data.take();
+                
+                slot.flag.store(S_FREE, Ordering::Release);
+
+                if let Some(return_data) = val {
+                    return Ok(return_data)
                 } else {
-                    return Err(AtomicArrayErrors::EmptyIndexError { slot_idx: idx as u32 });
-                };
+                    return Err(AtomicArrayErrors::EmptyIndexError { slot_idx: idx as u32 })
+                }
+            } else {
+                return Err(AtomicArrayErrors::BlockedSlotError { slot_idx: idx as u32 })
             }
         }
 
