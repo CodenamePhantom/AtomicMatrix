@@ -58,6 +58,7 @@ use crate::{
     },
     prelude::*,
 };
+use crate::safe_shm;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 // Internal consts for state and permission control
@@ -152,6 +153,9 @@ pub struct BalancerSectors {
     capacity: u32,
     occupation: u32,
 }
+
+safe_shm!(Fencer);
+safe_shm!(ACL);
 
 impl Fencer {
     /// Spawn a new [`Fencer`] object and returns both the Fencer reference, and
@@ -438,7 +442,7 @@ impl<'a> RouteGuard<'a> {
     /// # Returns
     ///
     /// A result containing either Ok(()), or a [`FencerErrors`]
-    pub fn route_msg<T>(&self, msg: T) -> Result<(), FencerErrors> {
+    pub fn route_msg<T: SafeSHM>(&self, msg: T) -> Result<(), FencerErrors> {
         if !self.check_permissions(PERM_WRITE) {
             return Err(FencerErrors::UnauthorizedWrite);
         };

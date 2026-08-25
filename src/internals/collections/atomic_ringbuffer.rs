@@ -38,7 +38,7 @@
 //! This means that, although you can pass and construct the same ringbuffer all over,
 //! following the correct system utilization is up to you.
 
-use crate::internals::error_collection::BufferErrors;
+use crate::{internals::error_collection::BufferErrors, safe_shm};
 use crate::prelude::*;
 use std::{ sync::atomic::{ AtomicBool, AtomicU32, Ordering }, cell::UnsafeCell };
 
@@ -81,14 +81,16 @@ pub struct AtomicRingBuffer<T, const N: usize> {
     address: u32,
 }
 
+
 // Safety: as the buffer inherits the zero-copy, lock-free traits from
 // the matrix by default, and not allowing direct manipulation through a
 // mut reference, it is safe to be shared across different threads with-
 // out causing race conditions (contentions are still implied).
 unsafe impl<T, const N: usize> Send for AtomicRingBuffer<T, N> {}
 unsafe impl<T, const N: usize> Sync for AtomicRingBuffer<T, N> {}
+unsafe impl<T: SafeSHM, const N: usize> SafeSHM for AtomicRingBuffer<T, N> {}
 
-impl<'a, T: Default + Copy, const N: usize> AtomicRingBuffer<T, N> {
+impl<'a, T: Default + Copy + SafeSHM, const N: usize> AtomicRingBuffer<T, N> {
     /// Internal helper function to move the current pointer forward in
     /// the buffer.
     ///

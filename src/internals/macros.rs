@@ -12,3 +12,13 @@ macro_rules! unwind {
             .map_err(|_| $crate::internals::error_collection::HandlerErrors::PanicRecovery)
     }
 }
+
+#[macro_export]
+macro_rules! safe_shm {
+    ($struct_name:ident < $($g:ident),* >) => {
+        unsafe impl<$($g: SafeSHM),*> SafeSHM for $struct_name<$($g),*> {}
+    };
+    ($struct_name:ident) => {
+        unsafe impl SafeSHM for $struct_name {}
+    };
+}

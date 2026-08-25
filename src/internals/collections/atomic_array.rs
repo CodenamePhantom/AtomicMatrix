@@ -1,5 +1,6 @@
 use crate::internals::error_collection::AtomicArrayErrors;
 use crate::prelude::*;
+use crate::safe_shm;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, Ordering};
 
@@ -27,7 +28,9 @@ pub struct AtomicArray<T, const N: usize> {
     slots: [Slot<T>; N],
 }
 
-impl<T, const N: usize> AtomicArray<T, N> {
+unsafe impl<T: SafeSHM, const N: usize> SafeSHM for AtomicArray<T, N> {}
+
+impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
     pub fn new(handler: &MatrixHandler) -> Option<&Self> {
         let block = handler.allocate::<AtomicArray<T, N>>().ok()?;
 
@@ -277,12 +280,6 @@ impl<T, const N: usize> AtomicArray<T, N> {
         }
 
         return Err(AtomicArrayErrors::ArrayEmpty);
-    }
-
-    /// removes a value from the array and moves all subsequent slots
-    /// backwards.
-    pub fn delete(&self, idx: u32) {
-        unimplemented!()
     }
 
     /// Removes a value from the array without reorganizing slots.

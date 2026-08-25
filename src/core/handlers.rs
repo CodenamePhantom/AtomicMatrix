@@ -341,7 +341,7 @@ pub trait HandlerFunctions {
     ///
     /// # Returns:
     /// A result containing either the block of type T, or a HandlerErros.
-    fn allocate<T>(&self) -> Result<Block<T>, HandlerErrors> {
+    fn allocate<T: SafeSHM>(&self) -> Result<Block<T>, HandlerErrors> {
         let tag = type_tag::make::<T>();
         let size = std::mem::size_of::<T>() as u32;
 

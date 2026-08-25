@@ -25,7 +25,10 @@ pub mod prelude {
         cartographer_builder::*,
     };
     pub use crate::internals::collections::*;
-    pub use crate::helpers::atomic_ext::AtomicExtensions;
-    pub use crate::helpers::type_tag;
-    pub use crate::helpers::type_guard;
+    pub use crate::helpers::{
+        atomic_ext::AtomicExtensions,
+        type_tag,
+        type_guard,
+        safe_shm::SafeSHM,
+    };
 }
