@@ -1,3 +1,5 @@
+use crate::prelude::SafeSHM;
+
 /// Executes a single deref operation over a TypeGuard, casting the panic to a Result if it occurs.
 ///
 /// ### Disclaimer
@@ -13,6 +15,12 @@ macro_rules! unwind {
     }
 }
 
+/// Implements SafeSHM for foreing structs.
+/// 
+/// ### Disclaimer
+/// SafeSHM is a marker trait that tells the compiler the current type is safe to be used inside the 
+/// AtomicMatrix. It can be implemented on heap allocated values like Strings, and Vecs, but these types
+/// are not SHM safe and should not be used. 
 #[macro_export]
 macro_rules! safe_shm {
     ($struct_name:ident < $($g:ident),* >) => {
@@ -22,3 +30,13 @@ macro_rules! safe_shm {
         unsafe impl SafeSHM for $struct_name {}
     };
 }
+
+macro_rules! safe_shm_tuple {
+    () => {};
+    ($first:ident $(, $rest:ident)* $(,)?) => {
+        unsafe impl<$first: SafeSHM, $($rest: SafeSHM),*> SafeSHM for ($first, $($rest),*) {}
+        safe_shm_tuple!($($rest),*);
+    };
+}
+
+safe_shm_tuple!(A, B, C, D, E, F, G, H, I, J, K, L);

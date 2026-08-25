@@ -81,6 +81,7 @@ use atomic_matrix::{
     internals::collections::atomic_ringbuffer::{AtomicRingBuffer, Behaviour},
     prelude::*,
 };
+use atomic_matrix::safe_shm;
 use std::{
     thread, 
     time::{Instant, Duration},
@@ -100,6 +101,8 @@ struct Mesg {
     seq: u32,
     status: AtomicU8,
 }
+
+safe_shm!(Mesg);
 
 /// Sender procedure.
 ///

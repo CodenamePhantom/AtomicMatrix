@@ -38,7 +38,7 @@
 //! This means that, although you can pass and construct the same ringbuffer all over,
 //! following the correct system utilization is up to you.
 
-use crate::{internals::error_collection::BufferErrors, safe_shm};
+use crate::{internals::error_collection::BufferErrors};
 use crate::prelude::*;
 use std::{ sync::atomic::{ AtomicBool, AtomicU32, Ordering }, cell::UnsafeCell };
 

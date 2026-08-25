@@ -2,6 +2,17 @@ use std::cell::{Cell, UnsafeCell};
 use std::marker::PhantomData;
 use std::sync::atomic::*;
 
+/// A marker struct that tells the compiler the implemented type is AtomicMatrix safe.
+/// 
+/// Types that implement this trait are not heap allocated and does not wrap any pointer indirection,
+/// as allocating a value to the matrix casts the value directly into bytes, and doesn't grab any value
+/// from indirect pointer Structs like Strings, Vec, Boxes and others.
+/// 
+/// Most base primitives that come with rust have this trait implemented by default on the crate.
+/// 
+/// ### DISCLAIMER
+/// Callers can implement this trait to whatever types they want, even heap allocated ones. But this
+/// behaviour is not recommended and it **WILL** cause undefined behaviour.
 pub unsafe trait SafeSHM: 'static {}
 
 unsafe impl SafeSHM for u8 {}
