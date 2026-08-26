@@ -31,6 +31,12 @@ macro_rules! safe_shm {
     };
 }
 
+/// Implements SafeSHM for tuples.
+/// 
+/// This allows users to declare tuple allocations on blocks and other matrix native structs like
+/// AtomicArrays, Ringbuffers, and all the others.
+/// 
+/// **This macro is not exported**
 macro_rules! safe_shm_tuple {
     () => {};
     ($first:ident $(, $rest:ident)* $(,)?) => {

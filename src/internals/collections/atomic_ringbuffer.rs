@@ -86,7 +86,7 @@ pub struct AtomicRingBuffer<T, const N: usize> {
 unsafe impl<T, const N: usize> Send for AtomicRingBuffer<T, N> {}
 unsafe impl<T, const N: usize> Sync for AtomicRingBuffer<T, N> {}
 
-impl<'a, T: Default + Copy + SafeSHM, const N: usize> AtomicRingBuffer<T, N> {
+impl<'a, T: Default + SafeSHM, const N: usize> AtomicRingBuffer<T, N> {
     /// Internal helper function to move the current pointer forward in
     /// the buffer.
     ///
