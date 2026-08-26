@@ -1,3 +1,5 @@
+extern crate self as atomic_matrix;
+
 pub mod internals;
 pub mod core;
 pub mod extensive_lib;
@@ -29,6 +31,6 @@ pub mod prelude {
         atomic_ext::AtomicExtensions,
         type_tag,
         type_guard,
-        safe_shm::SafeSHM,
     };
+    pub use atomic_matrix_derive::SafeSHM;
 }

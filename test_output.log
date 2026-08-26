@@ -1,0 +1,171 @@
+   Compiling atomic-matrix v0.4.1 (/mnt/c/Users/VitorFalchi/Documents/AtomicMatrix)
+warning: unused variable: `prev_h`
+  --> src/extensive_lib/looper.rs:77:21
+   |
+77 |                 let prev_h = unsafe { prev_ptr.resolve_header(self.handler_ref.base_ptr()) };
+   |                     ^^^^^^ help: if this is intentional, prefix it with an underscore: `_prev_h`
+   |
+   = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unnecessary `unsafe` block
+   --> src/extensive_lib/looper.rs:141:19
+    |
+141 |         let res = unsafe { self.handler.read(&block).unwrap() };
+    |                   ^^^^^^ unnecessary `unsafe` block
+    |
+    = note: `#[warn(unused_unsafe)]` (part of `#[warn(unused)]`) on by default
+
+warning: type `cartographer::CartographerShm` is more private than the item `cartographer::CartographerConfig::Shm::0`
+  --> src/core/cartographer.rs:43:9
+   |
+43 |     Shm(CartographerShm),
+   |         ^^^^^^^^^^^^^^^ field `cartographer::CartographerConfig::Shm::0` is reachable at visibility `pub`
+   |
+note: but type `cartographer::CartographerShm` is only usable at visibility `pub(crate)`
+  --> src/core/cartographer.rs:56:1
+   |
+56 | pub(crate) struct CartographerShm {
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `CartographerMemFd` is more private than the item `cartographer::CartographerConfig::MemFd::0`
+  --> src/core/cartographer.rs:44:11
+   |
+44 |     MemFd(CartographerMemFd),
+   |           ^^^^^^^^^^^^^^^^^ field `cartographer::CartographerConfig::MemFd::0` is reachable at visibility `pub`
+   |
+note: but type `CartographerMemFd` is only usable at visibility `pub(crate)`
+  --> src/core/cartographer.rs:69:1
+   |
+69 | pub(crate) struct CartographerMemFd {}
+   | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: fields `apparmor_confined` and `selinux` are never read
+  --> src/core/cartographer_builder.rs:37:5
+   |
+29 | pub struct CartographerShmBuilder {
+   |            ---------------------- fields in this struct
+...
+37 |     apparmor_confined: bool,
+   |     ^^^^^^^^^^^^^^^^^
+38 |     selinux: bool,
+   |     ^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: multiple fields are never read
+  --> src/core/cartographer_builder.rs:57:5
+   |
+55 | pub struct CartographerMemFdBuilder {
+   |            ------------------------ fields in this struct
+56 |     // basics
+57 |     size: LinkMethod,
+   |     ^^^^
+58 |     fd: Option<RawFd>,
+   |     ^^
+59 |     fd_broker_addr: String,
+   |     ^^^^^^^^^^^^^^
+60 |     role: ProcessRole,
+   |     ^^^^
+...
+63 |     runtime_protected: bool,
+   |     ^^^^^^^^^^^^^^^^^
+64 |     memfd_secret: bool,
+   |     ^^^^^^^^^^^^
+65 |     memfd_seal_write: bool,
+   |     ^^^^^^^^^^^^^^^^
+...
+68 |     defer: bool,
+   |     ^^^^^
+69 |     before_init: Option<Box<dyn FnOnce(&mut AtomicMatrix) + 'static>>,
+   |     ^^^^^^^^^^^
+70 |     attach_callback: Option<Box<dyn FnOnce() + 'static>>,
+   |     ^^^^^^^^^^^^^^^
+
+warning: field `app_protection_list` is never read
+  --> src/core/cartographer.rs:61:9
+   |
+56 | pub(crate) struct CartographerShm {
+   |                   --------------- field in this struct
+...
+61 |     pub app_protection_list: Vec<String>,
+   |         ^^^^^^^^^^^^^^^^^^^
+
+warning: fields `cap`, `action`, `threshold_spawn`, `threshold_decomission`, and `sectors` are never read
+   --> src/extensive_lib/fencer.rs:145:5
+    |
+144 | pub struct Balancer<T: Fn() -> ()> {
+    |            -------- fields in this struct
+145 |     cap: u32,
+    |     ^^^
+146 |     action: T,
+    |     ^^^^^^
+147 |     threshold_spawn: u32,
+    |     ^^^^^^^^^^^^^^^
+148 |     threshold_decomission: u32,
+    |     ^^^^^^^^^^^^^^^^^^^^^
+149 |     sectors: Vec<BalancerSectors>,
+    |     ^^^^^^^
+
+warning: fields `handler`, `capacity`, and `occupation` are never read
+   --> src/extensive_lib/fencer.rs:153:5
+    |
+152 | pub struct BalancerSectors {
+    |            --------------- fields in this struct
+153 |     handler: MatrixHandler,
+    |     ^^^^^^^
+154 |     capacity: u32,
+    |     ^^^^^^^^
+155 |     occupation: u32,
+    |     ^^^^^^^^^^
+
+warning: associated functions `spawn_balancer` and `decommission_balancer` are never used
+   --> src/extensive_lib/fencer.rs:615:8
+    |
+610 | impl<T: Fn() -> ()> Balancer<T> {
+    | ------------------------------- associated functions in this implementation
+...
+615 |     fn spawn_balancer() {
+    |        ^^^^^^^^^^^^^^
+...
+619 |     fn decommission_balancer() {
+    |        ^^^^^^^^^^^^^^^^^^^^^
+
+warning: `atomic-matrix` (lib) generated 10 warnings (run `cargo fix --lib -p atomic-matrix` to apply 1 suggestion)
+warning: `atomic-matrix` (lib test) generated 10 warnings (10 duplicates)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 7.41s
+     Running unittests src/lib.rs (target/debug/deps/atomic_matrix-4793fdd5a5206383)
+
+running 29 tests
+test core::handlers::tests::test_successful_state_setting ... ok
+test core::handlers::tests::test_successful_state_transition ... ok
+test core::handlers::tests::test_type_mismatch_detection ... ok
+test core::handlers::tests::test_fail_transition_to_reserved_states ... ok
+test core::handlers::tests::test_fail_setting_reserved_state ... ok
+test core::handlers::tests::test_mutref_usability ... ok
+test core::handlers::tests::test_inline_error_recovery ... ok
+test core::handlers::tests::test_typed_block_allocation ... ok
+test core::handlers::tests::test_use_after_free ... ok
+test core::handlers::tests::test_double_free ... ok
+test core::handlers::tests::test_write_if ... ok
+test core::matrix::tests::test_ack_and_coalesce ... ok
+test core::handlers::tests::test_typed_write ... ok
+test core::handlers::tests::test_write_if_fail ... ok
+test core::matrix::tests::test_allocation_and_spliting ... ok
+test core::handlers::tests::test_write_transition ... ok
+test core::handlers::tests::test_write_transition_fail ... ok
+test core::matrix::tests::test_long_term_fragmentation_healing ... ignored
+test core::matrix::tests::test_multithreaded_stress ... ignored
+test core::matrix::tests::test_allocation_size_plus_md_section ... ok
+test core::matrix::tests::test_initial_bootstrap ... ok
+test core::matrix::tests::test_misaligned_header_query ... ok
+test core::matrix::tests::test_mapping ... ok
+test core::matrix::tests::test_invalid_block_query ... ok
+test core::matrix::tests::test_out_of_bounds_query ... ok
+test core::handlers::tests::test_type_guard_panic ... ok
+test core::handlers::tests::test_inline_unwind_during_lock ... ok
+test core::handlers::tests::test_inline_block_writing ... ok
+error: test failed, to rerun pass `--lib`
+
+Caused by:
+  process didn't exit successfully: `/mnt/c/Users/VitorFalchi/Documents/AtomicMatrix/target/debug/deps/atomic_matrix-4793fdd5a5206383` (signal: 11, SIGSEGV: invalid memory reference)

@@ -56,6 +56,7 @@ use crate::{
         collections::atomic_ringbuffer::*,
         error_collection::FencerErrors,
     },
+    helpers::safe_shm::SafeSHM,
     prelude::*,
 };
 use crate::safe_shm;

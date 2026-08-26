@@ -34,6 +34,7 @@
 //! trade off of increased complexity and code surface.
 
 use crate::internals::error_collection::AtomicArrayErrors;
+use crate::helpers::safe_shm::SafeSHM;
 use crate::prelude::*;
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -50,6 +51,7 @@ const S_FREE: u8 = 4;
 /// 
 /// It holds the atomic flag for the current slot as well as the value wrapped in an UnsafeCell.
 /// This allows the value to be initalized as empty safelly for all participants in the array.
+#[derive(SafeSHM)]
 pub struct Slot<T> {
     flag: AtomicU8,
     data: UnsafeCell<Option<T>>,
@@ -69,13 +71,17 @@ pub struct StrictRefMut<'a, T> {
 /// 
 /// It holds an array containing all the slots declared by the user. This declaration is made at
 /// compile time through a generic const value.
+#[derive(SafeSHM)]
 pub struct AtomicArray<T, const N: usize> {
     slots: [Slot<T>; N],
 }
 
-/// Marking the array and its value as safe for the SHM. This blocks the declaration of arrays
-/// containing heap allocated values such as Strings, Vecs, Boxes, and others.
-unsafe impl<T: SafeSHM, const N: usize> SafeSHM for AtomicArray<T, N> {}
+/// SAFETY:
+/// 
+/// Since this struct is merely a static reference to the actual data inside the matrix, sending it
+/// across threads is safe
+unsafe impl<T: SafeSHM, const N: usize> Send for AtomicArray<T, N> {}
+unsafe impl<T: SafeSHM, const N: usize> Sync for AtomicArray<T, N> {}
 
 impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
     /// Allocates a new AtomicArray and return its reference.

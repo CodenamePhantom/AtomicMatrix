@@ -135,65 +135,76 @@ atomic-matrix = { git = "https://github.com/CodenamePhantom/AtomicMatrix" }
 ```rust
 use atomic_matrix::prelude::*;
 
-// Bootstrap a 50MB matrix in /dev/shm
-
-let handler = AtomicMatrix::bootstrap(
-    uid_lite::generate_uuid(), // internal uid generator because i hate have to import UUID to every other project.
-    memory_scale::custom::mb::<50>(), // memory layout creator because i love semantic sugar.
-).unwrap();
-
-// Allocate a u64 block
-
-let mut block = handler.allocate::<u64>().unwrap();
-
-// Write the message. This will dump the bytes regardless of the block state.
-
-unsafe { handler.write(&mut block, 2000).unwrap() };
-
-// You can also safe write using atomic states (States from 0 to 49 are reserved and will fail if tried)
-
-handler.write_if(&mut block, 2000, MyCustomState).unwrap();
-// or
-handler.write_transition(&mut block, 2000, TargetState, MyCustomState, Ordering::Whatever).unwrap();
-
-// Read it back
-
-let data = handler.read_copy(&block).unwrap();
-println!("{data}");
-
-// You can also read type guarded references directly
-
-let rt_ref = handler.read(&block).unwrap() // reference to T
-let rt_mut_ref = handler.read_mut(&block).unwrap() // mutable reference to T
-
-// references can be deref
-
-match unwind!({ *rt_mut_ref = heavy_math_equation(*rt_mut_ref) }) { // unwind! casts panics into a HandlerErrors
-    Ok(_) => {
-        println!("{}", *rt_ref);
-    },
-    Err(_) => {
-        println!("Block deallocated");
-    }
+// You can declare custom memory safe structs using our proc-macro reexported with the crate.
+#[derive(SafeSHM)]
+struct Custom {
+    val1: u32,
+    val2: u64
 }
 
-// You can query a block allocated from different process//thread targeting the offset directly. There will be data structures to share them
-let foreign_block = handler.get_block::<u32>(30035).unwrap(); // it will fail if the offset is not a valid block
+pub fn main() {
+    // Bootstrap a 50MB matrix in /dev/shm
+    let handler = AtomicMatrix::bootstrap(
+        uid_lite::generate_uuid(), // internal uid generator because i hate have to import UUID to every other project.
+        memory_scale::custom::mb::<50>(), // memory layout creator because i love semantic sugar.
+    ).unwrap();
 
-let foreign_ref = handler.read(&foreign_block).unwrap();
+    // Allocate a u64 block
 
-println!("Foreign data: {}", *foreign_ref);
+    let mut block = handler.allocate::<Custom>().unwrap();
 
-// Free it
+    // Write the message. This will dump the bytes regardless of the block state.
+    let custom = Custom { val1: 1000, val2: 2000}
 
-handler.free(block);
+    unsafe { handler.write(&mut block, custom).unwrap() };
 
-// Kill the arena
+    // You can also safe write using atomic states (States from 0 to 49 are reserved and will fail if tried)
 
-unsafe { handler.die().unwrap() }
+    handler.write_if(&mut block, custom, MyCustomState).unwrap();
+    // or
+    handler.write_transition(&mut block, custom, TargetState, MyCustomState, Ordering::Whatever).unwrap();
+
+    // Read it back
+
+    let data = handler.read_copy(&block).unwrap();
+    println!("{data}");
+
+    // You can also read type guarded references directly
+
+    let rt_ref = handler.read(&block).unwrap() // reference to T
+    let rt_mut_ref = handler.read_mut(&block).unwrap() // mutable reference to T
+
+    // references can be deref
+
+    match unwind!({ *rt_mut_ref = heavy_math_equation(*rt_mut_ref) }) { // unwind! casts panics into a HandlerErrors
+        Ok(_) => {
+            println!("{}", *rt_ref);
+        },
+        Err(_) => {
+            println!("Block deallocated");
+        }
+    }
+
+    // You can query a block allocated from different process//thread targeting the offset directly. There will be data structures to share them
+    let foreign_block = handler.get_block::<u32>(30035).unwrap(); // it will fail if the offset is not a valid block
+
+    let foreign_ref = handler.read(&foreign_block).unwrap();
+
+    println!("Foreign data: {}", *foreign_ref);
+
+    // Free it
+
+    handler.free(block);
+
+    // Kill the arena
+
+    unsafe { handler.die().unwrap() }
+}
 ```
 
 Multiple processes can map the same segment by passing the same UUID to `bootstrap`. The init guard ensures only one process performs the initial formatting regardless of how many processes call `bootstrap` simultaneously.
+
+For more information on `SafeSHM` derive macro check its [git repo](https://github.com/CodenamePhantom/AtomicMatrix-Derive)
 
 ## Safety
 

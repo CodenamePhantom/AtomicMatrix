@@ -95,14 +95,13 @@ const SENDER_NUM: u32 = 4;
 const RB_SIZE: usize = 8192;
 
 /// Message struct used for the peer-matching protocol. Status is the atomic handshake checkpoint.
+#[derive(SafeSHM)]
 struct Mesg {
     thread_id: u8,
     num: u16,
     seq: u32,
     status: AtomicU8,
 }
-
-safe_shm!(Mesg);
 
 /// Sender procedure.
 ///

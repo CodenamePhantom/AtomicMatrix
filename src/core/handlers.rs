@@ -67,6 +67,7 @@
 
 use crate::internals::error_collection::HandlerErrors;
 use crate::helpers::type_guard::*;
+use crate::helpers::safe_shm::SafeSHM;
 use crate::prelude::*;
 use crate::unwind;
 use memmap2::MmapMut;
@@ -1435,7 +1436,7 @@ mod tests {
                                     println!("{}", *v);
                                 }
 
-                                thread::sleep(Duration::from_secs(1));
+                                thread::sleep(Duration::from_millis(300));
                             })
                             .is_none()
                     {
@@ -1464,7 +1465,7 @@ mod tests {
         let mut block = handler.allocate::<u32>().unwrap();
         let c_block = handler.get_block::<u32>(block.header_offset()).unwrap();
 
-        thread::spawn(move || {
+        let t_handler = thread::spawn(move || {
             thread::sleep(Duration::from_secs(3));        
             s_handler.inline(&c_block, |_| {
                 thread::sleep(Duration::from_secs(1))
@@ -1489,6 +1490,8 @@ mod tests {
         println!("Final value: {}", *val_ref);
         assert!(got_error);
         assert!(matches!(res, Err(HandlerErrors::ReservedState { state: STATE_LOCK })));
+
+        t_handler.join().unwrap();
 
         unsafe { handler.die().unwrap() }
     }

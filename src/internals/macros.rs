@@ -1,4 +1,4 @@
-use crate::prelude::SafeSHM;
+use crate::helpers::safe_shm::SafeSHM;
 
 /// Executes a single deref operation over a TypeGuard, casting the panic to a Result if it occurs.
 ///
