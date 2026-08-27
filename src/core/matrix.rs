@@ -290,7 +290,7 @@ impl AtomicMatrix {
         size: u32,
     ) -> Result<RelativePtr<u8>, MatrixErrors> {
         let size = (size + 15) & !15;
-        let size = size.max(32);
+        let size = size.max(helpers::HEADER_SPACE);
         let (fl, sl) = helpers::find_indices(size);
 
         for _ in 0..512 {

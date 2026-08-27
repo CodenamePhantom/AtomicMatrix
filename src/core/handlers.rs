@@ -434,7 +434,11 @@ pub trait HandlerFunctions {
                 });
             }
 
-            std::ptr::copy_nonoverlapping(payload, dst, size);
+            std::ptr::copy_nonoverlapping(
+                payload, 
+                dst, 
+                1
+            );
         }
 
         header.last_edit.set_now();
@@ -493,7 +497,11 @@ pub trait HandlerFunctions {
                 });
             }
 
-            std::ptr::copy_nonoverlapping(payload, dst, size);
+            std::ptr::copy_nonoverlapping(
+                payload, 
+                dst, 
+                1
+            );
         }
 
         header.last_edit.set_now();
@@ -558,7 +566,11 @@ pub trait HandlerFunctions {
                 });
             }
 
-            std::ptr::copy_nonoverlapping(payload, dst, size);
+            std::ptr::copy_nonoverlapping(
+                payload, 
+                dst, 
+                1
+            );
         }
 
         header.last_edit.set_now();
@@ -587,7 +599,7 @@ pub trait HandlerFunctions {
     ///
     /// ### Returns:
     /// A result containing either a TypeGuard<T>, or a HandlerErrors.
-    fn read<'a, T>(&self, block: &Block<T>) -> Result<TypeGuard<T>, HandlerErrors> {
+    fn read<T>(&self, block: &Block<T>) -> Result<TypeGuard<T>, HandlerErrors> {
         match self.matrix().checked_query(self.base_ptr(), block.header_offset()) {
             Ok(_) => {}
             Err(_) => {
@@ -1524,7 +1536,7 @@ mod tests {
 
         // The handler free call will not allow freeing this block as it is in STATE_LOCK.
         // We drop to the raw matrix to execute the process.
-        thread::spawn(move || {
+        let t_handler = thread::spawn(move || {
             let header_ptr = RelativePtr::<BlockHeader>::new(offset);
             thread::sleep(Duration::from_secs(1));
             
@@ -1537,6 +1549,75 @@ mod tests {
         });
 
         assert!(res.is_none());
+
+        t_handler.join().unwrap();
+
+        unsafe { handler.die().unwrap() }
+    }
+
+    #[test]
+    fn test_complex_struct_integrity() {
+        use std::sync::atomic::AtomicU16;
+
+        #[derive(SafeSHM, Debug)]
+        struct ComplexStruct {
+            val: u32,
+            another_val: u16,
+            just_one_more: Option<u32>,
+            yet_another_yogurt: AtomicU16, // i use it, btw
+        }
+
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+
+        let mut struct_block = handler.allocate::<ComplexStruct>().unwrap();
+        let mut validation_block = handler.allocate::<u32>().unwrap();
+
+        let s_header = unsafe { struct_block.header() };
+        let struct_ref = handler.read(&struct_block).unwrap();
+        let v_header = unsafe { validation_block.header() };
+
+        println!("Block struct: {:?} | Block val: {:?}", s_header, v_header);
+        println!("Block struct offset: {} | Block val offset: {}", struct_block.tagless_ptr().offset() - HEADER_SPACE, validation_block.tagless_ptr().offset() - HEADER_SPACE);
+
+        let template_struct = ComplexStruct {
+            val: 2000,
+            another_val: 3000,
+            just_one_more: None,
+            yet_another_yogurt: AtomicU16::new(4000),
+        };
+
+        println!("Size of constructed payload: {}", std::mem::size_of_val(&template_struct));
+
+        unsafe { 
+            handler.write(&mut struct_block, template_struct).unwrap(); 
+            println!("Block val after struct write: {:?}", v_header);
+            println!("Block struct value after write: {:?}", *struct_ref);
+            handler.write(&mut validation_block, 0).unwrap();
+        };
+
+        let mut offsets: (u32, u32) = (0, 0);
+        offsets.0 = struct_block.header_offset();
+        offsets.1 = validation_block.header_offset();
+
+        std::thread::scope(|s| {
+            let s_handler = handler.share();
+
+            println!("We got here");
+            s.spawn(move || {
+                let s_block = s_handler.get_block::<ComplexStruct>(offsets.0).unwrap();
+                let mut v_block = s_handler.get_block::<u32>(offsets.1).unwrap();
+                
+                s_handler.inline(&s_block, |v| {
+                    if v.val == 2000 && v.another_val == 3000 && v.just_one_more == None && v.yet_another_yogurt.load(Ordering::Acquire) == 4000 {
+                        unsafe { s_handler.write(&mut v_block, 1).unwrap() };
+                    }
+                });
+            });
+        });
+
+        let validation_ref = handler.read(&validation_block).unwrap();
+
+        assert!(*validation_ref == 1);
 
         unsafe { handler.die().unwrap() }
     }
