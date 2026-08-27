@@ -1570,14 +1570,11 @@ mod tests {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
 
         let mut struct_block = handler.allocate::<ComplexStruct>().unwrap();
-        let mut validation_block = handler.allocate::<u32>().unwrap();
+        let mut validation_block = handler.allocate::<bool>().unwrap();
 
         let s_header = unsafe { struct_block.header() };
         let struct_ref = handler.read(&struct_block).unwrap();
         let v_header = unsafe { validation_block.header() };
-
-        println!("Block struct: {:?} | Block val: {:?}", s_header, v_header);
-        println!("Block struct offset: {} | Block val offset: {}", struct_block.tagless_ptr().offset() - HEADER_SPACE, validation_block.tagless_ptr().offset() - HEADER_SPACE);
 
         let template_struct = ComplexStruct {
             val: 2000,
@@ -1586,13 +1583,9 @@ mod tests {
             yet_another_yogurt: AtomicU16::new(4000),
         };
 
-        println!("Size of constructed payload: {}", std::mem::size_of_val(&template_struct));
-
         unsafe { 
             handler.write(&mut struct_block, template_struct).unwrap(); 
-            println!("Block val after struct write: {:?}", v_header);
-            println!("Block struct value after write: {:?}", *struct_ref);
-            handler.write(&mut validation_block, 0).unwrap();
+            handler.write(&mut validation_block, false).unwrap();
         };
 
         let mut offsets: (u32, u32) = (0, 0);
@@ -1605,11 +1598,15 @@ mod tests {
             println!("We got here");
             s.spawn(move || {
                 let s_block = s_handler.get_block::<ComplexStruct>(offsets.0).unwrap();
-                let mut v_block = s_handler.get_block::<u32>(offsets.1).unwrap();
+                let mut v_block = s_handler.get_block::<bool>(offsets.1).unwrap();
                 
                 s_handler.inline(&s_block, |v| {
-                    if v.val == 2000 && v.another_val == 3000 && v.just_one_more == None && v.yet_another_yogurt.load(Ordering::Acquire) == 4000 {
-                        unsafe { s_handler.write(&mut v_block, 1).unwrap() };
+                    if v.val == 2000 && 
+                        v.another_val == 3000 && 
+                        v.just_one_more == None && 
+                        v.yet_another_yogurt.load(Ordering::Acquire) == 4000 
+                    {
+                        unsafe { s_handler.write(&mut v_block, true).unwrap() };
                     }
                 });
             });
@@ -1617,7 +1614,7 @@ mod tests {
 
         let validation_ref = handler.read(&validation_block).unwrap();
 
-        assert!(*validation_ref == 1);
+        assert!(*validation_ref);
 
         unsafe { handler.die().unwrap() }
     }
