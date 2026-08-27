@@ -33,7 +33,7 @@
 use memmap2::MmapMut;
 use std::fs::OpenOptions;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU32, Ordering, fence};
+use std::sync::atomic::{ AtomicU32, Ordering, fence };
 
 pub mod helpers {
     use super::*;
@@ -50,9 +50,9 @@ pub mod helpers {
     pub const STATE_COALESCING: u32 = 3;
 
     pub const HEADER_SPACE: u32 = std::mem::size_of::<BlockHeader>() as u32;
-    pub const METADATA_SPACE: u32 = (16 + std::mem::size_of::<AtomicMatrix>() as u32 + 15) & !15;
+    pub const METADATA_SPACE: u32 = (16 + (std::mem::size_of::<AtomicMatrix>() as u32) + 15) & !15;
 
-    pub const HEADER_SIGNATURE: u32 = 0xCADAFACE;
+    pub const HEADER_SIGNATURE: u32 = 0xcadaface;
 
     /// Maps a block size to its corresponding (First-Level, Second-Level) indices.
     ///
@@ -198,7 +198,7 @@ impl AtomicMatrix {
                 reason: format!("Failed to create SHM file: {}", e),
             })?;
 
-        let total_size = size + helpers::METADATA_SPACE as usize;
+        let total_size = size + (helpers::METADATA_SPACE as usize);
 
         file.set_len(total_size as u64).map_err(|e| MatrixErrors::MatrixInitializationError {
             reason: format!("Failed to set matrix physical length: {}", e),
@@ -216,14 +216,15 @@ impl AtomicMatrix {
         let matrix_ptr = unsafe { base_ptr.add(16) as *mut AtomicMatrix };
         let current_offset: u32 = helpers::METADATA_SPACE;
 
-        if init_guard
-            .compare_exchange(
-                helpers::SYS_UNINITIALIZED,
-                helpers::SYS_FORMATTING,
-                Ordering::SeqCst,
-                Ordering::Relaxed,
-            )
-            .is_ok()
+        if
+            init_guard
+                .compare_exchange(
+                    helpers::SYS_UNINITIALIZED,
+                    helpers::SYS_FORMATTING,
+                    Ordering::SeqCst,
+                    Ordering::Relaxed
+                )
+                .is_ok()
         {
             let matrix = AtomicMatrix::init(matrix_ptr, total_size as u32);
 
@@ -244,9 +245,7 @@ impl AtomicMatrix {
             header.created_at.set_now();
 
             matrix.insert_free_block(base_ptr, current_offset, fl, sl);
-            matrix
-                .sector_boundaries
-                .store(size as u32, Ordering::Release);
+            matrix.sector_boundaries.store(size as u32, Ordering::Release);
 
             init_guard.store(helpers::SYS_READY, Ordering::SeqCst);
         } else {
@@ -260,12 +259,7 @@ impl AtomicMatrix {
             }
         }
 
-        Ok(MatrixHandler::new(
-            unsafe { &mut *matrix_ptr },
-            mmap,
-            current_offset,
-            path_id,
-        ))
+        Ok(MatrixHandler::new(unsafe { &mut *matrix_ptr }, mmap, current_offset, path_id))
     }
 
     /// Allocates a block in the matrix for the caller
@@ -287,7 +281,7 @@ impl AtomicMatrix {
     pub fn allocate(
         &self,
         base_ptr: *const u8,
-        size: u32,
+        size: u32
     ) -> Result<RelativePtr<u8>, MatrixErrors> {
         let size = (size + 15) & !15;
         let size = size.max(helpers::HEADER_SPACE);
@@ -296,11 +290,10 @@ impl AtomicMatrix {
         for _ in 0..512 {
             if let Some((f_fl, f_sl)) = self.find_suitable_block(fl, sl) {
                 if let Ok(offset) = self.remove_free_block(base_ptr, f_fl, f_sl) {
-                    let header =
-                        unsafe { &mut *(base_ptr.add(offset as usize) as *mut BlockHeader) };
-                    header
-                        .state
-                        .store(helpers::STATE_ALLOCATED, Ordering::Release);
+                    let header = unsafe {
+                        &mut *(base_ptr.add(offset as usize) as *mut BlockHeader)
+                    };
+                    header.state.store(helpers::STATE_ALLOCATED, Ordering::Release);
 
                     let total_size = header.size.load(Ordering::Acquire);
 
@@ -323,9 +316,7 @@ impl AtomicMatrix {
                             next_h.created_at.set_now();
                         }
 
-                        header
-                            .size
-                            .store(size + helpers::HEADER_SPACE, Ordering::Release);
+                        header.size.store(size + helpers::HEADER_SPACE, Ordering::Release);
                         fence(Ordering::SeqCst);
 
                         let (r_fl, r_sl) = helpers::find_indices(rem_size);
@@ -409,24 +400,24 @@ impl AtomicMatrix {
 
         let mut final_offset = current_offset;
 
-        while current_offset > helpers::METADATA_SPACE as u32 {
+        while current_offset > (helpers::METADATA_SPACE as u32) {
             let prev_phys_offset = current_header.prev_phys.load(Ordering::Acquire);
 
             if prev_phys_offset == 0 {
                 break;
             }
 
-            let prev_header_ptr =
-                unsafe { base_ptr.add(prev_phys_offset as usize) as *mut BlockHeader };
+            let prev_header_ptr = unsafe {
+                base_ptr.add(prev_phys_offset as usize) as *mut BlockHeader
+            };
             let prev_header = unsafe { &mut *prev_header_ptr };
 
-            let claimed = prev_header
-                .state
+            let claimed = prev_header.state
                 .swap_if_any(
                     &[STATE_ACKED, STATE_FREE],
                     STATE_COALESCING,
                     Ordering::Acquire,
-                    Ordering::Relaxed,
+                    Ordering::Relaxed
                 )
                 .is_ok();
 
@@ -456,16 +447,15 @@ impl AtomicMatrix {
         let sector_limit = self.sector_end_offset(final_offset);
         if let Some(next_h_offset) = final_offset.checked_add(total_size) {
             if next_h_offset < sector_limit {
-                let next_h =
-                    unsafe { &*(base_ptr.add(next_h_offset as usize) as *const BlockHeader) };
+                let next_h = unsafe {
+                    &*(base_ptr.add(next_h_offset as usize) as *const BlockHeader)
+                };
                 next_h.prev_phys.store(final_offset, Ordering::Release);
             }
         }
 
         current_header.size.store(total_size, Ordering::Release);
-        current_header
-            .state
-            .store(helpers::STATE_FREE, Ordering::Release);
+        current_header.state.store(helpers::STATE_FREE, Ordering::Release);
         current_header.created_at.set_now();
 
         let (fl, sl) = helpers::find_indices(total_size);
@@ -502,7 +492,7 @@ impl AtomicMatrix {
     pub fn checked_query(
         &self,
         base_ptr: *const u8,
-        offset: u32,
+        offset: u32
     ) -> Result<RelativePtr<u8>, MatrixErrors> {
         if offset % 16 != 0 {
             return Err(MatrixErrors::MisalignedHeader);
@@ -515,11 +505,11 @@ impl AtomicMatrix {
         let ptr = RelativePtr::<u8>::new(offset + HEADER_SPACE);
         let header = unsafe { ptr.resolve_header(base_ptr) };
 
-        if header
-            .state
-            .load_if_not_any(&[STATE_COALESCING, STATE_ACKED, STATE_FREE], Ordering::Acquire)
-            .is_err()
-            || header.signature != helpers::HEADER_SIGNATURE
+        if
+            header.state
+                .load_if_not_any(&[STATE_COALESCING, STATE_ACKED, STATE_FREE], Ordering::Acquire)
+                .is_err() ||
+            header.signature != helpers::HEADER_SIGNATURE
         {
             return Err(MatrixErrors::InvalidBlock);
         }
@@ -584,7 +574,7 @@ impl AtomicMatrix {
         &self,
         base_ptr: *const u8,
         fl: u32,
-        sl: u32,
+        sl: u32
     ) -> Result<u32, MatrixErrors> {
         let head = &self.matrix[fl as usize][sl as usize];
         loop {
@@ -593,14 +583,11 @@ impl AtomicMatrix {
                 return Err(MatrixErrors::EmptyBitmapError);
             }
             let next = unsafe {
-                (*(base_ptr.add(off as usize) as *const BlockHeader))
-                    .next_free
-                    .load(Ordering::Acquire)
+                (*(base_ptr.add(off as usize) as *const BlockHeader)).next_free.load(
+                    Ordering::Acquire
+                )
             };
-            if head
-                .compare_exchange(off, next, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
+            if head.compare_exchange(off, next, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                 if next == 0 {
                     self.sl_bitmaps[fl as usize].fetch_and(!(1 << sl), Ordering::Release);
                     if self.sl_bitmaps[fl as usize].load(Ordering::Acquire) == 0 {
@@ -628,10 +615,7 @@ impl AtomicMatrix {
         loop {
             let old = head.load(Ordering::Acquire);
             h.next_free.store(old, Ordering::Release);
-            if head
-                .compare_exchange(old, offset, Ordering::AcqRel, Ordering::Relaxed)
-                .is_ok()
-            {
+            if head.compare_exchange(old, offset, Ordering::AcqRel, Ordering::Relaxed).is_ok() {
                 break;
             }
             std::hint::spin_loop();
@@ -700,8 +684,11 @@ impl<T> RelativePtr<T> {
     /// A life time speficied reference to the header of this block
     pub unsafe fn resolve_header<'a>(&self, base_ptr: *const u8) -> &'a BlockHeader {
         unsafe {
-            &*(base_ptr.add((self.offset as usize) - helpers::HEADER_SPACE as usize)
-                as *mut BlockHeader)
+            &*(
+                base_ptr.add(
+                    (self.offset as usize) - (helpers::HEADER_SPACE as usize)
+                ) as *mut BlockHeader
+            )
         }
     }
 
@@ -717,8 +704,11 @@ impl<T> RelativePtr<T> {
     /// A life time speficied mutable reference to the header of this block
     pub unsafe fn resolve_header_mut<'a>(&self, base_ptr: *const u8) -> &'a mut BlockHeader {
         unsafe {
-            &mut *(base_ptr.add((self.offset as usize) - helpers::HEADER_SPACE as usize)
-                as *mut BlockHeader)
+            &mut *(
+                base_ptr.add(
+                    (self.offset as usize) - (helpers::HEADER_SPACE as usize)
+                ) as *mut BlockHeader
+            )
         }
     }
 
@@ -763,7 +753,7 @@ impl<T> RelativePtr<T> {
 #[cfg(test)]
 mod tests {
     use crate::core::handlers::HandlerFunctions;
-    use crate::core::matrix::{BlockHeader, RelativePtr};
+    use crate::core::matrix::{ BlockHeader, RelativePtr };
     use crate::internals::collections::memory_scale;
 
     use super::*;
@@ -805,17 +795,11 @@ mod tests {
 
             let header = rel_ptr.resolve_header(base_ptr);
 
-            assert_eq!(
-                header.size.load(Ordering::Acquire),
-                64 + helpers::HEADER_SPACE
-            );
-            assert_eq!(
-                header.state.load(Ordering::Acquire),
-                helpers::STATE_ALLOCATED
-            );
+            assert_eq!(header.size.load(Ordering::Acquire), 64 + helpers::HEADER_SPACE);
+            assert_eq!(header.state.load(Ordering::Acquire), helpers::STATE_ALLOCATED);
         }
 
-        unsafe { handler.die().unwrap() };
+        unsafe { handler.die().unwrap() }
     }
 
     /// Test coalesce logic to see if blocks will merge correctly.
@@ -848,16 +832,13 @@ mod tests {
 
             let h_merged = ptr_b.resolve_header(base_ptr);
             assert_eq!(h_merged.state.load(Ordering::Acquire), helpers::STATE_FREE);
-            assert_eq!(
-                h_merged.size.load(Ordering::Acquire),
-                (64 * 3) + (3 * helpers::HEADER_SPACE)
-            );
+            assert_eq!(h_merged.size.load(Ordering::Acquire), 64 * 3 + 3 * helpers::HEADER_SPACE);
 
             let h_e = ptr_e.resolve_header(base_ptr);
             assert_eq!(h_e.state.load(Ordering::Acquire), helpers::STATE_ALLOCATED);
-        };
+        }
 
-        unsafe { handler.die().unwrap() };
+        unsafe { handler.die().unwrap() }
     }
 
     #[test]
@@ -911,7 +892,9 @@ mod tests {
 
         let block = handler.allocate::<u32>().unwrap();
         let header = RelativePtr::<BlockHeader>::new(block.header_offset());
-        unsafe { handler.matrix().fast_ack(&header, handler.base_ptr()) };
+        unsafe {
+            handler.matrix().fast_ack(&header, handler.base_ptr());
+        }
 
         let res_ack = handler.matrix().checked_query(handler.base_ptr(), block.header_offset());
         let state = unsafe { header.resolve(handler.base_ptr()).state.load(Ordering::Relaxed) };
@@ -939,7 +922,7 @@ mod tests {
         // May God help us all at this moment.
 
         use std::collections::HashSet;
-        use std::sync::{Arc, Barrier};
+        use std::sync::{ Arc, Barrier };
         use std::thread;
 
         // We use 62MB matrix to allocate all the buffers
@@ -963,27 +946,33 @@ mod tests {
             let s_handler = handler.share();
             let fail_count_clone = Arc::clone(&fail_count);
 
-            handles.push(thread::spawn(move || {
-                let mut my_offsets = Vec::new();
+            handles.push(
+                thread::spawn(move || {
+                    let mut my_offsets = Vec::new();
 
-                b.wait();
+                    b.wait();
 
-                for _ in 0..allocs_per_second {
-                    for _ in 0..10 {
-                        if let Ok(rel_ptr) = s_handler.matrix().allocate(s_handler.base_ptr(), 64) {
-                            let h = unsafe { rel_ptr.resolve_header(s_handler.base_ptr()) };
-                            us_ref.fetch_add(h.size.load(Ordering::Relaxed), Ordering::Release);
+                    for _ in 0..allocs_per_second {
+                        for _ in 0..10 {
+                            if
+                                let Ok(rel_ptr) = s_handler
+                                    .matrix()
+                                    .allocate(s_handler.base_ptr(), 64)
+                            {
+                                let h = unsafe { rel_ptr.resolve_header(s_handler.base_ptr()) };
+                                us_ref.fetch_add(h.size.load(Ordering::Relaxed), Ordering::Release);
 
-                            my_offsets.push(rel_ptr.offset());
-                            break;
+                                my_offsets.push(rel_ptr.offset());
+                                break;
+                            }
+                            fail_count_clone.fetch_add(1, Ordering::Relaxed);
+                            std::hint::spin_loop();
                         }
-                        fail_count_clone.fetch_add(1, Ordering::Relaxed);
-                        std::hint::spin_loop();
                     }
-                }
 
-                my_offsets
-            }));
+                    my_offsets
+                })
+            );
         }
 
         // Collect everything we did and check
@@ -1020,7 +1009,7 @@ mod tests {
             fail_count.load(Ordering::Relaxed)
         );
 
-        unsafe { handler.die().unwrap() };
+        unsafe { handler.die().unwrap() }
     }
 
     /// Test if the matrix can hold 10 minutes of 8 threads executing random alloc
@@ -1033,9 +1022,9 @@ mod tests {
         //
         // May god help your device at this moment
 
-        use std::sync::{Arc, Barrier};
+        use std::sync::{ Arc, Barrier };
         use std::thread;
-        use std::time::{Duration, Instant};
+        use std::time::{ Duration, Instant };
 
         const DURATION: u32 = 600;
         const THREADS: u32 = 8;
@@ -1053,39 +1042,42 @@ mod tests {
             let h = Arc::clone(&handler_arc);
             let b = Arc::clone(&barrier);
 
-            handles.push(thread::spawn(move || {
-                let base_ptr = h.base_ptr() as *mut u8;
-                let matrix = &h.matrix();
-                let mut my_blocks = Vec::new();
-                let mut rng = t_id + 1;
-                let mut total_ops = 0u64;
+            handles.push(
+                thread::spawn(move || {
+                    let base_ptr = h.base_ptr() as *mut u8;
+                    let matrix = &h.matrix();
+                    let mut my_blocks = Vec::new();
+                    let mut rng = t_id + 1;
+                    let mut total_ops = 0u64;
 
-                b.wait();
+                    b.wait();
 
-                while start_time.elapsed() < duration {
-                    rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
+                    while start_time.elapsed() < duration {
+                        rng = rng.wrapping_mul(1103515245).wrapping_add(12345);
 
-                    if rng % 10 < 7 && my_blocks.len() < 200 {
-                        let alloc_size = rng % 512;
-                        if let Ok(ptr) = matrix.allocate(base_ptr, alloc_size as u32) {
-                            my_blocks.push(ptr);
+                        if rng % 10 < 7 && my_blocks.len() < 200 {
+                            let alloc_size = rng % 512;
+                            if let Ok(ptr) = matrix.allocate(base_ptr, alloc_size as u32) {
+                                my_blocks.push(ptr);
+                            }
+                        } else if !my_blocks.is_empty() {
+                            let idx = (rng as usize) % my_blocks.len();
+                            let ptr = my_blocks.swap_remove(idx);
+
+                            let header_ptr = RelativePtr::<BlockHeader>::new(
+                                ptr.offset() - helpers::HEADER_SPACE
+                            );
+                            matrix.ack(&header_ptr, base_ptr);
+
+                            if total_ops % 5 == 0 {
+                                matrix.coalesce(&header_ptr, base_ptr);
+                            }
                         }
-                    } else if !my_blocks.is_empty() {
-                        let idx = (rng as usize) % my_blocks.len();
-                        let ptr = my_blocks.swap_remove(idx);
-
-                        let header_ptr =
-                            RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
-                        matrix.ack(&header_ptr, base_ptr);
-
-                        if total_ops % 5 == 0 {
-                            matrix.coalesce(&header_ptr, base_ptr);
-                        }
+                        total_ops += 1;
                     }
-                    total_ops += 1;
-                }
-                (my_blocks, total_ops)
-            }));
+                    (my_blocks, total_ops)
+                })
+            );
         }
 
         let mut total_work = 0u64;
@@ -1095,8 +1087,9 @@ mod tests {
             let base_ptr = handler_arc.base_ptr() as *mut u8;
 
             for ptr in remaining {
-                let header_ptr =
-                    RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
+                let header_ptr = RelativePtr::<BlockHeader>::new(
+                    ptr.offset() - helpers::HEADER_SPACE
+                );
                 handler_arc.matrix().ack(&header_ptr, base_ptr);
                 handler_arc.matrix().coalesce(&header_ptr, base_ptr);
             }
@@ -1117,16 +1110,13 @@ mod tests {
         println!("Endurance Results (Duration of {} seconds)", DURATION);
         println!("Num of threads: {}", THREADS);
         println!("Total operations: {}", total_work);
-        println!(
-            "Throughput: {:.2} Mop/s",
-            (total_work as f64) / (DURATION as f64) / 1_000_000.0
-        );
+        println!("Throughput: {:.2} Mop/s", (total_work as f64) / (DURATION as f64) / 1_000_000.0);
         println!("Final free fragments: {}", free_count);
         println!("Entrophy percentage: {}%", entrophy_percentage);
 
         assert!(entrophy_percentage < 0.001, "Excessive Fragmentation");
         assert!(mops > 1.0, "Throughput regression: {:.2} Mop/s", mops);
 
-        unsafe { handler_arc.die().unwrap() };
+        unsafe { handler_arc.die().unwrap() }
     }
 }

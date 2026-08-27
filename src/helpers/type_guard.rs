@@ -3,29 +3,29 @@ use std::sync::atomic::Ordering;
 use std::panic::UnwindSafe;
 
 /// Runtime safe type wrapper for deref a matrix value reference.
-/// 
+///
 /// It holds no direct reference to the value other than its type, opting instead, for calculating
-/// and validating its existance every time it is dereferenced. This approach trades runtime UB 
+/// and validating its existance every time it is dereferenced. This approach trades runtime UB
 /// events for deterministic panics and errors that can be treated locally.
 #[derive(Debug)]
 pub struct TypeGuard<T> {
     val_offset: u32,
     offset: u32,
     base_ptr: *const u8,
-    _marker: std::marker::PhantomData<*const T>
+    _marker: std::marker::PhantomData<*const T>,
 }
 
 /// Runtime safe type wrapper for deref a matrix mutable value reference.
-/// 
+///
 /// It holds no direct reference to the value other than its type, opting instead, for calculating
-/// and validating its existance every time it is dereferenced. This approach trades runtime UB 
+/// and validating its existance every time it is dereferenced. This approach trades runtime UB
 /// events for deterministic panics and errors that can be treated locally.
 #[derive(Debug)]
 pub struct TypeGuardMut<T> {
     val_offset: u32,
     offset: u32,
     base_ptr: *const u8,
-    _marker: std::marker::PhantomData<*const T>
+    _marker: std::marker::PhantomData<*const T>,
 }
 
 impl<T> TypeGuard<T> {
@@ -37,9 +37,15 @@ impl<T> TypeGuard<T> {
         let header_ptr = unsafe { self.base_ptr.add(self.offset as usize) as *const BlockHeader };
         let header = unsafe { header_ptr.as_ref()? };
 
-        if header.signature != HEADER_SIGNATURE { return None };
-        if header.state.load_if_any(&[STATE_ACKED, STATE_FREE, STATE_COALESCING], Ordering::Acquire).is_ok() {
-            return None
+        if header.signature != HEADER_SIGNATURE {
+            return None;
+        }
+        if
+            header.state
+                .load_if_any(&[STATE_ACKED, STATE_FREE, STATE_COALESCING], Ordering::Acquire)
+                .is_ok()
+        {
+            return None;
         }
 
         Some(header)
@@ -55,12 +61,12 @@ impl<T> TypeGuard<T> {
     /// ### Returns:
     /// An instance of Self.
     pub(crate) fn new(val_offset: u32, offset: u32, base_ptr: *const u8) -> Self {
-         Self {
+        Self {
             val_offset,
             offset,
             base_ptr,
-            _marker: std::marker::PhantomData
-         }
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// Validates the header of the current data coordinates and returns a reference to the data
@@ -84,8 +90,7 @@ impl<T> std::ops::Deref for TypeGuard<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.try_get()
-            .expect("TypeGuard: access to invalidated, freed, or corrupted block")
+        self.try_get().expect("TypeGuard: access to invalidated, freed, or corrupted block")
     }
 }
 
@@ -98,9 +103,15 @@ impl<T> TypeGuardMut<T> {
         let header_ptr = unsafe { self.base_ptr.add(self.offset as usize) as *const BlockHeader };
         let header = unsafe { header_ptr.as_ref()? };
 
-        if header.signature != HEADER_SIGNATURE { return None };
-        if header.state.load_if_any(&[STATE_ACKED, STATE_FREE, STATE_COALESCING], Ordering::Acquire).is_ok() {
-            return None
+        if header.signature != HEADER_SIGNATURE {
+            return None;
+        }
+        if
+            header.state
+                .load_if_any(&[STATE_ACKED, STATE_FREE, STATE_COALESCING], Ordering::Acquire)
+                .is_ok()
+        {
+            return None;
         }
 
         Some(header)
@@ -116,12 +127,12 @@ impl<T> TypeGuardMut<T> {
     /// ### Returns:
     /// An instance of Self.
     pub(crate) fn new(val_offset: u32, offset: u32, base_ptr: *const u8) -> Self {
-         Self {
+        Self {
             val_offset,
             offset,
             base_ptr,
-            _marker: std::marker::PhantomData
-         }
+            _marker: std::marker::PhantomData,
+        }
     }
 
     /// Validates the header of the current data coordinates and returns a reference to the data
@@ -138,7 +149,7 @@ impl<T> TypeGuardMut<T> {
         }
     }
 
-    /// Validates the header of the current data coordinates and returns a mutable reference to the 
+    /// Validates the header of the current data coordinates and returns a mutable reference to the
     /// data inside the matrix.
     ///
     /// ### Returns:
@@ -159,17 +170,15 @@ impl<T> std::ops::Deref for TypeGuardMut<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.try_get()
-            .expect("TypeGuard: access to invalidated, freed, or corrupted block")
+        self.try_get().expect("TypeGuard: access to invalidated, freed, or corrupted block")
     }
 }
 
-/// Derefing this struct will run `try_get()` in the coordinates to fetch the mutable reference. 
+/// Derefing this struct will run `try_get()` in the coordinates to fetch the mutable reference.
 /// Panic if fails.
 impl<T> std::ops::DerefMut for TypeGuardMut<T> {
     fn deref_mut(&mut self) -> &mut T {
-        self.try_get_mut()
-                .expect("TypeGuard: access to invalidated, freed, or corrupted block")
+        self.try_get_mut().expect("TypeGuard: access to invalidated, freed, or corrupted block")
     }
 }
 

@@ -149,34 +149,29 @@ pub fn main() {
         memory_scale::custom::mb::<50>(), // memory layout creator because i love semantic sugar.
     ).unwrap();
 
-    // Allocate a u64 block
-
+    // Allocate the Custom struct
     let mut block = handler.allocate::<Custom>().unwrap();
 
     // Write the message. This will dump the bytes regardless of the block state.
-    let custom = Custom { val1: 1000, val2: 2000}
+    let custom = Custom { val1: 1000, val2: 2000 };
 
     unsafe { handler.write(&mut block, custom).unwrap() };
 
     // You can also safe write using atomic states (States from 0 to 49 are reserved and will fail if tried)
-
-    handler.write_if(&mut block, custom, MyCustomState).unwrap();
+    handler.write_if(&mut block, custom, TargetState).unwrap();
     // or
     handler.write_transition(&mut block, custom, TargetState, MyCustomState, Ordering::Whatever).unwrap();
 
     // Read it back
-
     let data = handler.read_copy(&block).unwrap();
     println!("{data}");
 
     // You can also read type guarded references directly
-
     let rt_ref = handler.read(&block).unwrap() // reference to T
     let rt_mut_ref = handler.read_mut(&block).unwrap() // mutable reference to T
 
     // references can be deref
-
-    match unwind!({ *rt_mut_ref = heavy_math_equation(*rt_mut_ref) }) { // unwind! casts panics into a HandlerErrors
+    match unwind!({ rt_mut_ref = heavy_math_equation(rt_ref) }) { // unwind! casts panics into a HandlerErrors
         Ok(_) => {
             println!("{}", *rt_ref);
         },
@@ -185,7 +180,8 @@ pub fn main() {
         }
     }
 
-    // You can query a block allocated from different process//thread targeting the offset directly. There will be data structures to share them
+    // You can query a block allocated from different process thread targeting the offset directly. 
+    // There will be data structures to share them
     let foreign_block = handler.get_block::<u32>(30035).unwrap(); // it will fail if the offset is not a valid block
 
     let foreign_ref = handler.read(&foreign_block).unwrap();
@@ -193,11 +189,9 @@ pub fn main() {
     println!("Foreign data: {}", *foreign_ref);
 
     // Free it
-
     handler.free(block);
 
     // Kill the arena
-
     unsafe { handler.die().unwrap() }
 }
 ```

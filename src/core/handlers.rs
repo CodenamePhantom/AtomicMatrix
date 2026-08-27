@@ -434,11 +434,7 @@ pub trait HandlerFunctions {
                 });
             }
 
-            std::ptr::copy_nonoverlapping(
-                payload, 
-                dst, 
-                1
-            );
+            std::ptr::copy_nonoverlapping(payload, dst, 1);
         }
 
         header.last_edit.set_now();
@@ -497,11 +493,7 @@ pub trait HandlerFunctions {
                 });
             }
 
-            std::ptr::copy_nonoverlapping(
-                payload, 
-                dst, 
-                1
-            );
+            std::ptr::copy_nonoverlapping(payload, dst, 1);
         }
 
         header.last_edit.set_now();
@@ -566,11 +558,7 @@ pub trait HandlerFunctions {
                 });
             }
 
-            std::ptr::copy_nonoverlapping(
-                payload, 
-                dst, 
-                1
-            );
+            std::ptr::copy_nonoverlapping(payload, dst, 1);
         }
 
         header.last_edit.set_now();
@@ -700,15 +688,15 @@ pub trait HandlerFunctions {
     /// This function ensures an exclusive read operation on the block data inside the MatrixHandler
     /// contract, as it transitions the block to STATE_LOCK, and every participant that adheres to
     /// the handler API respect the block present state.
-    /// 
-    /// If a call stumbles upon a STATE_LOCK block, it will retry to acquire exclusivity 512 times 
+    ///
+    /// If a call stumbles upon a STATE_LOCK block, it will retry to acquire exclusivity 512 times
     /// before returning None
     ///
     /// ### Warning
     ///
     /// If a participant crashes holding this block inline ref, the segment will stale inside
     /// STATE_LOCK unless some action is taken. Callers are required to manage their own block
-    /// recovery logic, as blocks can still have their state transitioned manually even when set 
+    /// recovery logic, as blocks can still have their state transitioned manually even when set
     /// to LOCK
     ///
     /// ### Params:
@@ -728,7 +716,9 @@ pub trait HandlerFunctions {
 
             if curr_state == STATE_LOCK {
                 retry_count += 1;
-                if retry_count >= 512 { return None };
+                if retry_count >= 512 {
+                    return None;
+                }
                 continue;
             }
 
@@ -749,13 +739,13 @@ pub trait HandlerFunctions {
                     exec_res.ok()?;
 
                     break;
-                },
+                }
                 Err(_) => {
                     retry_count += 1;
                     if retry_count >= 512 {
-                        return None
+                        return None;
                     } else {
-                        continue
+                        continue;
                     }
                 }
             }
@@ -770,15 +760,15 @@ pub trait HandlerFunctions {
     /// This function ensures an exclusive read/write operation on the block data inside the
     /// MatrixHandler contract, as it transitions the block to STATE_LOCK, and every participant that
     /// adheres to the handler API respect the block present state.
-    /// 
-    /// If a call stumbles upon a STATE_LOCK block, it will retry to acquire exclusivity 512 times 
+    ///
+    /// If a call stumbles upon a STATE_LOCK block, it will retry to acquire exclusivity 512 times
     /// before returning None
     ///
     /// ### Warning
     ///
     /// If a participant crashes holding this block inline ref, the segment will stale inside
     /// STATE_LOCK unless some action is taken. Callers are required to manage their own block
-    /// recovery logic, as blocks can still have their state transitioned manually even when set 
+    /// recovery logic, as blocks can still have their state transitioned manually even when set
     /// to LOCK
     ///
     /// ### Params:
@@ -794,13 +784,15 @@ pub trait HandlerFunctions {
         self.matrix().checked_query(self.base_ptr(), block.header_offset()).ok()?;
 
         let header = unsafe { block.header() };
-            
+
         loop {
             let curr_state = header.state.load(Ordering::Acquire);
 
             if curr_state == STATE_LOCK {
                 retry_count += 1;
-                if retry_count >= 512 { return None };
+                if retry_count >= 512 {
+                    return None;
+                }
                 continue;
             }
 
@@ -821,13 +813,15 @@ pub trait HandlerFunctions {
                     exec_res.ok()?;
 
                     break;
-                },
+                }
                 Err(_) => {
                     retry_count += 1;
-                    if retry_count >= 512 { return None };
+                    if retry_count >= 512 {
+                        return None;
+                    }
                     continue;
                 }
-            }        
+            }
         }
 
         return Some(());
@@ -1172,7 +1166,7 @@ mod tests {
 
         unsafe { handler.die().unwrap() }
     }
-    
+
     /// Test if write_if fails the write with the wrong state value
     #[test]
     fn test_write_if_fail() {
@@ -1478,10 +1472,8 @@ mod tests {
         let c_block = handler.get_block::<u32>(block.header_offset()).unwrap();
 
         let t_handler = thread::spawn(move || {
-            thread::sleep(Duration::from_secs(3));        
-            s_handler.inline(&c_block, |_| {
-                thread::sleep(Duration::from_secs(1))
-            });
+            thread::sleep(Duration::from_secs(3));
+            s_handler.inline(&c_block, |_| { thread::sleep(Duration::from_secs(1)) });
         });
 
         let val_ref = handler.read(&block).unwrap();
@@ -1489,14 +1481,14 @@ mod tests {
         let mut res;
 
         loop {
-            res = handler.write_if(&mut block, *val_ref + 10, STATE_ALLOCATED); 
+            res = handler.write_if(&mut block, *val_ref + 10, STATE_ALLOCATED);
             if res.is_ok() {
                 continue;
             } else {
                 break;
             }
         }
-        
+
         got_error = true;
 
         println!("Final value: {}", *val_ref);
@@ -1516,12 +1508,15 @@ mod tests {
 
         handler.free(free_block).unwrap();
 
-        let res = handler.inline(&block, |_| {
-            // some very important code that will fail.
-        });
+        let res = handler.inline(
+            &block,
+            |_| {
+                // some very important code that will fail.
+            }
+        );
 
         assert!(res.is_none());
-        
+
         unsafe { handler.die().unwrap() }
     }
 
@@ -1539,7 +1534,7 @@ mod tests {
         let t_handler = thread::spawn(move || {
             let header_ptr = RelativePtr::<BlockHeader>::new(offset);
             thread::sleep(Duration::from_secs(1));
-            
+
             s_handler.matrix().ack(&header_ptr, s_handler.base_ptr());
         });
 
@@ -1559,7 +1554,7 @@ mod tests {
     fn test_complex_struct_integrity() {
         use std::sync::atomic::AtomicU16;
 
-        #[derive(SafeSHM, Debug)]
+        #[derive(SafeSHM)]
         struct ComplexStruct {
             val: u32,
             another_val: u16,
@@ -1572,10 +1567,6 @@ mod tests {
         let mut struct_block = handler.allocate::<ComplexStruct>().unwrap();
         let mut validation_block = handler.allocate::<bool>().unwrap();
 
-        let s_header = unsafe { struct_block.header() };
-        let struct_ref = handler.read(&struct_block).unwrap();
-        let v_header = unsafe { validation_block.header() };
-
         let template_struct = ComplexStruct {
             val: 2000,
             another_val: 3000,
@@ -1583,10 +1574,10 @@ mod tests {
             yet_another_yogurt: AtomicU16::new(4000),
         };
 
-        unsafe { 
-            handler.write(&mut struct_block, template_struct).unwrap(); 
+        unsafe {
+            handler.write(&mut struct_block, template_struct).unwrap();
             handler.write(&mut validation_block, false).unwrap();
-        };
+        }
 
         let mut offsets: (u32, u32) = (0, 0);
         offsets.0 = struct_block.header_offset();
@@ -1595,18 +1586,18 @@ mod tests {
         std::thread::scope(|s| {
             let s_handler = handler.share();
 
-            println!("We got here");
             s.spawn(move || {
                 let s_block = s_handler.get_block::<ComplexStruct>(offsets.0).unwrap();
                 let mut v_block = s_handler.get_block::<bool>(offsets.1).unwrap();
-                
+
                 s_handler.inline(&s_block, |v| {
-                    if v.val == 2000 && 
-                        v.another_val == 3000 && 
-                        v.just_one_more == None && 
-                        v.yet_another_yogurt.load(Ordering::Acquire) == 4000 
+                    if
+                        v.val == 2000 &&
+                        v.another_val == 3000 &&
+                        v.just_one_more == None &&
+                        v.yet_another_yogurt.load(Ordering::Acquire) == 4000
                     {
-                        unsafe { s_handler.write(&mut v_block, true).unwrap() };
+                        unsafe { s_handler.write(&mut v_block, true).unwrap() }
                     }
                 });
             });

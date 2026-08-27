@@ -9,7 +9,7 @@ use std::any::type_name;
 
 /// Generate a new type_tag in u32 format from the type passed to this function.
 ///
-/// The type is extracted using [`type_name`] then run through rust internal hash_map module 
+/// The type is extracted using [`type_name`] then run through rust internal hash_map module
 /// [`DefaultHasher`]. The value is then returned as an u32.
 ///
 /// ### Params:
@@ -19,7 +19,7 @@ use std::any::type_name;
 /// The hashed type name in u32 format.
 pub fn make<T>() -> u32 {
     let name = type_name::<T>();
-    return fnv1a_32(name.as_bytes())
+    return fnv1a_32(name.as_bytes());
 }
 
 /// Compares the passed type to the type tag inside the provided block.

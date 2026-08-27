@@ -16,7 +16,7 @@ const fn custom(amount: usize, scale: MemoryScale) -> usize {
 
 /// Size Two scaling for memory layout.
 pub mod two {
-    use super::{MemoryScale, custom};
+    use super::{ MemoryScale, custom };
 
     pub const B: usize = custom(2, MemoryScale::B);
     pub const KB: usize = custom(2, MemoryScale::KiB);
@@ -26,7 +26,7 @@ pub mod two {
 
 /// Size Four scaling for memory layout.
 pub mod four {
-    use super::{MemoryScale, custom};
+    use super::{ MemoryScale, custom };
 
     pub const B: usize = custom(4, MemoryScale::B);
     pub const KB: usize = custom(4, MemoryScale::KiB);
@@ -36,7 +36,7 @@ pub mod four {
 
 /// Size Eight scaling for memory layout.
 pub mod eight {
-    use super::{MemoryScale, custom};
+    use super::{ MemoryScale, custom };
 
     pub const B: usize = custom(8, MemoryScale::B);
     pub const KB: usize = custom(8, MemoryScale::KiB);
@@ -46,7 +46,7 @@ pub mod eight {
 
 /// Size Sixteen scaling for memory layout.
 pub mod sixteen {
-    use super::{MemoryScale, custom};
+    use super::{ MemoryScale, custom };
 
     pub const B: usize = custom(16, MemoryScale::B);
     pub const KB: usize = custom(16, MemoryScale::KiB);
@@ -61,7 +61,7 @@ pub mod sixteen {
 /// let size = memory_scale::custom::mb::<353>();
 /// let handler = AtomicMatrix::bootstrap(None, size).unwrap();
 pub mod custom {
-    use super::{MemoryScale, custom};
+    use super::{ MemoryScale, custom };
 
     pub const fn b<const VAL: usize>() -> usize {
         custom(VAL, MemoryScale::B)
@@ -76,4 +76,3 @@ pub mod custom {
         custom(VAL, MemoryScale::GiB)
     }
 }
-

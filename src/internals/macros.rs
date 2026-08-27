@@ -12,15 +12,15 @@ macro_rules! unwind {
     ($expr:expr) => {
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| $expr))
             .map_err(|_| $crate::internals::error_collection::HandlerErrors::PanicRecovery)
-    }
+    };
 }
 
 /// Implements SafeSHM for foreing structs.
-/// 
+///
 /// ### Disclaimer
-/// SafeSHM is a marker trait that tells the compiler the current type is safe to be used inside the 
+/// SafeSHM is a marker trait that tells the compiler the current type is safe to be used inside the
 /// AtomicMatrix. It can be implemented on heap allocated values like Strings, and Vecs, but these types
-/// are not SHM safe and should not be used. 
+/// are not SHM safe and should not be used.
 #[macro_export]
 macro_rules! safe_shm {
     ($struct_name:ident < $($g:ident),* >) => {
@@ -32,10 +32,10 @@ macro_rules! safe_shm {
 }
 
 /// Implements SafeSHM for tuples.
-/// 
+///
 /// This allows users to declare tuple allocations on blocks and other matrix native structs like
 /// AtomicArrays, Ringbuffers, and all the others.
-/// 
+///
 /// **This macro is not exported**
 macro_rules! safe_shm_tuple {
     () => {};

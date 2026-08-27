@@ -19,18 +19,11 @@ pub mod helpers;
 pub mod prelude {
     pub use crate::core::{
         handlers::*,
-        matrix::{
-            *,
-            helpers::*,
-        },
+        matrix::{ *, helpers::* },
         cartographer::*,
         cartographer_builder::*,
     };
     pub use crate::internals::collections::*;
-    pub use crate::helpers::{
-        atomic_ext::AtomicExtensions,
-        type_tag,
-        type_guard,
-    };
+    pub use crate::helpers::{ atomic_ext::AtomicExtensions, type_tag, type_guard };
     pub use atomic_matrix_derive::SafeSHM;
 }

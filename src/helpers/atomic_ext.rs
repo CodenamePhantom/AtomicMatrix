@@ -29,7 +29,7 @@ pub trait AtomicExtensions {
         forbidden: Self::Value,
         new_value: Self::Value,
         success_ordering: Ordering,
-        fail_ordering: Ordering,
+        fail_ordering: Ordering
     ) -> Result<Self::Value, Self::Value>;
 
     /// Swaps the value if its equal to the provided target value.
@@ -51,7 +51,7 @@ pub trait AtomicExtensions {
         target: Self::Value,
         new_value: Self::Value,
         success_ordering: Ordering,
-        fail_ordering: Ordering,
+        fail_ordering: Ordering
     ) -> Result<Self::Value, Self::Value>;
 
     /// Swaps the value if it is not contained inside a provided list of forbidden values.
@@ -73,7 +73,7 @@ pub trait AtomicExtensions {
         forbidden_list: &[Self::Value],
         new_value: Self::Value,
         success_ordering: Ordering,
-        fail_ordering: Ordering,
+        fail_ordering: Ordering
     ) -> Result<Self::Value, Self::Value>;
 
     /// Swaps the value if it exists inside a provided list of targeted values.
@@ -92,7 +92,7 @@ pub trait AtomicExtensions {
         target_list: &[Self::Value],
         new_value: Self::Value,
         success_ordering: Ordering,
-        fail_ordering: Ordering,
+        fail_ordering: Ordering
     ) -> Result<Self::Value, Self::Value>;
 
     /// Stores the value if its not equal the provided forbidden value.
@@ -114,7 +114,7 @@ pub trait AtomicExtensions {
         forbidden: Self::Value,
         new_value: Self::Value,
         success_ordering: Ordering,
-        fail_ordering: Ordering,
+        fail_ordering: Ordering
     ) -> bool;
 
     /// Stores the value if its equal to the provided target value.
@@ -136,7 +136,7 @@ pub trait AtomicExtensions {
         target: Self::Value,
         new_value: Self::Value,
         success_ordering: Ordering,
-        fail_ordering: Ordering,
+        fail_ordering: Ordering
     ) -> bool;
 
     /// Stores the value if it is not contained inside a provided list of forbidden values.
@@ -158,7 +158,7 @@ pub trait AtomicExtensions {
         forbidden_list: &[Self::Value],
         new_value: Self::Value,
         success_ordering: Ordering,
-        fail_ordering: Ordering,
+        fail_ordering: Ordering
     ) -> bool;
 
     /// Stores the value if it exists inside a provided list of target values.
@@ -180,7 +180,7 @@ pub trait AtomicExtensions {
         target_list: &[Self::Value],
         new_value: Self::Value,
         success_ordering: Ordering,
-        fail_ordering: Ordering,
+        fail_ordering: Ordering
     ) -> bool;
 
     /// Loads the value if its not equal to the provided forbidden value.
@@ -223,7 +223,7 @@ pub trait AtomicExtensions {
     fn load_if_not_any(
         &self,
         forbidden_list: &[Self::Value],
-        ordering: Ordering,
+        ordering: Ordering
     ) -> Result<Self::Value, ()>;
 
     /// Loads a value if it is present inside a provided list of target values.
@@ -240,7 +240,7 @@ pub trait AtomicExtensions {
     fn load_if_any(
         &self,
         target_list: &[Self::Value],
-        ordering: Ordering,
+        ordering: Ordering
     ) -> Result<Self::Value, ()>;
 }
 
