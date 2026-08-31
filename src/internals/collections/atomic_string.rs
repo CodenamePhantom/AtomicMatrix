@@ -3,10 +3,10 @@
 //! the next 255 char block on the chain.
 //!
 //! Strings that are written will be broken down to the char array and casted into this block. If
-//! your string surpasses 255 chars, a new block with state STRING_CHAIN will be allocated for the
-//! exact size of the overflow, and the offset to this spill block will be appended into the u32
-//! pointer. If the string does not overflow, the whole data will be written into this single block
-//! and the pointer will remain at zero.
+//! your string surpasses 255 chars, a new block with state STRING_CHAIN will be allocated with more
+//! 255 slots to allocate the overflow, and the offset to this spill block will be appended into the 
+//! u32 pointer. If the string does not overflow, the whole data will be written into this single 
+//! block and the pointer will remain at zero.
 //!
 //! ### Runtime mutability.
 //!
@@ -32,14 +32,13 @@
 //!                     ... Up to N overflowned blocks.
 //! 
 //! The first AtomicString block works as the head for the segment and is never deallocated.
-//! Strings that overflow are broken down into 255 chunks and allocated into a chain of blocks.
 //!
 //! ### Safety
 //!
 //! AtomicStrings are synchronized internally and follow the RwLock philosophy where everyone can
 //! read at any time, but only one process/thread can write at any given time. Therefore, they are
 //! not considered trully lock-free in the general sense, but they will also not spin lock your
-//! process/thread uppon trying to manipulate it, returning an error instead of locking.
+//! process/thread uppon trying to manipulate it, returning None instead of locking.
 
 use std::{ array, sync::atomic::{ AtomicU8, AtomicU32, AtomicUsize, Ordering } };
 use crate::{ helpers::type_guard::TypeGuardMut, prelude::* };
@@ -101,8 +100,8 @@ impl AtomicString {
         s_handler: SharedHandler,
         value: String,
         agreement: Option<u32>
-    ) -> &'static AtomicString {
-        let mut as_block = s_handler.allocate::<AtomicString>().unwrap();
+    ) -> Option<&'static AtomicString> {
+        let mut as_block = s_handler.allocate::<AtomicString>().ok()?;
         let mut prev: Option<Block<StringChain>> = None;
         let mut is_head = true;
         let mut chars = value.chars().peekable();
@@ -136,7 +135,7 @@ impl AtomicString {
                         STATE_STRING,
                         Ordering::Release
                     )
-                    .unwrap();
+                    .ok()?;
 
                 is_head = false;
             } else {
@@ -144,13 +143,13 @@ impl AtomicString {
                     str: char_arr,
                     next_overflow: AtomicU32::new(0),
                 };
-                let mut chain_block = s_handler.allocate::<StringChain>().unwrap();
+                let mut chain_block = s_handler.allocate::<StringChain>().ok()?;
 
                 if let Some(ref mut previous) = prev {
-                    let prev_ref = s_handler.read_mut(previous).unwrap();
+                    let prev_ref = s_handler.read_mut(previous).ok()?;
                     prev_ref.next_overflow.store(chain_block.header_offset(), Ordering::Release);
                 } else {
-                    let as_ref = s_handler.read_mut::<AtomicString>(&mut as_block).unwrap();
+                    let as_ref = s_handler.read_mut::<AtomicString>(&mut as_block).ok()?;
                     as_ref.next_overflow.store(chain_block.header_offset(), Ordering::Release);
                 }
 
@@ -162,7 +161,7 @@ impl AtomicString {
                         STRING_CHAIN,
                         Ordering::Release
                     )
-                    .unwrap();
+                    .ok()?;
 
                 prev = Some(chain_block);
             }
@@ -172,10 +171,10 @@ impl AtomicString {
             }
         }
 
-        let str_guard = s_handler.read(&as_block).unwrap();
+        let str_guard = s_handler.read(&as_block).ok()?;
         let str: &Self = unsafe { &*(&*str_guard as *const Self) };
 
-        return str;
+        return Some(str);
     }
 
     /// Writes a new String into the AtomicString segment.
@@ -216,15 +215,15 @@ impl AtomicString {
                     };
 
                     if next_link != 0 {
-                        chain_block = s_handler.get_block::<StringChain>(next_link).unwrap();
-                        string_chain = s_handler.read_mut(&chain_block).unwrap();
+                        chain_block = s_handler.get_block::<StringChain>(next_link).ok()?;
+                        string_chain = s_handler.read_mut(&chain_block).ok()?;
                         next_link = string_chain.next_overflow.swap(0, Ordering::Release);
                     } else {
-                        chain_block = s_handler.allocate::<StringChain>().unwrap();
+                        chain_block = s_handler.allocate::<StringChain>().ok()?;
                     }
 
                     if let Some(ref mut prev) = prev_block {
-                        let prev_ref = s_handler.read_mut::<StringChain>(&prev).unwrap();
+                        let prev_ref = s_handler.read_mut::<StringChain>(&prev).ok()?;
                         prev_ref.next_overflow.store(
                             chain_block.header_offset(),
                             Ordering::Release
@@ -234,9 +233,9 @@ impl AtomicString {
                     }
 
                     unsafe {
-                        s_handler.write(&mut chain_block, new_string_chain).unwrap();
+                        s_handler.write(&mut chain_block, new_string_chain).ok()?;
                     }
-                    s_handler.set_state(&chain_block, STRING_CHAIN).unwrap();
+                    s_handler.set_state(&chain_block, STRING_CHAIN).ok()?;
 
                     prev_block = Some(chain_block);
                 }
@@ -250,10 +249,10 @@ impl AtomicString {
         }
 
         while next_link != 0 {
-            let mut extra_block = s_handler.get_block::<StringChain>(next_link).unwrap();
-            let extra_str = s_handler.read_mut(&mut extra_block).unwrap();
+            let mut extra_block = s_handler.get_block::<StringChain>(next_link).ok()?;
+            let extra_str = s_handler.read_mut(&mut extra_block).ok()?;
             next_link = extra_str.next_overflow.load(Ordering::Acquire);
-            s_handler.free(extra_block).unwrap();
+            s_handler.free(extra_block).ok()?;
         }
 
         self.state.store(IDLE, Ordering::Release);
@@ -263,7 +262,7 @@ impl AtomicString {
 
     /// Reads an string back from the struct.
     /// 
-    /// The follows the overflow chain there is no more links to load from.
+    /// It follows the overflow chain until there is no more links to load from.
     /// 
     /// ### Params
     /// @s_handler: A SharedHandler instance for matrix operations.
@@ -289,8 +288,8 @@ impl AtomicString {
                     next_link = self.next_overflow.load(Ordering::Acquire);
                     is_head = false;
                 } else {
-                    let next_chain = s_handler.get_block::<StringChain>(next_link).unwrap();
-                    let str_ref = s_handler.read(&next_chain).unwrap();
+                    let next_chain = s_handler.get_block::<StringChain>(next_link).ok()?;
+                    let str_ref = s_handler.read(&next_chain).ok()?;
                     let str_chain: String = str_ref.str
                         .iter()
                         .take_while(|&&c| c != '\0')
@@ -318,7 +317,7 @@ impl AtomicString {
                 }
 
                 return Some(v)
-            }).unwrap();
+            }).ok()?;
         } else {
             return None
         }
