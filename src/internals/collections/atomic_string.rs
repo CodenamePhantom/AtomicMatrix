@@ -8,17 +8,6 @@
 //! u32 pointer. If the string does not overflow, the whole data will be written into this single
 //! block and the pointer will remain at zero.
 //!
-//! ### Runtime mutability.
-//!
-//! New strings that are passed to an existing AtomicString will dinamically allocate new overflow
-//! blocks as needed. This ensures that AtomicStrings doesn't need compile time known sizes and
-//! remains dynamic. Overflow blocks are also limited to 255 chars and will spawn a subsequent
-//! chain block if this limit is surpassed, that will be attached to the previous block in the
-//! chain.
-//!
-//! If the string is mutated into a size smaller than the previous iteration, that makes an
-//! overflow useless, this block will be deallocated from the string and its pointer will be zeroed
-//!
 //! ### Architecture diagram
 //!
 //! [Matrix Block]
@@ -33,6 +22,26 @@
 //!
 //! The first AtomicString block works as the head for the segment and is never deallocated.
 //!
+//! ### Runtime mutability.
+//!
+//! New strings that are passed to an existing AtomicString will dinamically allocate new overflow
+//! blocks as needed. This ensures that AtomicStrings doesn't need compile time known sizes and
+//! remains dynamic. Overflow blocks are also limited to 255 chars and will spawn a subsequent
+//! chain block if this limit is surpassed, that will be attached to the previous block in the
+//! chain.
+//!
+//! If the string is mutated into a size smaller than the previous iteration, that makes an
+//! overflow useless, this block will be deallocated from the string and its pointer will be zeroed
+//!
+//! ### Corruption
+//! 
+//! If a write operation fails after the string has been touched, the AtomicString is_corrupted
+//! flag will be set to true. Corrupted strings cannot be read by participants and will return
+//! None immediately after trying.
+//! 
+//! Write operations will pass through this state normally and overwrite the string. This behaviour
+//! cleanse the state with a new set of chars and reverts the flag back to false.
+//! 
 //! ### Quorum idling
 //!
 //! AtomicStrings have an optional agreement threshold that can be set. Strings that have a defined
@@ -58,6 +67,17 @@
 //!
 //! The quorum cannot be modified after the string has been created.
 //!
+//! ### Rolling back.
+//!
+//! Failed operations implement a Defer rollback that performs an action when the method is returned
+//! earlier.
+//!
+//! - **Write Operations**: Write operations that have touched the string will flip the corruption
+//! flag and switch the state back to IDLE. Strings that have not been touched will simply be 
+//! flipped back to IDLE
+//! - **Read Operations**: Read fails will execute the default decrease operation (see
+//! `reader_decrease()` function)
+//!
 //! ### Safety
 //!
 //! AtomicStrings are synchronized internally and follow the RwLock philosophy where everyone can
@@ -65,7 +85,7 @@
 //! not considered trully lock-free in the general sense, but they will also not spin lock your
 //! process/thread uppon trying to manipulate it, returning None instead of locking.
 
-use std::{ array, sync::atomic::{ AtomicU8, AtomicU32, AtomicUsize, Ordering } };
+use std::{ array, sync::atomic::{ AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering } };
 use crate::{ helpers::type_guard::TypeGuardMut, prelude::* };
 
 /// Marks a string as IDLE, so writers know when its available for writing
@@ -81,6 +101,8 @@ const STATE_STRING: u32 = 900_000;
 /// Sets a string link as an StringChain block
 const STRING_CHAIN: u32 = 900_001;
 
+const CHAR_COUNT: usize = 64;
+
 /// AtomicString struct
 ///
 /// It works as the head segment of the atomic string, holding critical metadata that all
@@ -92,8 +114,9 @@ pub struct AtomicString {
     agreement: AtomicU32,
     curr_agreed: AtomicU32,
     string_length: AtomicUsize,
-    str: [char; 255],
+    str: [char; CHAR_COUNT],
     next_overflow: AtomicU32,
+    is_corrupted: AtomicBool,
     this_offset: u32,
 }
 
@@ -103,8 +126,17 @@ pub struct AtomicString {
 /// to the next block in the chain.
 #[derive(SafeSHM)]
 pub struct StringChain {
-    str: [char; 255],
+    str: [char; CHAR_COUNT],
     next_overflow: AtomicU32,
+}
+
+struct Defer<F: FnOnce()>(Option<F>);
+impl<F: FnOnce()> Drop for Defer<F> {
+    fn drop(&mut self) {
+        if let Some(f) = self.0.take() {
+            f();
+        }
+    }
 }
 
 impl AtomicString {
@@ -162,6 +194,7 @@ impl AtomicString {
         agreement: Option<u32>
     ) -> Option<&'static AtomicString> {
         let mut as_block = s_handler.allocate::<AtomicString>().ok()?;
+
         let mut prev: Option<Block<StringChain>> = None;
         let mut is_head = true;
         let mut chars = value.chars().peekable();
@@ -174,7 +207,7 @@ impl AtomicString {
         }
 
         loop {
-            let char_arr: [char; 255] = array::from_fn(|_| chars.next().unwrap_or('\0'));
+            let char_arr: [char; CHAR_COUNT] = array::from_fn(|_| chars.next().unwrap_or('\0'));
 
             if is_head {
                 let atomic_string = AtomicString {
@@ -185,6 +218,7 @@ impl AtomicString {
                     string_length: AtomicUsize::new(value.chars().count()),
                     str: char_arr,
                     next_overflow: AtomicU32::new(0),
+                    is_corrupted: AtomicBool::new(false),
                     this_offset: as_block.header_offset(),
                 };
                 s_handler
@@ -272,6 +306,18 @@ impl AtomicString {
     /// ### Returns
     /// An empty option stating if the operation was successful or not.
     pub fn write(&mut self, s_handler: SharedHandler, value: String) -> Option<()> {
+        use std::cell::Cell;
+
+        let touched = Cell::new(false);
+        let mut rollback = Defer(
+            Some(|| {
+                if touched.get() {
+                    self.is_corrupted.store(true, Ordering::Release);
+                }
+                self.state.store(IDLE, Ordering::Release);
+            })
+        );
+
         let mut chars = value.chars().peekable();
         let mut is_head = true;
         let mut prev_block: Option<Block<StringChain>> = None;
@@ -279,7 +325,7 @@ impl AtomicString {
 
         if self.state.compare_exchange(IDLE, WRITING, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
             loop {
-                let char_arr: [char; 255] = array::from_fn(|_| chars.next().unwrap_or('\0'));
+                let char_arr: [char; CHAR_COUNT] = array::from_fn(|_| chars.next().unwrap_or('\0'));
 
                 if is_head {
                     next_link = self.next_overflow.swap(0, Ordering::Release);
@@ -288,6 +334,7 @@ impl AtomicString {
                     self.string_length.store(value.chars().count(), Ordering::Release);
 
                     is_head = false;
+                    touched.set(true);
                 } else {
                     let mut chain_block: Block<StringChain>;
                     let string_chain: TypeGuardMut<StringChain>;
@@ -297,9 +344,17 @@ impl AtomicString {
                     };
 
                     if next_link != 0 {
-                        chain_block = s_handler.get_block::<StringChain>(next_link).ok()?;
-                        string_chain = s_handler.read_mut(&chain_block).ok()?;
-                        next_link = string_chain.next_overflow.swap(0, Ordering::Release);
+                        match s_handler.get_block::<StringChain>(next_link) {
+                            Ok(v) => {
+                                chain_block = v;
+                                string_chain = s_handler.read_mut(&chain_block).ok()?;
+                                next_link = string_chain.next_overflow.swap(0, Ordering::Release);
+                            }
+                            Err(_) => {
+                                chain_block = s_handler.allocate::<StringChain>().ok()?;
+                                next_link = 0;
+                            }
+                        }
                     } else {
                         chain_block = s_handler.allocate::<StringChain>().ok()?;
                     }
@@ -327,6 +382,7 @@ impl AtomicString {
                 }
             }
         } else {
+            rollback.0 = None;
             return None;
         }
 
@@ -337,6 +393,9 @@ impl AtomicString {
             s_handler.free(extra_block).ok()?;
         }
 
+        rollback.0 = None;
+
+        self.is_corrupted.store(false, Ordering::Release);
         if self.agreement.load(Ordering::Acquire) > 0 {
             self.state.store(NEW, Ordering::Release);
         } else {
@@ -362,9 +421,20 @@ impl AtomicString {
     /// ### Returns
     /// An optional string loaded from the AtomicString segment.
     pub fn read(&self, s_handler: SharedHandler) -> Option<String> {
+        let mut rollback = Defer(
+            Some(|| {
+                self.reader_decrease();
+            })
+        );
+
         let mut is_head = true;
         let mut str_buffs: Vec<String> = Vec::new();
         let mut next_link = 0;
+
+        if self.is_corrupted.load(Ordering::Acquire) {
+            rollback.0 = None;
+            return None;
+        }
 
         if self.state.swap_if_not(WRITING, READING, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             self.readers.fetch_add(1, Ordering::Release);
@@ -380,20 +450,8 @@ impl AtomicString {
                     next_link = self.next_overflow.load(Ordering::Acquire);
                     is_head = false;
                 } else {
-                    let next_chain = match s_handler.get_block::<StringChain>(next_link) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            self.reader_decrease();
-                            return None
-                        }
-                    };
-                    let str_ref = match s_handler.read(&next_chain) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            self.reader_decrease();
-                            return None
-                        }
-                    };
+                    let next_chain = s_handler.get_block::<StringChain>(next_link).ok()?;
+                    let str_ref = s_handler.read(&next_chain).ok()?;
                     let str_chain: String = str_ref.str
                         .iter()
                         .take_while(|&&c| c != '\0')
@@ -410,8 +468,11 @@ impl AtomicString {
 
             self.reader_decrease();
         } else {
+            rollback.0 = None;
             return None;
         }
+
+        rollback.0 = None;
 
         let final_str = str_buffs.join("");
 
@@ -474,11 +535,15 @@ impl AtomicString {
         let mut next_link = 0;
         let mut is_head = true;
 
+        if self.is_corrupted.load(Ordering::Acquire) {
+            return false;
+        }
+
         if self.state.swap_if_not(WRITING, READING, Ordering::Acquire, Ordering::Relaxed).is_ok() {
             self.readers.fetch_add(1, Ordering::Release);
 
             loop {
-                let char_arr: [char; 255] = array::from_fn(|_| chars.next().unwrap_or('\0'));
+                let char_arr: [char; CHAR_COUNT] = array::from_fn(|_| chars.next().unwrap_or('\0'));
 
                 if is_head {
                     for (idx, char) in char_arr.iter().enumerate() {
@@ -492,19 +557,13 @@ impl AtomicString {
                     next_link = self.next_overflow.load(Ordering::Acquire);
                 } else {
                     if next_link != 0 {
-                        let chain_block = match s_handler.get_block::<StringChain>(next_link) {
-                            Ok(v) => v,
-                            Err(_) => {
-                                self.reader_decrease();
-                                return false;
-                            }
+                        let Ok(chain_block) = s_handler.get_block::<StringChain>(next_link) else {
+                            self.reader_decrease();
+                            return false;
                         };
-                        let str_ref = match s_handler.read(&chain_block) {
-                            Ok(v) => v,
-                            Err(_) => {
-                                self.reader_decrease();
-                                return false;
-                            }
+                        let Ok(str_ref) = s_handler.read(&chain_block) else {
+                            self.reader_decrease();
+                            return false;
                         };
 
                         for (idx, char) in char_arr.iter().enumerate() {
@@ -548,6 +607,17 @@ impl AtomicString {
     pub fn for_each_char<F>(&self, s_handler: SharedHandler, mut f: F) -> Option<()>
         where F: FnMut(char)
     {
+        let mut rollback = Defer(
+            Some(|| {
+                self.reader_decrease();
+            })
+        );
+
+        if self.is_corrupted.load(Ordering::Acquire) {
+            rollback.0 = None;
+            return None;
+        }
+
         let mut next_link = 0;
         let mut is_head = true;
 
@@ -564,20 +634,8 @@ impl AtomicString {
                     next_link = self.next_overflow.load(Ordering::Acquire);
                     is_head = false;
                 } else {
-                    let chain_block = match s_handler.get_block::<StringChain>(next_link) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            self.reader_decrease();
-                            return None;
-                        }
-                    };
-                    let str_ref = match s_handler.read(&chain_block) {
-                        Ok(v) => v,
-                        Err(_) => {
-                            self.reader_decrease();
-                            return None;
-                        }
-                    };
+                    let chain_block = s_handler.get_block::<StringChain>(next_link).ok()?;
+                    let str_ref = s_handler.read(&chain_block).ok()?;
 
                     str_ref.str
                         .iter()
@@ -593,7 +651,12 @@ impl AtomicString {
             }
 
             self.reader_decrease();
+        } else {
+            rollback.0 = None;
+            return None;
         }
+
+        rollback.0 = None;
 
         return Some(());
     }
@@ -610,45 +673,44 @@ impl AtomicString {
     /// ### Returns
     /// An empty option stating the success of the operation.
     pub fn clean(&mut self, s_handler: SharedHandler) -> Option<()> {
+        use std::cell::Cell;
+
+        let touched = Cell::new(false);
+        let mut rollback = Defer(
+            Some(|| {
+                if touched.get() {
+                    self.is_corrupted.store(true, Ordering::Release);
+                }
+                self.state.store(IDLE, Ordering::Release);
+            })
+        );
+
         let mut next_link;
 
         if self.state.compare_exchange(IDLE, WRITING, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
-            let char_arr: [char; 255] = ['\0'; 255];
+            let char_arr: [char; CHAR_COUNT] = ['\0'; CHAR_COUNT];
 
             self.str = char_arr;
             self.string_length.store(0, Ordering::Release);
 
             next_link = self.next_overflow.load(Ordering::Acquire);
+            touched.set(true);
             self.next_overflow.store(0, Ordering::Release);
         } else {
+            rollback.0 = None;
             return None;
         }
 
         while next_link != 0 {
-            let mut extra_block = match s_handler.get_block::<StringChain>(next_link) {
-                Ok(v) => v,
-                Err(_) => {
-                    self.state.store(IDLE, Ordering::Release);
-                    return None;
-                }
-            };
-            let extra_str = match s_handler.read_mut(&mut extra_block) {
-                Ok(v) => v,
-                Err(_) => {
-                    self.state.store(IDLE, Ordering::Release);
-                    return None;
-                }
-            };
+            let mut extra_block = s_handler.get_block::<StringChain>(next_link).ok()?;
+            let extra_str = s_handler.read_mut(&mut extra_block).ok()?;
             next_link = extra_str.next_overflow.load(Ordering::Acquire);
-            match s_handler.free(extra_block) {
-                Ok(_) => {},
-                Err(_) => {
-                    self.state.store(IDLE, Ordering::Release);
-                    return None;
-                }
-            };
+            s_handler.free(extra_block).ok()?;
         }
 
+        rollback.0 = None;
+
+        self.is_corrupted.store(false, Ordering::Release);
         if self.agreement.load(Ordering::Acquire) > 0 {
             self.state.store(NEW, Ordering::Release);
         } else {
