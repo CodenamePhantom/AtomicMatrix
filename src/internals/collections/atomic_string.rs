@@ -95,8 +95,10 @@
 // Quick author note:
 // This could be implemented in a easier way... But where's the fun in that? Good luck.
 
-use std::{ array, sync::atomic::{ AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering } };
-use crate::{ prelude::* };
+use std::{ cell::Cell, array, sync::atomic::{ AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering } };
+use better_result::chain_up;
+
+use crate::{ helpers::type_guard::TypeGuardMut, prelude::* };
 
 /// Marks a string as IDLE, so writers know when its available for writing
 const IDLE: u8 = 0;
@@ -199,6 +201,7 @@ impl AtomicString {
     ///
     /// ### Params
     /// @s_handler: A SharedHandler instance for matrix operations.
+    #[inline]
     fn update_versioning(&self, s_handler: SharedHandler) {
         let as_block = s_handler.get_block::<AtomicString>(self.offset()).unwrap();
         let block_header = unsafe { as_block.header() };
@@ -211,6 +214,7 @@ impl AtomicString {
     /// Strings that have a defined agreement threshold are marked as NEW, so no writers can
     /// overwrite the value before all participants agree to have read it. Strings without a
     /// threshold are marked as IDLE directly.
+    #[inline]
     fn commit_write(&self) {
         self.is_corrupted.store(false, Ordering::Release);
         if self.agreement.load(Ordering::Acquire) > 0 {
@@ -223,6 +227,7 @@ impl AtomicString {
     /// Performs an atomic operation to decrease the reader value and migrate the string to IDLE.
     ///
     /// The Quorum idling protocol is calculated here.
+    #[inline]
     fn reader_decrease(&self) {
         self.readers
             .fetch_update(Ordering::Release, Ordering::Acquire, |mut v| {
@@ -252,6 +257,9 @@ impl AtomicString {
     /// For chain blocks, if getting the next block fails, the caller will receive a None instead
     /// of the block se they can decide what is to be done with this failed event. If the caller
     /// decides to return None to this method as well, the iteration will break and finaly return.
+    /// 
+    /// Errors that happen inside the closure should be explicitly returned wrapped in a Some(Err),
+    /// so the traversal can know that a step failed and break out with a None instead of Some(()).
     ///
     /// ### Params
     /// @s_handler: A SharedHandler instance for matrix operations. \
@@ -270,34 +278,111 @@ impl AtomicString {
     )
         -> Option<()>
         where
-            F: FnMut(Block<AtomicString>, &mut T) -> Option<()>,
-            G: FnMut(Option<Block<StringChain>>, &mut T) -> Option<u32>
+            F: FnMut(TypeGuardMut<AtomicString>, &mut T) -> Option<()>,
+            G: FnMut(Option<(TypeGuardMut<StringChain>, u32)>, &mut T) -> Option<Result<u32, ()>>
     {
         let mut is_head = true;
         let mut next_link = self.next_overflow.load(Ordering::Acquire);
-        let mut break_out = false;
 
-        while !break_out {
+        loop {
             if is_head {
                 let as_block = s_handler.get_block(self.offset()).ok()?;
-                if head_fn(as_block, context).is_none() {
+                let str_ref = s_handler.read_mut(&as_block).ok()?;
+                if head_fn(str_ref, context).is_none() {
                     return None;
                 }
                 is_head = false;
             } else {
                 if next_link != 0 {
-                    let chain_block = s_handler.get_block(next_link).ok();
-                    next_link = chain_fn(chain_block, context).unwrap_or(0);
+                    let chain_block = s_handler.get_block(next_link).ok()?;
+                    let str_ref = s_handler.read_mut::<StringChain>(&chain_block).ok()?;
+                    next_link = match chain_fn(Some((str_ref, chain_block.header_offset())), context) {
+                        Some(v) => v.ok()?,
+                        None => 0,
+                    };
                 } else {
-                    next_link = chain_fn(None, context).unwrap_or_else(|| {
-                        break_out = true;
-                        0
-                    });
+                    next_link = match chain_fn(None, context) {
+                        Some(v) => v.ok()?,
+                        None => break,
+                    };
                 }
             }
         }
 
         return Some(());
+    }
+
+    /// Acquires a read access to the string.
+    /// 
+    /// This method executes a swap on the string state to READING except if its in state WRITING.
+    /// 
+    /// Any call that fails inside of this method will immediately apply the rollback function and
+    /// return None.
+    /// 
+    /// ### Params
+    /// @exec: The function to execute in case the swap succeeds.
+    /// 
+    /// ### Returns
+    /// An option stating the successful execution of this method
+    #[inline]
+    fn acquire_read<F>(&self, exec: F) -> Option<()> 
+    where
+        F: FnOnce() -> Option<()>
+    {
+        if self.state.swap_if_not(WRITING, READING, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            let mut rollback = Defer::set(|| {
+                self.reader_decrease();
+            });
+
+            self.readers.fetch_add(1, Ordering::Release);
+
+            exec()?;
+
+            rollback.disarm();
+            self.reader_decrease();
+
+            return Some(())
+        } else {
+            return None
+        }
+    }
+
+    /// Acquires a write access to the string.
+    /// 
+    /// This method executes a CAS on the string state to WRITING only if its in IDLE first.
+    /// 
+    /// Any call that fails inside of this method will immediately apply the rollback function and
+    /// return None.
+    /// 
+    /// ### Params
+    /// @exec: The function to execute in case the CAS succeeds.
+    /// 
+    /// ### Returns
+    /// An option stating the successful execution of this method
+    #[inline]
+    fn acquire_write<F>(&self, exec: F, touched: &Cell<bool>, s_handler: SharedHandler) -> Option<()> 
+    where 
+        F: FnOnce() -> Option<()>
+    {
+        if self.state.compare_exchange(IDLE, WRITING, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+            let mut rollback = Defer::set(|| {
+                if touched.get() {
+                    self.is_corrupted.store(true, Ordering::Release);
+                }
+                self.state.store(IDLE, Ordering::Release);
+            });
+
+            exec()?;
+
+            rollback.disarm();
+
+            self.commit_write();
+            self.update_versioning(s_handler);
+
+            return Some(())
+        } else {
+            return None
+        }
     }
 
     /// Creates a new AtomicString inside the matrix.
@@ -344,6 +429,10 @@ impl AtomicString {
                     let corrupted_ref = s_handler.read(&corrupted_block).unwrap();
                     block_offset = corrupted_ref.next_overflow.load(Ordering::Acquire);
                     s_handler.free(corrupted_block).unwrap();
+                    
+                    if block_offset == 0 {
+                        break;
+                    }
                 }
             }
         });
@@ -456,28 +545,18 @@ impl AtomicString {
     /// ### Returns
     /// An empty option stating if the operation was successful or not.
     pub fn write(&mut self, s_handler: SharedHandler, value: String) -> Option<()> {
-        use std::cell::Cell;
-
         let touched = Cell::new(false);
-        let mut rollback = Defer::set(|| {
-            if touched.get() {
-                self.is_corrupted.store(true, Ordering::Release);
-            }
-            self.state.store(IDLE, Ordering::Release);
-        });
-
         let mut chars = value.chars().peekable();
-        let mut prev_block: Option<Block<StringChain>> = None;
+        let mut prev_str: Option<TypeGuardMut<StringChain>> = None;
 
-        if self.state.compare_exchange(IDLE, WRITING, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+        self.acquire_write(|| {
             self.traverse_string(
                 s_handler,
                 &mut chars,
-                |head_block, chars_ctx| {
+                |mut str_ref, chars_ctx| {
                     let char_arr: [char; CHAR_COUNT] = array::from_fn(|_|
                         chars_ctx.next().unwrap_or('\0')
                     );
-                    let mut str_ref = s_handler.read_mut(&head_block).ok()?;
 
                     str_ref.str = char_arr;
                     str_ref.string_length.store(value.chars().count(), Ordering::Release);
@@ -485,7 +564,7 @@ impl AtomicString {
                     touched.set(true);
                     return Some(());
                 },
-                |chain_block, chars_ctx| {
+                |str_pack, chars_ctx| {
                     let mut next_offset = 0;
                     let char_arr: [char; CHAR_COUNT] = array::from_fn(|_|
                         chars_ctx.next().unwrap_or('\0')
@@ -495,60 +574,59 @@ impl AtomicString {
                         next_overflow: AtomicU32::new(0),
                     };
 
-                    let mut block = match chain_block {
+                    let (mut str_ref, this_offset) = match str_pack {
                         Some(v) => {
-                            let v_ref = s_handler.read(&v).ok()?;
-                            next_offset = v_ref.next_overflow.load(Ordering::Acquire);
+                            next_offset = v.0.next_overflow.load(Ordering::Acquire);
                             v
                         }
                         None => {
                             if chars_ctx.peek().is_none() {
                                 return None;
                             } else {
-                                s_handler.allocate::<StringChain>().unwrap()
+                                let block = match s_handler.allocate::<StringChain>() {
+                                    Ok(v) => v,
+                                    Err(_) => return Some(Err(())),
+                                };
+                                match s_handler.set_state(&block, STRING_CHAIN) {
+                                    Ok(_) => {},
+                                    Err(_) => return Some(Err(())),
+                                };
+                                (s_handler.read_mut(&block).unwrap(), block.header_offset())
                             }
                         }
                     };
-                    if let Some(ref mut prev) = prev_block {
-                        let prev_ref = s_handler.read_mut::<StringChain>(&prev).ok()?;
-                        prev_ref.next_overflow.store(block.header_offset(), Ordering::Release);
+                    if let Some(ref mut prev) = prev_str {
+                        prev.next_overflow.store(this_offset, Ordering::Release);
                     } else {
-                        self.next_overflow.store(block.header_offset(), Ordering::Release);
+                        self.next_overflow.store(this_offset, Ordering::Release);
                     }
 
-                    unsafe {
-                        s_handler.write(&mut block, new_string).ok()?;
-                    }
-                    s_handler.set_state(&block, STRING_CHAIN).ok()?;
-
-                    prev_block = Some(block);
+                    *str_ref = new_string;
+                    prev_str = Some(str_ref);
 
                     if chars_ctx.peek().is_none() {
                         while next_offset != 0 {
-                            let mut extra_block = s_handler
-                                .get_block::<StringChain>(next_offset)
-                                .ok()?;
-                            let extra_str = s_handler.read_mut(&mut extra_block).ok()?;
+                            let mut extra_block = match s_handler.get_block::<StringChain>(next_offset) {
+                                Ok(v) => v,
+                                Err(_) => return Some(Err(()))
+                            };
+                            let extra_str = match s_handler.read_mut(&mut extra_block) {
+                                Ok(v) => v,
+                                Err(_) => return Some(Err(())),
+                            };
                             next_offset = extra_str.next_overflow.load(Ordering::Acquire);
-                            s_handler.free(extra_block).ok()?;
+                            match s_handler.free(extra_block) {
+                                Ok(_) => {},
+                                Err(_) => return Some(Err(())),
+                            };
                         }
                         return None;
                     } else {
-                        return Some(next_offset);
+                        return Some(Ok(next_offset));
                     }
                 }
-            )?;
-        } else {
-            rollback.disarm();
-            return None;
-        }
-
-        rollback.disarm();
-
-        self.commit_write();
-        self.update_versioning(s_handler);
-
-        return Some(());
+            )
+        }, &touched, s_handler)
     }
 
     /// Appends a new string at the end of the current stored value
@@ -564,72 +642,69 @@ impl AtomicString {
     /// ### Returns
     /// An option stating the successful execution of this method.
     pub fn append(&self, s_handler: SharedHandler, value: String) -> Option<()> {
-        use std::cell::Cell;
-
         if self.is_corrupted.load(Ordering::Acquire) {
             return None;
         }
 
         let touched = Cell::new(false);
-        let mut rollback = Defer::set(|| {
-            if touched.get() {
-                self.is_corrupted.store(true, Ordering::Release);
-            }
-            self.state.store(IDLE, Ordering::Release);
-        });
-
         let mut chars = value.chars().peekable();
-        let mut prev_block: Option<Block<StringChain>> = None;
+        let mut prev_str: Option<TypeGuardMut<StringChain>> = None;
 
-        if self.state.compare_exchange(IDLE, WRITING, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+        self.acquire_write(|| {
             self.traverse_string(
                 s_handler,
                 &mut chars,
-                |head_block, chars_ctx| {
-                    let mut str_ref = s_handler.read_mut::<AtomicString>(&head_block).ok()?;
+                |mut str_ref, chars_ctx| {
                     for ch in str_ref.str.iter_mut() {
                         if *ch == '\0' {
                             *ch = chars_ctx.next().unwrap_or('\0');
                         }
                     }
-                    str_ref.string_length.store(value.chars().count(), Ordering::Release);
+                    let old_length = str_ref.string_length.load(Ordering::Acquire);
+                    str_ref.string_length.store(value.chars().count() + old_length, Ordering::Release);
+                    touched.set(true);
 
                     return Some(());
                 },
-                |chain_block, chars_ctx| {
+                |str_pack, chars_ctx| {
                     let template_str = StringChain {
                         str: ['\0'; CHAR_COUNT],
                         next_overflow: AtomicU32::new(0),
                     };
 
                     let mut next_offset = 0;
-                    let block = match chain_block {
+                    let (mut str_ref, this_offset) = match str_pack {
                         Some(v) => {
-                            let v_ref = s_handler.read(&v).ok()?;
-                            next_offset = v_ref.next_overflow.load(Ordering::Acquire);
+                            next_offset = v.0.next_overflow.load(Ordering::Acquire);
                             v
                         }
                         None => {
                             if chars_ctx.peek().is_none() {
                                 return None;
                             } else {
-                                let mut v = s_handler.allocate::<StringChain>().ok()?;
-                                unsafe {s_handler.write(&mut v, template_str).ok()?}
-                                s_handler.set_state(&v, STRING_CHAIN).ok()?;
+                                let mut v = match s_handler.allocate::<StringChain>() {
+                                    Ok(v) => v,
+                                    Err(_) => return Some(Err(())),
+                                };
+                                unsafe { match s_handler.write(&mut v, template_str) {
+                                    Ok(_) => {},
+                                    Err(_) => return Some(Err(())),
+                                } }
+                                match s_handler.set_state(&v, STRING_CHAIN) {
+                                    Ok(_) => {},
+                                    Err(_) => return Some(Err(())),
+                                };
 
-                                v
+                                (s_handler.read_mut(&v).unwrap(), v.header_offset())
                             }
                         }
                     };
-                    let mut str_ref = s_handler.read_mut::<StringChain>(&block).ok()?;
-                    if let Some(ref mut prev) = prev_block {
-                        let prev_ref = s_handler.read_mut::<StringChain>(&prev).ok()?;
-                        prev_ref.next_overflow.store(block.header_offset(), Ordering::Release);
+                    if let Some(ref mut prev) = prev_str {
+                        prev.next_overflow.store(this_offset, Ordering::Release);
                     } else {
-                        self.next_overflow.store(block.header_offset(), Ordering::Release);
+                        self.next_overflow.store(this_offset, Ordering::Release);
                     }
-                    prev_block = Some(block);
-
+                    
                     if str_ref.next_overflow.load(Ordering::Acquire) == 0 {
                         touched.set(true);
                         for ch in str_ref.str.iter_mut() {
@@ -638,27 +713,18 @@ impl AtomicString {
                             }
                         }
 
+                        prev_str = Some(str_ref);
                         if chars_ctx.peek().is_none() {
                             return None;
                         } else {
-                            return Some(next_offset);
+                            return Some(Ok(next_offset));
                         }
                     } else {
-                        return Some(str_ref.next_overflow.load(Ordering::Acquire));
+                        return Some(Ok(str_ref.next_overflow.load(Ordering::Acquire)));
                     }
                 }
-            )?;
-        } else {
-            rollback.disarm();
-            return None;
-        }
-
-        rollback.disarm();
-
-        self.commit_write();
-        self.update_versioning(s_handler);
-
-        return Some(());
+            )
+        }, &touched, s_handler)
     }
 
     /// Reads an string back from the struct.
@@ -676,13 +742,8 @@ impl AtomicString {
         }
 
         let mut str_buffs: Vec<String> = Vec::new();
-        let mut rollback = Defer::set(|| {
-            self.reader_decrease();
-        });
 
-        if self.state.swap_if_not(WRITING, READING, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-            self.readers.fetch_add(1, Ordering::Release);
-
+        if self.acquire_read(|| {
             self.traverse_string(
                 s_handler,
                 &mut str_buffs,
@@ -696,9 +757,8 @@ impl AtomicString {
 
                     return Some(());
                 },
-                |mut chain_block, buff| {
-                    if let Some(block) = chain_block.take() {
-                        let str_ref = s_handler.read(&block).ok()?;
+                |mut str_pack, buff| {
+                    if let Some((str_ref, _)) = str_pack.take() {
                         let str_chain = str_ref.str
                             .iter()
                             .take_while(|&&c| c != '\0')
@@ -706,23 +766,19 @@ impl AtomicString {
 
                         buff.push(str_chain);
 
-                        return Some(str_ref.next_overflow.load(Ordering::Acquire));
+                        return Some(Ok(str_ref.next_overflow.load(Ordering::Acquire)));
                     } else {
                         return None;
                     }
                 }
-            )?;
+            )
+        }).is_some() {
+            let final_str = str_buffs.join("");
 
-            rollback.disarm();
-            self.reader_decrease();
+            return Some(final_str);
         } else {
-            rollback.disarm();
-            return None;
+            return None
         }
-
-        let final_str = str_buffs.join("");
-
-        return Some(final_str);
     }
 
     /// Compares a String value against the AtomicString currently written.
@@ -743,10 +799,7 @@ impl AtomicString {
             return false;
         }
 
-        if self.state.swap_if_not(WRITING, READING, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-            self.readers.fetch_add(1, Ordering::Release);
-
-            if
+        if self.acquire_read(|| {
                 self
                     .traverse_string(
                         s_handler,
@@ -763,16 +816,12 @@ impl AtomicString {
 
                             return Some(());
                         },
-                        |mut chain_block, chars_ctx| {
+                        |mut str_pack, chars_ctx| {
                             let char_arr: [char; CHAR_COUNT] = array::from_fn(|_|
                                 chars_ctx.next().unwrap_or('\0')
                             );
                             let next_offset: u32;
-                            if let Some(block) = chain_block.take() {
-                                let Ok(str_ref) = s_handler.read(&block) else {
-                                    return None;
-                                };
-
+                            if let Some((str_ref, _)) = str_pack.take() {
                                 next_offset = str_ref.next_overflow.load(Ordering::Acquire);
 
                                 for (idx, char) in char_arr.iter().enumerate() {
@@ -784,20 +833,14 @@ impl AtomicString {
                                 return None;
                             }
 
-                            return Some(next_offset);
+                            return Some(Ok(next_offset));
                         }
                     )
-                    .is_none()
-            {
-                self.reader_decrease();
-                return false;
-            }
-            self.reader_decrease();
+        }).is_some() {
+            return true;
         } else {
             return false;
         }
-
-        return true;
     }
 
     /// Executes a closure function againts each char in the AtomicString.
@@ -818,13 +861,7 @@ impl AtomicString {
             return None;
         }
 
-        let mut rollback = Defer::set(|| {
-            self.reader_decrease();
-        });
-
-        if self.state.swap_if_not(WRITING, READING, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-            self.readers.fetch_add(1, Ordering::Release);
-
+        self.acquire_read(|| {
             self.traverse_string(
                 s_handler,
                 &mut f,
@@ -836,10 +873,9 @@ impl AtomicString {
 
                     return Some(());
                 },
-                |mut chain_block, func| {
+                |mut str_pack, func| {
                     let next_offset;
-                    if let Some(block) = chain_block.take() {
-                        let str_ref = s_handler.read(&block).ok()?;
+                    if let Some((str_ref, _)) = str_pack.take() {
                         next_offset = str_ref.next_overflow.load(Ordering::Acquire);
 
                         str_ref.str
@@ -847,21 +883,13 @@ impl AtomicString {
                             .take_while(|&&c| c != '\0')
                             .for_each(|v| func(*v));
 
-                        return Some(next_offset);
+                        return Some(Ok(next_offset));
                     } else {
                         return None;
                     }
                 }
-            )?;
-
-            rollback.disarm();
-            self.reader_decrease();
-        } else {
-            rollback.disarm();
-            return None;
-        }
-
-        return Some(());
+            )
+        })
     }
 
     /// Clears the whole string, leaving only the AtomicString head block filled with NULL chars.
@@ -876,52 +904,39 @@ impl AtomicString {
     /// ### Returns
     /// An empty option stating the success of the operation.
     pub fn clean(&mut self, s_handler: SharedHandler) -> Option<()> {
-        use std::cell::Cell;
-
         let touched = Cell::new(false);
-        let mut rollback = Defer::set(|| {
-            if touched.get() {
-                self.is_corrupted.store(true, Ordering::Release);
-            }
-            self.state.store(IDLE, Ordering::Release);
-        });
 
-        if self.state.compare_exchange(IDLE, WRITING, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
+        self.acquire_write(|| {
             self.traverse_string(
                 s_handler,
                 &mut String::new(),
-                |mut head_block, _| {
-                    let mut head_ref = s_handler.read_mut(&mut head_block).ok()?;
+                |mut str_ref, _| {
                     let char_arr: [char; CHAR_COUNT] = ['\0'; CHAR_COUNT];
 
-                    head_ref.str = char_arr;
-                    head_ref.string_length.store(0, Ordering::Release);
+                    str_ref.str = char_arr;
+                    str_ref.string_length.store(0, Ordering::Release);
 
                     return Some(());
                 },
-                |mut chain_block, _| {
-                    if let Some(block) = chain_block.take() {
-                        let str_ref = s_handler.read(&block).ok()?;
+                |mut str_pack, _| {
+                    if let Some((str_ref, this_offset)) = str_pack.take() {
+                        let block = match s_handler.get_block::<StringChain>(this_offset) {
+                            Ok(v) => v,
+                            Err(_) => return Some(Err(())),
+                        };
                         let next_offset = str_ref.next_overflow.load(Ordering::Acquire);
-                        s_handler.free(block).ok()?;
+                        match s_handler.free(block) {
+                            Ok(v) => v,
+                            Err(_) => return Some(Err(())),
+                        };
 
-                        return Some(next_offset);
+                        return Some(Ok(next_offset));
                     } else {
                         return None;
                     }
                 }
-            )?;
-        } else {
-            rollback.disarm();
-            return None;
-        }
-
-        rollback.disarm();
-
-        self.commit_write();
-        self.update_versioning(s_handler);
-
-        return Some(());
+            )
+        }, &touched, s_handler)
     }
 
     /// Gets the current last_edit timestamp from the AtomicString block header.
