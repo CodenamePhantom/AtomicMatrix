@@ -3,7 +3,7 @@
 //! All types passed through this helper can be safely coordinated between threads, as passing the
 //! same type from a different caller process will result in the same hash.
 
-use crate::prelude::{ Block, TAG_SIZE };
+use crate::{core::matrix::helpers::HEADER_SPACE, prelude::{ Block, TAG_SIZE }};
 
 use std::any::type_name;
 
@@ -17,7 +17,7 @@ use std::any::type_name;
 ///
 /// ### Returns:
 /// The hashed type name in u32 format.
-pub fn make<T>() -> u32 {
+pub fn make<T>() -> u64 {
     let name = type_name::<T>();
     return fnv1a_32(name.as_bytes());
 }
@@ -34,10 +34,9 @@ pub fn make<T>() -> u32 {
 /// ### Returns:
 /// A bool stating if the types matches or not.
 pub fn compare<T>(block: &Block<T>, base_ptr: *const u8) -> bool {
-    let offset = block.pointer().offset() - TAG_SIZE;
-    let addr = unsafe { base_ptr.add(offset as usize) };
+    let addr = unsafe { base_ptr.add((block.header_offset() + HEADER_SPACE) as usize) };
 
-    let stored_tag = unsafe { (addr as *const u32).read() };
+    let stored_tag = unsafe { (addr as *const u64).read() };
     let expected_tag = make::<T>();
 
     stored_tag == expected_tag
@@ -54,10 +53,10 @@ pub fn compare<T>(block: &Block<T>, base_ptr: *const u8) -> bool {
 ///
 /// ### Returns:
 /// The u32 result of the string hashing
-pub fn fnv1a_32(bytes: &[u8]) -> u32 {
-    let mut hash: u32 = 0x811c9dc5;
+pub fn fnv1a_32(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0x811c9dc5;
     for &b in bytes {
-        hash ^= b as u32;
+        hash ^= b as u64;
         hash = hash.wrapping_mul(0x01000193);
     }
 

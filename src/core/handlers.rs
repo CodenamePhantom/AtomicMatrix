@@ -78,7 +78,7 @@ use std::sync::atomic::Ordering;
 /// Currently only 0–3 are assigned — the remaining range (4–48) is reserved
 /// for future internal lifecycle states without breaking user code.
 pub const USER_STATE_MIN: u32 = 49;
-pub const TAG_SIZE: u32 = std::mem::size_of::<u32>() as u32;
+pub const TAG_SIZE: u32 = std::mem::size_of::<u64>() as u32;
 pub const STATE_LOCK: u32 = 4;
 
 /// A typed handle to an allocated block in the matrix.
@@ -203,7 +203,7 @@ impl<T> Block<T> {
     /// ### Returns:
     /// A generic RelativePtr of the block, without the type_tag offset.
     pub fn tagless_ptr(&self) -> RelativePtr<u8> {
-        RelativePtr::<u8>::new(self.pointer.offset() - TAG_SIZE)
+        RelativePtr::<u8>::new(self.pointer.offset() - TAG_SIZE as u32)
     }
 }
 
@@ -356,7 +356,7 @@ pub trait HandlerFunctions {
         };
 
         unsafe {
-            *(self.base_ptr().add(ptr.offset() as usize) as *mut u32) = tag;
+            *(self.base_ptr().add(ptr.offset() as usize) as *mut u64) = tag;
         }
 
         let block = Block::<T>::from_offset(ptr.offset() + TAG_SIZE, self.base_ptr() as usize);

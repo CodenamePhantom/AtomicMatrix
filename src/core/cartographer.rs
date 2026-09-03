@@ -46,7 +46,7 @@ pub enum CartographerConfig {
 
 #[repr(C)]
 struct CallbackBlock {
-    flag: AtomicU32,
+    flag: AtomicU64,
     _pad: u32,
     magic: AtomicU64,
     callback: fn(&mut AtomicMatrix),
