@@ -300,9 +300,15 @@ impl AtomicString {
                 let as_block = s_handler.get_block(self.offset()).ok()?;
                 let str_ref = s_handler.read_mut(&as_block).ok()?;
                 match head_fn(str_ref, context) {
-                    ClosureFlags::Next(v) => next_link = v,
-                    ClosureFlags::Error => return None,
-                    ClosureFlags::Break => break,
+                    ClosureFlags::Next(v) => {
+                        next_link = v;
+                    }
+                    ClosureFlags::Error => {
+                        return None;
+                    }
+                    ClosureFlags::Break => {
+                        break;
+                    }
                 }
                 is_head = false;
             } else {
@@ -313,14 +319,22 @@ impl AtomicString {
                         chain_fn(Some((str_ref, chain_block.header_offset())), context)
                     {
                         ClosureFlags::Next(v) => v,
-                        ClosureFlags::Error => return None,
-                        ClosureFlags::Break => break,
+                        ClosureFlags::Error => {
+                            return None;
+                        }
+                        ClosureFlags::Break => {
+                            break;
+                        }
                     };
                 } else {
                     next_link = match chain_fn(None, context) {
                         ClosureFlags::Next(v) => v,
-                        ClosureFlags::Error => return None,
-                        ClosureFlags::Break => break,
+                        ClosureFlags::Error => {
+                            return None;
+                        }
+                        ClosureFlags::Break => {
+                            break;
+                        }
                     };
                 }
             }
@@ -602,13 +616,12 @@ impl AtomicString {
                                 if chars_ctx.peek().is_none() {
                                     return ClosureFlags::Break;
                                 } else {
-                                    let Ok(block) = s_handler.allocate::<StringChain>()
-                                    else {
-                                            return ClosureFlags::Error;
+                                    let Ok(block) = s_handler.allocate::<StringChain>() else {
+                                        return ClosureFlags::Error;
                                     };
                                     if s_handler.set_state(&block, STRING_CHAIN).is_err() {
                                         return ClosureFlags::Error;
-                                    };
+                                    }
 
                                     (s_handler.read_mut(&block).unwrap(), block.header_offset())
                                 }
@@ -625,19 +638,18 @@ impl AtomicString {
 
                         if chars_ctx.peek().is_none() {
                             while next_offset != 0 {
-                                let Ok(mut extra_block) = s_handler.get_block::<StringChain>(next_offset)
-                                else {
+                                let Ok(mut extra_block) =
+                                    s_handler.get_block::<StringChain>(next_offset) else {
                                     return ClosureFlags::Error;
                                 };
-                                let Ok(extra_str) = s_handler.read_mut(&mut extra_block) 
-                                else {
+                                let Ok(extra_str) = s_handler.read_mut(&mut extra_block) else {
                                     return ClosureFlags::Error;
                                 };
 
                                 next_offset = extra_str.next_overflow.load(Ordering::Acquire);
                                 if s_handler.free(extra_block).is_err() {
                                     return ClosureFlags::Error;
-                                };
+                                }
                             }
                             return ClosureFlags::Break;
                         } else {
@@ -708,8 +720,7 @@ impl AtomicString {
                                 if chars_ctx.peek().is_none() {
                                     return ClosureFlags::Break;
                                 } else {
-                                    let Ok(mut v) = s_handler.allocate::<StringChain>() 
-                                    else {
+                                    let Ok(mut v) = s_handler.allocate::<StringChain>() else {
                                         return ClosureFlags::Error;
                                     };
                                     unsafe {
@@ -719,7 +730,7 @@ impl AtomicString {
                                     }
                                     if s_handler.set_state(&v, STRING_CHAIN).is_err() {
                                         return ClosureFlags::Error;
-                                    };
+                                    }
 
                                     (s_handler.read_mut(&v).unwrap(), v.header_offset())
                                 }
@@ -746,7 +757,9 @@ impl AtomicString {
                                 return ClosureFlags::Next(next_offset);
                             }
                         } else {
-                            return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
+                            return ClosureFlags::Next(
+                                str_ref.next_overflow.load(Ordering::Acquire)
+                            );
                         }
                     }
                 )
@@ -786,7 +799,9 @@ impl AtomicString {
 
                             buff.push(head_str);
 
-                            return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
+                            return ClosureFlags::Next(
+                                str_ref.next_overflow.load(Ordering::Acquire)
+                            );
                         },
                         |mut str_pack, buff| {
                             if let Some((str_ref, _)) = str_pack.take() {
@@ -797,7 +812,9 @@ impl AtomicString {
 
                                 buff.push(str_chain);
 
-                                return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
+                                return ClosureFlags::Next(
+                                    str_ref.next_overflow.load(Ordering::Acquire)
+                                );
                             } else {
                                 return ClosureFlags::Break;
                             }
@@ -848,7 +865,9 @@ impl AtomicString {
                                 }
                             }
 
-                            return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
+                            return ClosureFlags::Next(
+                                str_ref.next_overflow.load(Ordering::Acquire)
+                            );
                         },
                         |mut str_pack, chars_ctx| {
                             let char_arr: [char; CHAR_COUNT] = array::from_fn(|_|
@@ -928,6 +947,17 @@ impl AtomicString {
         })
     }
 
+    /// Executes a closure function againts a mutable reference to each char in the AtomicString.
+    ///
+    /// It will traverse the whole chain of chars, including StringChains, and execute the closure
+    /// until it captures the first \0 (NULL) char.
+    ///
+    /// ### Params
+    /// @s_handler: A SharedHandler instance for matrix operations.
+    /// @f: The closure function to execute against the chars mutable reference.
+    ///
+    /// ### Returns
+    /// An empty option stating the success of the call execution.
     pub fn for_each_char_mut<F>(&mut self, s_handler: SharedHandler, mut f: F) -> Option<()>
         where F: FnMut(&mut char)
     {
@@ -936,35 +966,39 @@ impl AtomicString {
         }
         let touched = Cell::new(false);
 
-        self.acquire_write(|| {
-            self.traverse_string(
-                s_handler,
-                &mut f,
-                |mut str_ref, func| {
-                    str_ref.str
-                        .iter_mut()
-                        .take_while(|c| **c != '\0')
-                        .for_each(|v| func(v));
-
-                    return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
-                },
-                |mut str_pack, func| {
-                    let next_offset;
-                    if let Some((mut str_ref, _)) = str_pack.take() {
-                        next_offset = str_ref.next_overflow.load(Ordering::Acquire);
-
+        self.acquire_write(
+            || {
+                self.traverse_string(
+                    s_handler,
+                    &mut f,
+                    |mut str_ref, func| {
                         str_ref.str
                             .iter_mut()
                             .take_while(|c| **c != '\0')
                             .for_each(|v| func(v));
 
-                        return ClosureFlags::Next(next_offset);
-                    } else {
-                        return ClosureFlags::Break;
+                        return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
+                    },
+                    |mut str_pack, func| {
+                        let next_offset;
+                        if let Some((mut str_ref, _)) = str_pack.take() {
+                            next_offset = str_ref.next_overflow.load(Ordering::Acquire);
+
+                            str_ref.str
+                                .iter_mut()
+                                .take_while(|c| **c != '\0')
+                                .for_each(|v| func(v));
+
+                            return ClosureFlags::Next(next_offset);
+                        } else {
+                            return ClosureFlags::Break;
+                        }
                     }
-                }
-            )
-        }, &touched, s_handler)
+                )
+            },
+            &touched,
+            s_handler
+        )
     }
     /// Clears the whole string, leaving only the AtomicString head block filled with NULL chars.
     ///
@@ -995,8 +1029,7 @@ impl AtomicString {
                     },
                     |mut str_pack, _| {
                         if let Some((str_ref, this_offset)) = str_pack.take() {
-                            let Ok(block) = s_handler.get_block::<StringChain>(this_offset) 
-                            else {
+                            let Ok(block) = s_handler.get_block::<StringChain>(this_offset) else {
                                 return ClosureFlags::Error;
                             };
                             let next_offset = str_ref.next_overflow.load(Ordering::Acquire);
@@ -1065,10 +1098,13 @@ impl AtomicString {
 
     /// Return the amount of agreements pending for this string to be marked as IDLE.
     pub fn pending_agreements(&self) -> u32 {
-        if self.state.load(Ordering::Acquire) == READING && self.agreement.load(Ordering::Acquire) > 0 {
+        if
+            self.state.load(Ordering::Acquire) == READING &&
+            self.agreement.load(Ordering::Acquire) > 0
+        {
             return self.agreement.load(Ordering::Acquire) - self.curr_agreed.load(Ordering::Acquire);
         } else {
-            return 0
+            return 0;
         }
     }
 }
@@ -1137,8 +1173,10 @@ mod tests {
 
                 loop {
                     if local_as.eq(s_handler, "Now i'm a new string!".into()) {
-                        unsafe { s_handler.write(&mut local_v, true).unwrap() }
-                        break
+                        unsafe {
+                            s_handler.write(&mut local_v, true).unwrap();
+                        }
+                        break;
                     }
                 }
             });
@@ -1147,7 +1185,9 @@ mod tests {
                 let local_as = AtomicString::from(s_handler, as_offset).unwrap();
 
                 loop {
-                    if local_as.write(s_handler, "Now i'm a new string!".into()).is_some() { break };
+                    if local_as.write(s_handler, "Now i'm a new string!".into()).is_some() {
+                        break;
+                    }
                 }
             });
         });
@@ -1177,8 +1217,8 @@ mod tests {
                 let local_as = AtomicString::from(s_handler, as_offset).unwrap();
                 let mut local_v = s_handler.get_block::<bool>(v_offset).unwrap();
 
-                if !local_as.eq(s_handler, "Now i'm a new string!".into()) {
-                    unsafe { s_handler.write(&mut local_v, true).unwrap() }
+                unsafe { 
+                    s_handler.write(&mut local_v, !local_as.eq(s_handler, "Now i'm a new string!".into())).unwrap() 
                 }
             });
         });
@@ -1190,14 +1230,11 @@ mod tests {
 
     #[test]
     fn test_looooooooooooong_strings() {
-        let long_string = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{}<>?/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{}<>?"; // sowy
+        let long_string =
+            "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{}<>?/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789!@#$%^&*()-_=+[]{}<>?"; // sowy
 
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
-        let atomic_string = AtomicString::new(
-            handler.share(),
-            long_string.into(),
-            None
-        ).unwrap();
+        let atomic_string = AtomicString::new(handler.share(), long_string.into(), None).unwrap();
         let validation_block = handler.allocate::<bool>().unwrap();
         let v_ref = handler.read(&validation_block).unwrap();
 
@@ -1210,8 +1247,8 @@ mod tests {
                 let local_as = AtomicString::from(s_handler, as_offset).unwrap();
                 let mut local_v = s_handler.get_block::<bool>(v_offset).unwrap();
 
-                if local_as.eq(s_handler, long_string.into()) {
-                    unsafe { s_handler.write(&mut local_v, true).unwrap() }
+                unsafe { 
+                    s_handler.write(&mut local_v, local_as.eq(s_handler, long_string.into())).unwrap() 
                 }
             });
         });
@@ -1224,11 +1261,7 @@ mod tests {
     #[test]
     fn test_quorum_idling() {
         let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
-        let atomic_string = AtomicString::new(
-            handler.share(),
-            "".into(),
-            Some(4)
-        ).unwrap();
+        let atomic_string = AtomicString::new(handler.share(), "".into(), Some(4)).unwrap();
         let validation_block = handler.allocate::<bool>().unwrap();
         let v_ref = handler.read(&validation_block).unwrap();
 
@@ -1240,57 +1273,20 @@ mod tests {
             let as_offset = atomic_string.offset();
             let v_offset = validation_block.header_offset();
 
-            s.spawn(move || {
-                let local_as = AtomicString::from(s_handler, as_offset).unwrap();
-                let mut local_v = s_handler.get_block::<bool>(v_offset).unwrap();
+            for _ in 0..4 {
+                s.spawn(move || {
+                    let local_as = AtomicString::from(s_handler, as_offset).unwrap();
+                    let mut local_v = s_handler.get_block::<bool>(v_offset).unwrap();
 
-                while local_as.read(s_handler).is_none() {}
+                    while local_as.read(s_handler).is_none() {}
 
-                if local_as.pending_agreements() == 0 {
-                    unsafe { s_handler.write(&mut local_v, true).unwrap() };
-                } else {
-                    assert!(local_as.state.load(Ordering::Acquire) == READING);
-                }
-            });
-
-            s.spawn(move || {
-                let local_as = AtomicString::from(s_handler, as_offset).unwrap();
-                let mut local_v = s_handler.get_block::<bool>(v_offset).unwrap();
-
-                while local_as.read(s_handler).is_none() {}
-                
-                if local_as.pending_agreements() == 0 {
-                    unsafe { s_handler.write(&mut local_v, true).unwrap() };
-                } else {
-                    assert!(local_as.state.load(Ordering::Acquire) == READING);
-                }
-            });
-
-            s.spawn(move || {
-                let local_as = AtomicString::from(s_handler, as_offset).unwrap();
-                let mut local_v = s_handler.get_block::<bool>(v_offset).unwrap();
-
-                while local_as.read(s_handler).is_none() {}
-
-                if local_as.pending_agreements() == 0 {
-                    unsafe { s_handler.write(&mut local_v, true).unwrap() };
-                } else {
-                    assert!(local_as.state.load(Ordering::Acquire) == READING);
-                }
-            });
-
-            s.spawn(move || {
-                let local_as = AtomicString::from(s_handler, as_offset).unwrap();
-                let mut local_v = s_handler.get_block::<bool>(v_offset).unwrap();
-
-                while local_as.read(s_handler).is_none() {}
-
-                if local_as.pending_agreements() == 0 {
-                    unsafe { s_handler.write(&mut local_v, true).unwrap() };
-                } else {
-                    assert!(local_as.state.load(Ordering::Acquire) == READING);
-                }
-            });
+                    if local_as.pending_agreements() == 0 {
+                        unsafe { s_handler.write(&mut local_v, true).unwrap() }
+                    } else {
+                        assert!(local_as.state.load(Ordering::Acquire) == READING);
+                    }
+                });
+            }
         });
 
         assert!(*v_ref);
@@ -1319,9 +1315,13 @@ mod tests {
                 let local_c = s_handler.get_block::<u32>(c_offset).unwrap();
                 let mut c_ref = s_handler.read_mut(&local_c).unwrap();
 
-                local_as.for_each_char(s_handler, |v| {
-                    if v == 's' || v == 'S' { *c_ref += 1 };
-                }).unwrap();
+                local_as
+                    .for_each_char(s_handler, |v| {
+                        if v == 's' || v == 'S' {
+                            *c_ref += 1;
+                        }
+                    })
+                    .unwrap();
             });
         });
 
@@ -1343,8 +1343,12 @@ mod tests {
 
             s.spawn(move || {
                 let local_as = AtomicString::from(s_handler, as_offset).unwrap();
-                
-                local_as.for_each_char_mut(s_handler, |v| *v = 'a').unwrap();
+
+                local_as
+                    .for_each_char_mut(s_handler, |v| {
+                        *v = 'a';
+                    })
+                    .unwrap();
             });
         });
 
