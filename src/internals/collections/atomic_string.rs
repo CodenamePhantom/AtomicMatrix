@@ -118,6 +118,12 @@ const STRING_CHAIN: u32 = 900_001;
 /// How many chars will be stored per chain link
 const CHAR_COUNT: usize = 64;
 
+enum ClosureFlags {
+    Break,
+    Error,
+    Next(u32),
+}
+
 /// AtomicString struct
 ///
 /// It works as the head segment of the atomic string, holding critical metadata that all
@@ -283,8 +289,8 @@ impl AtomicString {
     )
         -> Option<()>
         where
-            F: FnMut(TypeGuardMut<AtomicString>, &mut T) -> Option<()>,
-            G: FnMut(Option<(TypeGuardMut<StringChain>, u32)>, &mut T) -> Option<Result<u32, ()>>
+            F: FnMut(TypeGuardMut<AtomicString>, &mut T) -> ClosureFlags,
+            G: FnMut(Option<(TypeGuardMut<StringChain>, u32)>, &mut T) -> ClosureFlags
     {
         let mut is_head = true;
         let mut next_link = self.next_overflow.load(Ordering::Acquire);
@@ -293,8 +299,10 @@ impl AtomicString {
             if is_head {
                 let as_block = s_handler.get_block(self.offset()).ok()?;
                 let str_ref = s_handler.read_mut(&as_block).ok()?;
-                if head_fn(str_ref, context).is_none() {
-                    return None;
+                match head_fn(str_ref, context) {
+                    ClosureFlags::Next(v) => next_link = v,
+                    ClosureFlags::Error => return None,
+                    ClosureFlags::Break => break,
                 }
                 is_head = false;
             } else {
@@ -304,15 +312,15 @@ impl AtomicString {
                     next_link = match
                         chain_fn(Some((str_ref, chain_block.header_offset())), context)
                     {
-                        Some(v) => v.ok()?,
-                        None => 0,
+                        ClosureFlags::Next(v) => v,
+                        ClosureFlags::Error => return None,
+                        ClosureFlags::Break => break,
                     };
                 } else {
                     next_link = match chain_fn(None, context) {
-                        Some(v) => v.ok()?,
-                        None => {
-                            break;
-                        }
+                        ClosureFlags::Next(v) => v,
+                        ClosureFlags::Error => return None,
+                        ClosureFlags::Break => break,
                     };
                 }
             }
@@ -573,7 +581,7 @@ impl AtomicString {
                         str_ref.string_length.store(value.chars().count(), Ordering::Release);
 
                         touched.set(true);
-                        return Some(());
+                        return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
                     },
                     |str_pack, chars_ctx| {
                         let mut next_offset = 0;
@@ -592,20 +600,16 @@ impl AtomicString {
                             }
                             None => {
                                 if chars_ctx.peek().is_none() {
-                                    return None;
+                                    return ClosureFlags::Break;
                                 } else {
-                                    let block = match s_handler.allocate::<StringChain>() {
-                                        Ok(v) => v,
-                                        Err(_) => {
-                                            return Some(Err(()));
-                                        }
+                                    let Ok(block) = s_handler.allocate::<StringChain>()
+                                    else {
+                                            return ClosureFlags::Error;
                                     };
-                                    match s_handler.set_state(&block, STRING_CHAIN) {
-                                        Ok(_) => {}
-                                        Err(_) => {
-                                            return Some(Err(()));
-                                        }
-                                    }
+                                    if s_handler.set_state(&block, STRING_CHAIN).is_err() {
+                                        return ClosureFlags::Error;
+                                    };
+
                                     (s_handler.read_mut(&block).unwrap(), block.header_offset())
                                 }
                             }
@@ -621,31 +625,23 @@ impl AtomicString {
 
                         if chars_ctx.peek().is_none() {
                             while next_offset != 0 {
-                                let mut extra_block = match
-                                    s_handler.get_block::<StringChain>(next_offset)
-                                {
-                                    Ok(v) => v,
-                                    Err(_) => {
-                                        return Some(Err(()));
-                                    }
+                                let Ok(mut extra_block) = s_handler.get_block::<StringChain>(next_offset)
+                                else {
+                                    return ClosureFlags::Error;
                                 };
-                                let extra_str = match s_handler.read_mut(&mut extra_block) {
-                                    Ok(v) => v,
-                                    Err(_) => {
-                                        return Some(Err(()));
-                                    }
+                                let Ok(extra_str) = s_handler.read_mut(&mut extra_block) 
+                                else {
+                                    return ClosureFlags::Error;
                                 };
+
                                 next_offset = extra_str.next_overflow.load(Ordering::Acquire);
-                                match s_handler.free(extra_block) {
-                                    Ok(_) => {}
-                                    Err(_) => {
-                                        return Some(Err(()));
-                                    }
+                                if s_handler.free(extra_block).is_err() {
+                                    return ClosureFlags::Error;
                                 };
                             }
-                            return None;
+                            return ClosureFlags::Break;
                         } else {
-                            return Some(Ok(next_offset));
+                            return ClosureFlags::Next(next_offset);
                         }
                     }
                 )
@@ -694,7 +690,7 @@ impl AtomicString {
                         );
                         touched.set(true);
 
-                        return Some(());
+                        return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
                     },
                     |str_pack, chars_ctx| {
                         let template_str = StringChain {
@@ -710,28 +706,20 @@ impl AtomicString {
                             }
                             None => {
                                 if chars_ctx.peek().is_none() {
-                                    return None;
+                                    return ClosureFlags::Break;
                                 } else {
-                                    let mut v = match s_handler.allocate::<StringChain>() {
-                                        Ok(v) => v,
-                                        Err(_) => {
-                                            return Some(Err(()));
-                                        }
+                                    let Ok(mut v) = s_handler.allocate::<StringChain>() 
+                                    else {
+                                        return ClosureFlags::Error;
                                     };
                                     unsafe {
-                                        match s_handler.write(&mut v, template_str) {
-                                            Ok(_) => {}
-                                            Err(_) => {
-                                                return Some(Err(()));
-                                            }
+                                        if s_handler.write(&mut v, template_str).is_err() {
+                                            return ClosureFlags::Error;
                                         }
                                     }
-                                    match s_handler.set_state(&v, STRING_CHAIN) {
-                                        Ok(_) => {}
-                                        Err(_) => {
-                                            return Some(Err(()));
-                                        }
-                                    }
+                                    if s_handler.set_state(&v, STRING_CHAIN).is_err() {
+                                        return ClosureFlags::Error;
+                                    };
 
                                     (s_handler.read_mut(&v).unwrap(), v.header_offset())
                                 }
@@ -753,12 +741,12 @@ impl AtomicString {
 
                             prev_str = Some(str_ref);
                             if chars_ctx.peek().is_none() {
-                                return None;
+                                return ClosureFlags::Break;
                             } else {
-                                return Some(Ok(next_offset));
+                                return ClosureFlags::Next(next_offset);
                             }
                         } else {
-                            return Some(Ok(str_ref.next_overflow.load(Ordering::Acquire)));
+                            return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
                         }
                     }
                 )
@@ -790,7 +778,7 @@ impl AtomicString {
                     self.traverse_string(
                         s_handler,
                         &mut str_buffs,
-                        |_, buff| {
+                        |str_ref, buff| {
                             let head_str = self.str
                                 .iter()
                                 .take_while(|&&c| c != '\0')
@@ -798,7 +786,7 @@ impl AtomicString {
 
                             buff.push(head_str);
 
-                            return Some(());
+                            return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
                         },
                         |mut str_pack, buff| {
                             if let Some((str_ref, _)) = str_pack.take() {
@@ -809,9 +797,9 @@ impl AtomicString {
 
                                 buff.push(str_chain);
 
-                                return Some(Ok(str_ref.next_overflow.load(Ordering::Acquire)));
+                                return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
                             } else {
-                                return None;
+                                return ClosureFlags::Break;
                             }
                         }
                     )
@@ -850,17 +838,17 @@ impl AtomicString {
                     self.traverse_string(
                         s_handler,
                         &mut chars,
-                        |_, chars_ctx| {
+                        |str_ref, chars_ctx| {
                             let char_arr: [char; CHAR_COUNT] = array::from_fn(|_|
                                 chars_ctx.next().unwrap_or('\0')
                             );
                             for (idx, char) in char_arr.iter().enumerate() {
                                 if *char != self.str[idx] {
-                                    return None;
+                                    return ClosureFlags::Error;
                                 }
                             }
 
-                            return Some(());
+                            return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
                         },
                         |mut str_pack, chars_ctx| {
                             let char_arr: [char; CHAR_COUNT] = array::from_fn(|_|
@@ -872,14 +860,14 @@ impl AtomicString {
 
                                 for (idx, char) in char_arr.iter().enumerate() {
                                     if *char != str_ref.str[idx] {
-                                        return None;
+                                        return ClosureFlags::Error;
                                     }
                                 }
                             } else {
-                                return None;
+                                return ClosureFlags::Break;
                             }
 
-                            return Some(Ok(next_offset));
+                            return ClosureFlags::Next(next_offset);
                         }
                     )
                 })
@@ -913,13 +901,13 @@ impl AtomicString {
             self.traverse_string(
                 s_handler,
                 &mut f,
-                |_, func| {
+                |str_ref, func| {
                     self.str
                         .iter()
                         .take_while(|&&c| c != '\0')
                         .for_each(|v| func(*v));
 
-                    return Some(());
+                    return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
                 },
                 |mut str_pack, func| {
                     let next_offset;
@@ -928,18 +916,56 @@ impl AtomicString {
 
                         str_ref.str
                             .iter()
-                            .take_while(|&&c| c != '\0')
+                            .take_while(|c| **c != '\0')
                             .for_each(|v| func(*v));
 
-                        return Some(Ok(next_offset));
+                        return ClosureFlags::Next(next_offset);
                     } else {
-                        return None;
+                        return ClosureFlags::Break;
                     }
                 }
             )
         })
     }
 
+    pub fn for_each_char_mut<F>(&mut self, s_handler: SharedHandler, mut f: F) -> Option<()>
+        where F: FnMut(&mut char)
+    {
+        if self.is_corrupted.load(Ordering::Acquire) {
+            return None;
+        }
+        let touched = Cell::new(false);
+
+        self.acquire_write(|| {
+            self.traverse_string(
+                s_handler,
+                &mut f,
+                |mut str_ref, func| {
+                    str_ref.str
+                        .iter_mut()
+                        .take_while(|c| **c != '\0')
+                        .for_each(|v| func(v));
+
+                    return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
+                },
+                |mut str_pack, func| {
+                    let next_offset;
+                    if let Some((mut str_ref, _)) = str_pack.take() {
+                        next_offset = str_ref.next_overflow.load(Ordering::Acquire);
+
+                        str_ref.str
+                            .iter_mut()
+                            .take_while(|c| **c != '\0')
+                            .for_each(|v| func(v));
+
+                        return ClosureFlags::Next(next_offset);
+                    } else {
+                        return ClosureFlags::Break;
+                    }
+                }
+            )
+        }, &touched, s_handler)
+    }
     /// Clears the whole string, leaving only the AtomicString head block filled with NULL chars.
     ///
     /// This function follows the same premise of the write call, where only one writer can
@@ -965,27 +991,22 @@ impl AtomicString {
                         str_ref.str = char_arr;
                         str_ref.string_length.store(0, Ordering::Release);
 
-                        return Some(());
+                        return ClosureFlags::Next(str_ref.next_overflow.load(Ordering::Acquire));
                     },
                     |mut str_pack, _| {
                         if let Some((str_ref, this_offset)) = str_pack.take() {
-                            let block = match s_handler.get_block::<StringChain>(this_offset) {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    return Some(Err(()));
-                                }
+                            let Ok(block) = s_handler.get_block::<StringChain>(this_offset) 
+                            else {
+                                return ClosureFlags::Error;
                             };
                             let next_offset = str_ref.next_overflow.load(Ordering::Acquire);
-                            match s_handler.free(block) {
-                                Ok(v) => v,
-                                Err(_) => {
-                                    return Some(Err(()));
-                                }
+                            if s_handler.free(block).is_err() {
+                                return ClosureFlags::Error;
                             }
 
-                            return Some(Ok(next_offset));
+                            return ClosureFlags::Next(next_offset);
                         } else {
-                            return None;
+                            return ClosureFlags::Break;
                         }
                     }
                 )
@@ -1044,15 +1065,20 @@ impl AtomicString {
 
     /// Return the amount of agreements pending for this string to be marked as IDLE.
     pub fn pending_agreements(&self) -> u32 {
-        return self.agreement.load(Ordering::Acquire) - self.curr_agreed.load(Ordering::Acquire);
+        if self.state.load(Ordering::Acquire) == READING && self.agreement.load(Ordering::Acquire) > 0 {
+            return self.agreement.load(Ordering::Acquire) - self.curr_agreed.load(Ordering::Acquire);
+        } else {
+            return 0
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use std::time::Duration;
 
-use crate::{
+    use crate::{
         core::{ handlers::HandlerFunctions, matrix::AtomicMatrix },
         internals::collections::{ atomic_string::AtomicString, memory_scale },
     };
@@ -1193,5 +1219,135 @@ use crate::{
         assert!(*v_ref);
 
         unsafe { handler.die().unwrap() }
+    }
+
+    #[test]
+    fn test_quorum_idling() {
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+        let atomic_string = AtomicString::new(
+            handler.share(),
+            "".into(),
+            Some(4)
+        ).unwrap();
+        let validation_block = handler.allocate::<bool>().unwrap();
+        let v_ref = handler.read(&validation_block).unwrap();
+
+        atomic_string.write(handler.share(), "This string requires quorum".into()).unwrap();
+        assert_eq!(atomic_string.state.load(Ordering::Acquire), NEW);
+
+        std::thread::scope(|s| {
+            let s_handler = handler.share();
+            let as_offset = atomic_string.offset();
+            let v_offset = validation_block.header_offset();
+
+            s.spawn(move || {
+                let local_as = AtomicString::from(s_handler, as_offset).unwrap();
+                let mut local_v = s_handler.get_block::<bool>(v_offset).unwrap();
+
+                while local_as.read(s_handler).is_none() {}
+
+                if local_as.pending_agreements() == 0 {
+                    unsafe { s_handler.write(&mut local_v, true).unwrap() };
+                } else {
+                    assert!(local_as.state.load(Ordering::Acquire) == READING);
+                }
+            });
+
+            s.spawn(move || {
+                let local_as = AtomicString::from(s_handler, as_offset).unwrap();
+                let mut local_v = s_handler.get_block::<bool>(v_offset).unwrap();
+
+                while local_as.read(s_handler).is_none() {}
+                
+                if local_as.pending_agreements() == 0 {
+                    unsafe { s_handler.write(&mut local_v, true).unwrap() };
+                } else {
+                    assert!(local_as.state.load(Ordering::Acquire) == READING);
+                }
+            });
+
+            s.spawn(move || {
+                let local_as = AtomicString::from(s_handler, as_offset).unwrap();
+                let mut local_v = s_handler.get_block::<bool>(v_offset).unwrap();
+
+                while local_as.read(s_handler).is_none() {}
+
+                if local_as.pending_agreements() == 0 {
+                    unsafe { s_handler.write(&mut local_v, true).unwrap() };
+                } else {
+                    assert!(local_as.state.load(Ordering::Acquire) == READING);
+                }
+            });
+
+            s.spawn(move || {
+                let local_as = AtomicString::from(s_handler, as_offset).unwrap();
+                let mut local_v = s_handler.get_block::<bool>(v_offset).unwrap();
+
+                while local_as.read(s_handler).is_none() {}
+
+                if local_as.pending_agreements() == 0 {
+                    unsafe { s_handler.write(&mut local_v, true).unwrap() };
+                } else {
+                    assert!(local_as.state.load(Ordering::Acquire) == READING);
+                }
+            });
+        });
+
+        assert!(*v_ref);
+
+        unsafe { handler.die().unwrap() }
+    }
+
+    #[test]
+    fn test_for_each_char() {
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+        let atomic_string = AtomicString::new(
+            handler.share(),
+            "This is a string with 5 S's".into(),
+            Some(4)
+        ).unwrap();
+        let count_block = handler.allocate::<u32>().unwrap();
+        let count_ref = handler.read(&count_block).unwrap();
+
+        std::thread::scope(|s| {
+            let as_offset = atomic_string.offset();
+            let c_offset = count_block.header_offset();
+            let s_handler = handler.share();
+
+            s.spawn(move || {
+                let local_as = AtomicString::from(s_handler, as_offset).unwrap();
+                let local_c = s_handler.get_block::<u32>(c_offset).unwrap();
+                let mut c_ref = s_handler.read_mut(&local_c).unwrap();
+
+                local_as.for_each_char(s_handler, |v| {
+                    if v == 's' || v == 'S' { *c_ref += 1 };
+                }).unwrap();
+            });
+        });
+
+        assert_eq!(*count_ref, 5);
+    }
+
+    #[test]
+    fn test_for_each_char_mut() {
+        let handler = AtomicMatrix::bootstrap(None, SIZE).unwrap();
+        let atomic_string = AtomicString::new(
+            handler.share(),
+            "I'm a string".into(),
+            Some(4)
+        ).unwrap();
+
+        std::thread::scope(|s| {
+            let as_offset = atomic_string.offset();
+            let s_handler = handler.share();
+
+            s.spawn(move || {
+                let local_as = AtomicString::from(s_handler, as_offset).unwrap();
+                
+                local_as.for_each_char_mut(s_handler, |v| *v = 'a').unwrap();
+            });
+        });
+
+        assert_eq!(atomic_string.read(handler.share()).unwrap(), "aaaaaaaaaaaa")
     }
 }
