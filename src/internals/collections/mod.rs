@@ -12,3 +12,4 @@ pub mod uid_lite;
 pub mod memory_scale;
 pub mod atomic_timestamp;
 pub mod atomic_string;
+pub mod atomic_fast_string;

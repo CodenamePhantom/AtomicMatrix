@@ -101,7 +101,7 @@ use std::{
     sync::atomic::{ AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering },
 };
 
-use crate::{ helpers::type_guard::TypeGuardMut, prelude::* };
+use crate::{ helpers::{ rollback::Rollback, type_guard::TypeGuardMut }, prelude::* };
 
 /// Marks a string as IDLE, so writers know when its available for writing
 const IDLE: u8 = 0;
@@ -162,47 +162,6 @@ pub struct StringChain {
     str: [char; CHAR_COUNT],
     /// THe offset to the next link in this string's chain.
     next_overflow: AtomicU32,
-}
-
-/// Defer is a RAII trigger that accepts a rollback function to be executed on the AtomicString.
-///
-/// Methods implement this to either free strings back, decrement readers, sinalize corruption, or
-/// whatever the current saga may require as compensation.
-///
-/// ### Panic!
-///
-/// If the rollback function also requires calls that would fail, they invariantly have to panic!
-/// the caller if something goes wrong, as the closure does not accept any kind of returns from it.
-struct Defer<F: FnOnce()>(Option<F>);
-
-impl<F: FnOnce()> Defer<F> {
-    /// Sets the rollback function to be executed on dropping the Defer while its still armed.
-    ///
-    /// ### Params
-    /// @f: The rollback function for the RAII guard.
-    ///
-    /// ### Returns
-    /// An instance of self that will be dropped at the end of the scope.
-    pub fn set(f: F) -> Self {
-        return Self(Some(f));
-    }
-
-    /// Disarms the rollback in the RAII guard before dropping the scope.
-    ///
-    /// This ideally should be called after all breakable calls that are recoverable are completed
-    /// to avoid triggering a rollback in a successful execution.
-    pub fn disarm(&mut self) {
-        self.0 = None;
-    }
-}
-
-/// Drop implementation for Defer. Calls the rollback on being dropped.
-impl<F: FnOnce()> Drop for Defer<F> {
-    fn drop(&mut self) {
-        if let Some(f) = self.0.take() {
-            f();
-        }
-    }
 }
 
 impl AtomicString {
@@ -358,7 +317,7 @@ impl AtomicString {
     #[inline]
     fn acquire_read<F>(&self, exec: F) -> Option<()> where F: FnOnce() -> Option<()> {
         if self.state.swap_if_not(WRITING, READING, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-            let mut rollback = Defer::set(|| {
+            let mut rollback = Rollback::set(|| {
                 self.reader_decrease();
             });
 
@@ -397,7 +356,7 @@ impl AtomicString {
         where F: FnOnce() -> Option<()>
     {
         if self.state.compare_exchange(IDLE, WRITING, Ordering::SeqCst, Ordering::Relaxed).is_ok() {
-            let mut rollback = Defer::set(|| {
+            let mut rollback = Rollback::set(|| {
                 if touched.get() {
                     self.is_corrupted.store(true, Ordering::Release);
                 }
@@ -445,7 +404,7 @@ impl AtomicString {
         let mut chars = value.chars().peekable();
         let is_head = Cell::new(true);
 
-        let mut rollback = Defer::set(|| {
+        let mut rollback = Rollback::set(|| {
             is_head.set(true);
             loop {
                 if is_head.get() {
@@ -1102,7 +1061,9 @@ impl AtomicString {
             self.state.load(Ordering::Acquire) == READING &&
             self.agreement.load(Ordering::Acquire) > 0
         {
-            return self.agreement.load(Ordering::Acquire) - self.curr_agreed.load(Ordering::Acquire);
+            return (
+                self.agreement.load(Ordering::Acquire) - self.curr_agreed.load(Ordering::Acquire)
+            );
         } else {
             return 0;
         }
@@ -1217,8 +1178,13 @@ mod tests {
                 let local_as = AtomicString::from(s_handler, as_offset).unwrap();
                 let mut local_v = s_handler.get_block::<bool>(v_offset).unwrap();
 
-                unsafe { 
-                    s_handler.write(&mut local_v, !local_as.eq(s_handler, "Now i'm a new string!".into())).unwrap() 
+                unsafe {
+                    s_handler
+                        .write(
+                            &mut local_v,
+                            !local_as.eq(s_handler, "Now i'm a new string!".into())
+                        )
+                        .unwrap()
                 }
             });
         });
@@ -1247,8 +1213,10 @@ mod tests {
                 let local_as = AtomicString::from(s_handler, as_offset).unwrap();
                 let mut local_v = s_handler.get_block::<bool>(v_offset).unwrap();
 
-                unsafe { 
-                    s_handler.write(&mut local_v, local_as.eq(s_handler, long_string.into())).unwrap() 
+                unsafe {
+                    s_handler
+                        .write(&mut local_v, local_as.eq(s_handler, long_string.into()))
+                        .unwrap()
                 }
             });
         });

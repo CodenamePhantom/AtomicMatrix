@@ -14,7 +14,11 @@ use std::sync::atomic::*;
 /// Callers can implement this trait to whatever types they want, even heap allocated ones. But this
 /// behaviour is not recommended and it **WILL** cause undefined behaviour.
 pub unsafe trait SafeSHM: 'static {}
+pub unsafe trait SafeSHMUnsized: SafeSHM {
+    unsafe fn from_raw_parts(ptr: *const u8, byte_len: usize) -> *const Self;
+}
 
+/// Sized types
 unsafe impl SafeSHM for u8 {}
 unsafe impl SafeSHM for u16 {}
 unsafe impl SafeSHM for u32 {}
@@ -49,3 +53,17 @@ unsafe impl<T: SafeSHM> SafeSHM for Cell<T> {}
 unsafe impl<T: SafeSHM> SafeSHM for Option<T> {}
 unsafe impl<T: SafeSHM> SafeSHM for PhantomData<T> {}
 unsafe impl<T: SafeSHM, const N: usize> SafeSHM for [T; N] {}
+
+/// Unsized types
+unsafe impl SafeSHM for str {}
+unsafe impl SafeSHMUnsized for str {
+    unsafe fn from_raw_parts(ptr: *const u8, byte_len: usize) -> *const Self {
+        std::ptr::slice_from_raw_parts(ptr, byte_len) as *const str
+    }
+}
+unsafe impl<T: SafeSHM> SafeSHM for [T] {}
+unsafe impl<T: SafeSHM> SafeSHMUnsized for [T] {
+    unsafe fn from_raw_parts(ptr: *const u8, byte_len: usize) -> *const Self {
+        std::ptr::slice_from_raw_parts(ptr as *const T, byte_len / std::mem::size_of::<T>())    
+    }
+}

@@ -3,7 +3,7 @@
 //! All types passed through this helper can be safely coordinated between threads, as passing the
 //! same type from a different caller process will result in the same hash.
 
-use crate::{core::matrix::helpers::HEADER_SPACE, prelude::{ Block, TAG_SIZE }};
+use crate::{core::matrix::helpers::HEADER_SPACE, prelude::Block};
 
 use std::any::type_name;
 
@@ -17,7 +17,7 @@ use std::any::type_name;
 ///
 /// ### Returns:
 /// The hashed type name in u32 format.
-pub fn make<T>() -> u64 {
+pub fn make<T: ?Sized>() -> u64 {
     let name = type_name::<T>();
     return fnv1a_32(name.as_bytes());
 }
@@ -33,7 +33,7 @@ pub fn make<T>() -> u64 {
 ///
 /// ### Returns:
 /// A bool stating if the types matches or not.
-pub fn compare<T>(block: &Block<T>, base_ptr: *const u8) -> bool {
+pub fn compare<T: ?Sized>(block: &Block<T>, base_ptr: *const u8) -> bool {
     let addr = unsafe { base_ptr.add((block.header_offset() + HEADER_SPACE) as usize) };
 
     let stored_tag = unsafe { (addr as *const u64).read() };

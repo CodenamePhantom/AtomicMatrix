@@ -65,6 +65,7 @@
 //! safety surfaces must be implemented to ensure an attacker cannot reach the matrix SHM arena
 //! directly (LSM protection, server hardening, infrastructure security, etc).
 
+use crate::helpers::safe_shm::SafeSHMUnsized;
 use crate::internals::error_collection::HandlerErrors;
 use crate::helpers::type_guard::*;
 use crate::helpers::safe_shm::SafeSHM;
@@ -99,11 +100,13 @@ pub const STATE_LOCK: u32 = 4;
 /// Blocks carry no lifetime parameter. The caller is responsible for not using
 /// a block after freeing it or after the handler is dropped.
 #[derive(Debug)]
-pub struct Block<T> {
+pub struct Block<T: ?Sized> {
     /// Payload offset from SHM base — points past the `BlockHeader`.
     pointer: RelativePtr<T>,
     base_ref: usize,
 }
+
+pub struct Untyped {}
 
 /// A lightweight reflection of the original handler that can be safely sent
 /// across threads.
@@ -139,7 +142,7 @@ pub struct MatrixHandler {
     id: String,
 }
 
-impl<T> Block<T> {
+impl<T: ?Sized> Block<T> {
     /// Constructs a `Block<T>` from a raw payload offset.
     ///
     /// ### Safety:
@@ -203,7 +206,7 @@ impl<T> Block<T> {
     /// ### Returns:
     /// A generic RelativePtr of the block, without the type_tag offset.
     pub fn tagless_ptr(&self) -> RelativePtr<u8> {
-        RelativePtr::<u8>::new(self.pointer.offset() - TAG_SIZE as u32)
+        RelativePtr::<u8>::new(self.pointer.offset() - (TAG_SIZE as u32))
     }
 }
 
@@ -375,16 +378,47 @@ pub trait HandlerFunctions {
     /// ### Returns
     /// A result containing either the RelativePtr, or a HandlerErrors.
     fn allocate_raw(&self, size: u32) -> Result<RelativePtr<u8>, HandlerErrors> {
-        match self.matrix().allocate(self.base_ptr(), size) {
-            Ok(v) => {
-                return Ok(v);
-            }
+        let ptr = self.matrix().allocate(self.base_ptr(), size)
+            .map_err(|e| HandlerErrors::AllocationFailed { reason: format!("{:?}", e) })?;
+
+        Ok(ptr)
+    }
+
+    /// Allocates a marked block with unknown size at compile time.
+    /// 
+    /// Marked blocks are read only, and a value must be written at allocation.
+    /// 
+    /// ### Params
+    /// @value: The value to spawn the block with.
+    /// 
+    /// ### Returns
+    /// A result containing either the Block
+    fn allocate_marked<T: ?Sized + SafeSHMUnsized>(&self, value: &T) -> Result<Block<T>, HandlerErrors> {
+        let tag = type_tag::make::<T>();
+        let size = size_of_val(value);
+
+        let ptr = match self.matrix().allocate(self.base_ptr(), size as u32 + TAG_SIZE) {
+            Ok(v) => v,
             Err(e) => {
-                return Err(HandlerErrors::AllocationFailed {
-                    reason: format!("{:?}", e),
-                });
+                return Err(HandlerErrors::AllocationFailed { reason: format!("{:?}", e) })
             }
+        };
+
+        unsafe {
+            *(self.base_ptr().add(ptr.offset() as usize) as *mut u64) = tag;
         }
+
+        unsafe {
+            let payload = std::ptr::from_ref(value) as *const u8;
+            let dst = self
+                .base_ptr()
+                .add((ptr.offset() + TAG_SIZE) as usize) as *mut u8;
+            std::ptr::copy_nonoverlapping(payload, dst, size);
+        }
+
+        let block = Block::<T>::from_offset(ptr.offset() + TAG_SIZE, self.base_ptr() as usize);
+
+        return  Ok(block);
     }
 
     /// Writes a value of type `T` into an allocated block.
@@ -682,6 +716,44 @@ pub trait HandlerFunctions {
         Ok(data_cp)
     }
 
+    /// Reads a reference to a marked block value.
+    /// 
+    /// ### Safety:
+    /// Deferencing this value checks if it still exists inside the matrix before returning the
+    /// value. If the value has been deallocated, the call will panic. It also does not ensure
+    /// exclusive access to the value.
+    ///
+    /// UnsizedGuard provides a safer method called `try_get()` that returns None if the value has 
+    /// been deallocated instead of panicking
+    /// 
+    /// ### Params:
+    /// @block: The block to get a reference from.
+    ///
+    /// ### Returns:
+    /// A result containing either a reference to T, or a HandlerErrors.
+    fn read_marked<T: ?Sized + SafeSHMUnsized>(&self, block: &Block<T>) -> Result<UnsizedGuard<T>, HandlerErrors> {
+        match self.matrix().checked_query(self.base_ptr(), block.header_offset()) {
+            Ok(_) => {}
+            Err(_) => {
+                return Err(HandlerErrors::InvalidOffset {
+                    offset: block.pointer.offset(),
+                });
+            }
+        }
+
+        if !type_tag::compare::<T>(&block, self.base_ptr()) {
+            return Err(HandlerErrors::TypeMismatchError);
+        }
+
+        let mut_data = UnsizedGuard::<T>::new(
+            block.pointer().offset(),
+            block.header_offset(),
+            block.base_ref as *const u8
+        );
+
+        return Ok(mut_data);
+    }
+
     /// Locks the block while inside a provided expression scope, giving a reference to the
     /// underlying value.
     ///
@@ -820,6 +892,83 @@ pub trait HandlerFunctions {
                         return None;
                     }
                     continue;
+                }
+            }
+        }
+
+        return Some(());
+    }
+
+    /// Locks the block while inside a provided expression scope, giving a reference to the
+    /// underlying value.
+    ///
+    /// This function ensures an exclusive read operation on the block data inside the MatrixHandler
+    /// contract, as it transitions the block to STATE_LOCK, and every participant that adheres to
+    /// the handler API respect the block present state.
+    ///
+    /// If a call stumbles upon a STATE_LOCK block, it will retry to acquire exclusivity 512 times
+    /// before returning None
+    /// 
+    /// This call is safe for unsized types.
+    ///
+    /// ### Warning
+    ///
+    /// If a participant crashes holding this block inline ref, the segment will stale inside
+    /// STATE_LOCK unless some action is taken. Callers are required to manage their own block
+    /// recovery logic, as blocks can still have their state transitioned manually even when set
+    /// to LOCK
+    ///
+    /// ### Params:
+    /// @block: The block to execute the expression on. \
+    /// @expr: The inline closure to execute.
+    ///
+    /// ### Returns:
+    /// An Option stating the success of the execution.
+    fn inline_marked<T: ?Sized + SafeSHMUnsized, F>(&self, block: &Block<T>, expr: F) -> Option<()>
+    where 
+        F: FnOnce(UnsizedGuard<T>)
+    {
+        let mut retry_count = 0;
+        self.matrix().checked_query(self.base_ptr(), block.header_offset()).ok()?;
+
+        let header = unsafe { block.header() };
+
+        loop {
+            let curr_state = unsafe { block.header().state.load(Ordering::Acquire) };
+
+            if curr_state == STATE_LOCK {
+                retry_count += 1;
+                if retry_count >= 512 {
+                    return None;
+                }
+                continue;
+            }
+
+            match
+                header.state.compare_exchange(
+                    curr_state,
+                    STATE_LOCK,
+                    Ordering::Acquire,
+                    Ordering::Relaxed
+                )
+            {
+                Ok(_) => {
+                    let exec_res = match self.read_marked(block) {
+                        Ok(rt_ref) => unwind!(expr(rt_ref)),
+                        Err(e) => Err(e),
+                    };
+                    header.state.store(curr_state, Ordering::Release);
+                    exec_res.ok()?;
+
+                    break;
+                }
+                Err(_) => {
+                    retry_count += 1;
+                    if retry_count >= 512 {
+                        return None;
+                    } else {
+                        continue;
+                    }
                 }
             }
         }

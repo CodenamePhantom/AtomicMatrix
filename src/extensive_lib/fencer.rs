@@ -265,7 +265,7 @@ impl Fencer {
 
         let id = block.pointer().offset() - HEADER_SPACE;
         let acl = self.generate_acl(id, dataplane.hash_id(priv_id), None, perms).unwrap();
-        unsafe { block.pointer().write(dataplane.base_ptr(), acl) };
+        // unsafe { block.pointer().write(dataplane.base_ptr(), acl) };
         let current_range_peak = self.guard_range.1.load(Ordering::Acquire);
         if id > current_range_peak {
             self.guard_range.1.store(id, Ordering::Release);

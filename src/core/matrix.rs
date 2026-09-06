@@ -141,7 +141,7 @@ pub struct AtomicMatrix {
 /// It also receives a PhantomData to inform the compiler we safely own whatever
 /// generic type the caller has passed to this pointer.
 #[derive(Debug)]
-pub struct RelativePtr<T> {
+pub struct RelativePtr<T: ?Sized> {
     offset: u32,
     _marker: PhantomData<T>,
 }
@@ -649,7 +649,7 @@ impl AtomicMatrix {
 /// provided address is valid and functional inside the matrix. Therefore, the
 /// caller must ensure that any operations executed are checked and valid before
 /// proceeding.
-impl<T> RelativePtr<T> {
+impl<T: ?Sized> RelativePtr<T> {
     /// Creates a new relative pointer based on the provided offset
     ///
     /// This initializes the pointer with the PhantomData ownership over the type
@@ -722,7 +722,10 @@ impl<T> RelativePtr<T> {
     ///
     /// ### Returns:
     /// A life time specified reference to the block scope.
-    pub unsafe fn resolve<'a>(&self, base_ptr: *const u8) -> &'a T {
+    pub unsafe fn resolve<'a>(&self, base_ptr: *const u8) -> &'a T
+    where
+        T: Sized,
+    {
         unsafe { &*(base_ptr.add(self.offset as usize) as *mut T) }
     }
 
@@ -736,17 +739,11 @@ impl<T> RelativePtr<T> {
     ///
     /// ### Returns:
     /// A life time specified mutable reference to the block scope.
-    pub unsafe fn resolve_mut<'a>(&self, base_ptr: *const u8) -> &'a mut T {
+    pub unsafe fn resolve_mut<'a>(&self, base_ptr: *const u8) -> &'a mut T
+    where
+        T: Sized,
+    {
         unsafe { &mut *(base_ptr.add(self.offset as usize) as *mut T) }
-    }
-
-    /// Writes bytes to the pointer data section.
-    ///
-    /// ### Params:
-    /// @base_ptr: The offset from the start of the SHM segment.
-    /// @value: The value to be written into the pointer.
-    pub unsafe fn write(&self, base_ptr: *const u8, value: T) {
-        unsafe { std::ptr::write(self.resolve_mut(base_ptr), value) }
     }
 }
 
