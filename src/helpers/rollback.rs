@@ -1,4 +1,3 @@
-
 /// Rollback is a RAII trigger that accepts a rollback function to be executed on dropping this
 /// Struct.
 ///
@@ -15,14 +14,18 @@ impl<F: FnOnce()> Rollback<F> {
     /// Sets the rollback function to be executed on dropping the Rollback while its still armed.
     ///
     /// ### Params
-    /// @f: The rollback function for the RAII guard.
+    /// @func: The rollback function for the RAII guard.
     ///
     /// ### Returns
     /// An instance of self that will be dropped at the end of the scope.
     pub fn set(func: F) -> Self {
-        return Self(Some(func))
+        return Self(Some(func));
     }
 
+    /// Updates the current rollback action written into the instance
+    ///
+    /// ### Params
+    /// @func: The rollback function for the RAII guard.
     pub fn update(&mut self, func: F) {
         self.0 = Some(func);
     }
@@ -32,7 +35,7 @@ impl<F: FnOnce()> Rollback<F> {
     /// This ideally should be called after all breakable calls that are recoverable are completed
     /// to avoid triggering a rollback in a successful execution.
     pub fn disarm(&mut self) {
-        self.0 = None
+        self.0 = None;
     }
 }
 

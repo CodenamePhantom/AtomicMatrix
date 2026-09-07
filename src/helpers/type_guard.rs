@@ -1,7 +1,7 @@
 use crate::helpers::safe_shm::SafeSHMUnsized;
 use crate::prelude::*;
-use std::sync::atomic::Ordering;
 use std::panic::UnwindSafe;
+use std::sync::atomic::Ordering;
 
 /// Runtime safe type wrapper for deref a matrix value reference.
 ///
@@ -34,7 +34,7 @@ pub struct TypeGuardMut<T> {
 /// It holds no direct reference to the value other than its type, opting instead, for calculating
 /// and validating its existance every time it is dereferenced. This approach trades runtime UB
 /// events for deterministic panics and errors that can be treated locally.
-/// 
+///
 /// Differently from the original TypeGuard, this struct guards the deref for a variable sized
 /// value inside the matrix.
 pub struct UnsizedGuard<T: ?Sized> {
@@ -56,10 +56,13 @@ impl<T> TypeGuard<T> {
         if header.signature != HEADER_SIGNATURE {
             return None;
         }
-        if
-            header.state
-                .load_if_any(&[STATE_ACKED, STATE_FREE, STATE_COALESCING], Ordering::Acquire)
-                .is_ok()
+        if header
+            .state
+            .load_if_any(
+                &[STATE_ACKED, STATE_FREE, STATE_COALESCING],
+                Ordering::Acquire,
+            )
+            .is_ok()
         {
             return None;
         }
@@ -106,7 +109,8 @@ impl<T> std::ops::Deref for TypeGuard<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.try_get().expect("TypeGuard: access to invalidated, freed, or corrupted block")
+        self.try_get()
+            .expect("TypeGuard: access to invalidated, freed, or corrupted block")
     }
 }
 
@@ -122,10 +126,13 @@ impl<T> TypeGuardMut<T> {
         if header.signature != HEADER_SIGNATURE {
             return None;
         }
-        if
-            header.state
-                .load_if_any(&[STATE_ACKED, STATE_FREE, STATE_COALESCING], Ordering::Acquire)
-                .is_ok()
+        if header
+            .state
+            .load_if_any(
+                &[STATE_ACKED, STATE_FREE, STATE_COALESCING],
+                Ordering::Acquire,
+            )
+            .is_ok()
         {
             return None;
         }
@@ -180,13 +187,14 @@ impl<T> TypeGuardMut<T> {
     }
 }
 
-/// Derefing this struct will run `try_get()` in the coordinates to fetch the mutable reference. 
+/// Derefing this struct will run `try_get()` in the coordinates to fetch the mutable reference.
 /// Panic if fails.
 impl<T> std::ops::Deref for TypeGuardMut<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.try_get().expect("TypeGuard: access to invalidated, freed, or corrupted block")
+        self.try_get()
+            .expect("TypeGuard: access to invalidated, freed, or corrupted block")
     }
 }
 
@@ -194,7 +202,8 @@ impl<T> std::ops::Deref for TypeGuardMut<T> {
 /// Panic if fails.
 impl<T> std::ops::DerefMut for TypeGuardMut<T> {
     fn deref_mut(&mut self) -> &mut T {
-        self.try_get_mut().expect("TypeGuard: access to invalidated, freed, or corrupted block")
+        self.try_get_mut()
+            .expect("TypeGuard: access to invalidated, freed, or corrupted block")
     }
 }
 
@@ -210,10 +219,13 @@ impl<T: ?Sized + SafeSHMUnsized> UnsizedGuard<T> {
         if header.signature != HEADER_SIGNATURE {
             return None;
         }
-        if
-            header.state
-                .load_if_any(&[STATE_ACKED, STATE_FREE, STATE_COALESCING], Ordering::Acquire)
-                .is_ok()
+        if header
+            .state
+            .load_if_any(
+                &[STATE_ACKED, STATE_FREE, STATE_COALESCING],
+                Ordering::Acquire,
+            )
+            .is_ok()
         {
             return None;
         }
@@ -255,13 +267,14 @@ impl<T: ?Sized + SafeSHMUnsized> UnsizedGuard<T> {
     }
 }
 
-/// Derefing this struct will run `try_get()` in the coordinates to fetch the reference. Panic if 
+/// Derefing this struct will run `try_get()` in the coordinates to fetch the reference. Panic if
 /// fails.
 impl<T: ?Sized + SafeSHMUnsized> std::ops::Deref for UnsizedGuard<T> {
     type Target = T;
 
     fn deref(&self) -> &T {
-        self.try_get().expect("TypeGuard: access to invalidated, freed, or corrupted block")
+        self.try_get()
+            .expect("TypeGuard: access to invalidated, freed, or corrupted block")
     }
 }
 

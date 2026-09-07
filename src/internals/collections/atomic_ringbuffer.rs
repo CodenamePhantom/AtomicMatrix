@@ -11,6 +11,7 @@
 //!
 //! The ringbuffer is composed of a single dedicated block inside the matrix.
 //!
+//! ```text
 //! [Matrix Block]
 //!     |
 //!     |--> [AtomicRingBuffer (Metadata)]
@@ -18,6 +19,7 @@
 //!     |--> [Offset 1]
 //!     |--> [Offset 2]
 //!     ... up to N offsets, user defined.
+//! ```
 //!
 //! Allocation contests for the next offset happens in a stage queue to avoid publishing an offset
 //! that contains no message, as this could SEGFAULT any read attempts on the contested head because
@@ -36,10 +38,13 @@
 //! This means that, although you can pass and construct the same ringbuffer all over, following the
 //! correct system utilization is up to you.
 
-use crate::{ internals::error_collection::BufferErrors, safe_shm };
 use crate::helpers::safe_shm::SafeSHM;
 use crate::prelude::*;
-use std::{ sync::atomic::{ AtomicBool, AtomicU32, Ordering }, cell::UnsafeCell };
+use crate::{internals::error_collection::AtomicRingbufferErrors, safe_shm};
+use std::{
+    cell::UnsafeCell,
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
+};
 
 /// The header state for the [`AtomicRingBuffer`]. It isolates the block from any other context
 /// present in the matrix.
@@ -101,11 +106,7 @@ impl<'a, T: Default + SafeSHM, const N: usize> AtomicRingBuffer<T, N> {
     #[inline]
     fn advance(&self, slot: u32) -> u32 {
         let next = slot + 1;
-        if next >= self.end {
-            self.start
-        } else {
-            next
-        }
+        if next >= self.end { self.start } else { next }
     }
 
     /// Allocates a new AtomicRingbuffer at the matrix and return its reference.
@@ -124,22 +125,21 @@ impl<'a, T: Default + SafeSHM, const N: usize> AtomicRingBuffer<T, N> {
 
         handler_ref.set_state(&block, STATE_RINGBUFFER).ok()?;
 
-        if
-            handler_ref
-                .inline_mut(&block, |mut rb| {
-                    *rb = Self {
-                        behaviour,
-                        start: 0,
-                        end: (slots.len() as u32) - 1,
-                        reserved_head: AtomicU32::new(0),
-                        commited_head: AtomicU32::new(0),
-                        slots,
-                        tail: AtomicU32::new(0),
-                        has_message: AtomicBool::new(false),
-                        address: block.header_offset(),
-                    };
-                })
-                .is_none()
+        if handler_ref
+            .inline_mut(&block, |mut rb| {
+                *rb = Self {
+                    behaviour,
+                    start: 0,
+                    end: (slots.len() as u32) - 1,
+                    reserved_head: AtomicU32::new(0),
+                    commited_head: AtomicU32::new(0),
+                    slots,
+                    tail: AtomicU32::new(0),
+                    has_message: AtomicBool::new(false),
+                    address: block.header_offset(),
+                };
+            })
+            .is_none()
         {
             return None;
         }
@@ -175,7 +175,7 @@ impl<'a, T: Default + SafeSHM, const N: usize> AtomicRingBuffer<T, N> {
     /// @BufferFull: The allocation exceeded the stablished ammount of wait iterations \
     /// @TooManyProducers: There are too many producers attached to this buffer and its not possible
     /// to allocate a slot before the buffer fills up.
-    pub fn enqueue(&self, item: T) -> Result<(), BufferErrors> {
+    pub fn enqueue(&self, item: T) -> Result<(), AtomicRingbufferErrors> {
         let mut cas_retries: u16 = 0;
         let mut wait_iterations: u16 = 0;
 
@@ -187,7 +187,7 @@ impl<'a, T: Default + SafeSHM, const N: usize> AtomicRingBuffer<T, N> {
             if next_head == current_tail {
                 match self.behaviour {
                     Behaviour::Drop => {
-                        return Err(BufferErrors::DropBehaviour);
+                        return Err(AtomicRingbufferErrors::DropBehaviour);
                     }
                     Behaviour::Wait(i) => {
                         for _ in 0..i {
@@ -195,7 +195,7 @@ impl<'a, T: Default + SafeSHM, const N: usize> AtomicRingBuffer<T, N> {
                         }
                         wait_iterations += 1;
                         if wait_iterations > WAIT_RETRY_CAP {
-                            return Err(BufferErrors::BufferFull);
+                            return Err(AtomicRingbufferErrors::BufferFull);
                         }
                         continue;
                     }
@@ -205,14 +205,12 @@ impl<'a, T: Default + SafeSHM, const N: usize> AtomicRingBuffer<T, N> {
                 }
             }
 
-            match
-                self.reserved_head.compare_exchange_weak(
-                    current_head,
-                    next_head,
-                    Ordering::Release,
-                    Ordering::Relaxed
-                )
-            {
+            match self.reserved_head.compare_exchange_weak(
+                current_head,
+                next_head,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => {
                     break current_head;
                 }
@@ -220,7 +218,7 @@ impl<'a, T: Default + SafeSHM, const N: usize> AtomicRingBuffer<T, N> {
                     std::hint::spin_loop();
                     cas_retries += 1;
                     if cas_retries > CAS_RETRIES_CAP {
-                        return Err(BufferErrors::TooManyProducers);
+                        return Err(AtomicRingbufferErrors::TooManyProducers);
                     }
                     continue;
                 }
@@ -261,10 +259,15 @@ impl<'a, T: Default + SafeSHM, const N: usize> AtomicRingBuffer<T, N> {
                 return None;
             }
 
-            if
-                self.tail
-                    .compare_exchange(current_tail, next_tail, Ordering::Release, Ordering::Relaxed)
-                    .is_ok()
+            if self
+                .tail
+                .compare_exchange(
+                    current_tail,
+                    next_tail,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
             {
                 let data = unsafe { self.slots[current_tail as usize].get().read() };
 

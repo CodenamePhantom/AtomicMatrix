@@ -9,12 +9,14 @@
 //! The array is composed of (shockingly) an array of Slots, which contain an atomic flag and a
 //! UnsafeCell that holds the value stored in the slot.
 //!
+//! ```text
 //! [Matrix Block]
 //!     |
 //!     |-> [Slot 1 (Flag/UnsafeCell<T>)]
 //!     |-> [Slot 2 (Flag/UnsafeCell<T>)]
 //!     |-> [Slot 3 (Flag/UnsafeCell<T>)]
 //!     ... up to N slots defined by the user.
+//! ```
 //!
 //! Internal operations like pop and push correctly coordinates the state machine to avoid data
 //! mutation races, reading of unfinished writes, or deleting a locked block.
@@ -33,11 +35,11 @@
 //! for slots manually. This allow users to manipulate their data however they want, with the
 //! trade off of increased complexity and code surface.
 
-use crate::internals::error_collection::AtomicArrayErrors;
 use crate::helpers::safe_shm::SafeSHM;
+use crate::internals::error_collection::AtomicArrayErrors;
 use crate::prelude::*;
 use std::cell::UnsafeCell;
-use std::sync::atomic::{ AtomicU8, Ordering };
+use std::sync::atomic::{AtomicU8, Ordering};
 
 pub const STATE_ARRAY: u32 = 10_001;
 
@@ -103,12 +105,11 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
             data: UnsafeCell::new(None),
         });
 
-        if
-            handler
-                .inline_mut(&block, |mut arr| {
-                    *arr = AtomicArray { slots };
-                })
-                .is_none()
+        if handler
+            .inline_mut(&block, |mut arr| {
+                *arr = AtomicArray { slots };
+            })
+            .is_none()
         {
             return None;
         }
@@ -130,7 +131,8 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
     /// ### Returns
     /// An optional static reference to the AtomicArray inside the matrix.
     pub fn new_from_map<F>(handler: SharedHandler, f: F) -> Option<&'static Self>
-        where F: Fn() -> Slot<T>
+    where
+        F: Fn() -> Slot<T>,
     {
         let block = handler.allocate::<AtomicArray<T, N>>().ok()?;
 
@@ -138,12 +140,11 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
 
         let slots: [Slot<T>; N] = std::array::from_fn(|_| f());
 
-        if
-            handler
-                .inline_mut(&block, |mut arr| {
-                    *arr = AtomicArray { slots };
-                })
-                .is_none()
+        if handler
+            .inline_mut(&block, |mut arr| {
+                *arr = AtomicArray { slots };
+            })
+            .is_none()
         {
             return None;
         }
@@ -182,7 +183,10 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
     ///
     /// ### Returns
     /// A result containing either a copy of the value, or an AtomicArrayErrors.
-    pub fn get(&self, idx: u32) -> Result<T, AtomicArrayErrors> where T: Copy {
+    pub fn get(&self, idx: u32) -> Result<T, AtomicArrayErrors>
+    where
+        T: Copy,
+    {
         let slot = &self[idx];
 
         match unsafe { *slot.data.get() } {
@@ -228,14 +232,15 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
     /// ### Returns
     /// A result containing either the value wrapped in a StrictRefMut, or an AtomicArrayErrors.
     pub fn strict_get<'a>(&'a self, idx: u32) -> Result<StrictRefMut<'a, T>, AtomicArrayErrors>
-        where T: Copy
+    where
+        T: Copy,
     {
         let slot: &'a Slot<T> = &self[idx];
 
-        if
-            slot.flag
-                .compare_exchange(S_OPEN, S_READING, Ordering::Acquire, Ordering::Relaxed)
-                .is_ok()
+        if slot
+            .flag
+            .compare_exchange(S_OPEN, S_READING, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
         {
             let data: &'a mut Option<T> = unsafe { &mut *slot.data.get() };
 
@@ -265,7 +270,10 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
         let slot = &self[idx];
         let f_list: [u8; 2] = [S_CLOSED, S_WRITING];
 
-        if slot.flag.store_if_not_any(&f_list, S_WRITING, Ordering::Release, Ordering::Relaxed) {
+        if slot
+            .flag
+            .store_if_not_any(&f_list, S_WRITING, Ordering::Release, Ordering::Relaxed)
+        {
             let data = unsafe { &mut *slot.data.get() };
             data.replace(value);
 
@@ -295,7 +303,10 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
         let mut retry_counter = 0;
 
         loop {
-            if slot.flag.store_if_not_any(&f_list, S_WRITING, Ordering::Release, Ordering::Relaxed) {
+            if slot
+                .flag
+                .store_if_not_any(&f_list, S_WRITING, Ordering::Release, Ordering::Relaxed)
+            {
                 let data = unsafe { &mut *slot.data.get() };
                 data.replace(value);
 
@@ -364,7 +375,9 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
                     }
                     None => {
                         slot.flag.store(S_FREE, Ordering::Release);
-                        return Err(AtomicArrayErrors::EmptyIndexError { slot_idx: idx as u32 });
+                        return Err(AtomicArrayErrors::EmptyIndexError {
+                            slot_idx: idx as u32,
+                        });
                     }
                 }
             }
@@ -401,7 +414,11 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
                 continue;
             }
 
-            if slot.flag.swap_if(S_OPEN, S_CLOSED, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            if slot
+                .flag
+                .swap_if(S_OPEN, S_CLOSED, Ordering::Acquire, Ordering::Relaxed)
+                .is_ok()
+            {
                 let data = unsafe { &mut *slot.data.get() };
                 let val = data.take();
 
@@ -410,10 +427,14 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
                 if let Some(return_data) = val {
                     return Ok(return_data);
                 } else {
-                    return Err(AtomicArrayErrors::EmptyIndexError { slot_idx: idx as u32 });
+                    return Err(AtomicArrayErrors::EmptyIndexError {
+                        slot_idx: idx as u32,
+                    });
                 }
             } else {
-                return Err(AtomicArrayErrors::BlockedSlotError { slot_idx: idx as u32 });
+                return Err(AtomicArrayErrors::BlockedSlotError {
+                    slot_idx: idx as u32,
+                });
             }
         }
 
@@ -440,10 +461,10 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
     pub fn unlock(&self, idx: u32) -> Option<()> {
         let slot = &self[idx];
 
-        if
-            slot.flag
-                .compare_exchange(S_CLOSED, S_OPEN, Ordering::Release, Ordering::Acquire)
-                .is_ok()
+        if slot
+            .flag
+            .compare_exchange(S_CLOSED, S_OPEN, Ordering::Release, Ordering::Acquire)
+            .is_ok()
         {
             return Some(());
         } else {
@@ -473,17 +494,23 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
         let slot_two = &self[largest];
         let f_list = [S_CLOSED, S_READING, S_WRITING];
 
-        let flag_one = match
-            slot_one.flag.swap_if_not_any(&f_list, S_CLOSED, Ordering::Acquire, Ordering::Relaxed)
-        {
+        let flag_one = match slot_one.flag.swap_if_not_any(
+            &f_list,
+            S_CLOSED,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
             Ok(v) => v,
             Err(_) => {
                 return None;
             }
         };
-        let flag_two = match
-            slot_two.flag.swap_if_not_any(&f_list, S_CLOSED, Ordering::Acquire, Ordering::Relaxed)
-        {
+        let flag_two = match slot_two.flag.swap_if_not_any(
+            &f_list,
+            S_CLOSED,
+            Ordering::Acquire,
+            Ordering::Relaxed,
+        ) {
             Ok(v) => v,
             Err(_) => {
                 slot_one.flag.store(flag_one, Ordering::Release);

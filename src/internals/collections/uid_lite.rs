@@ -19,7 +19,10 @@ use std::io::Read;
 /// The UUID decoded string.
 pub fn generate_uuid() -> String {
     let mut bytes = [0u8; 16];
-    File::open("/dev/urandom").unwrap().read_exact(&mut bytes).unwrap();
+    File::open("/dev/urandom")
+        .unwrap()
+        .read_exact(&mut bytes)
+        .unwrap();
 
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;

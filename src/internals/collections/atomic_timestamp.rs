@@ -1,5 +1,5 @@
-use std::sync::atomic::{ AtomicU64, Ordering };
-use std::time::{ SystemTime, UNIX_EPOCH };
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[repr(C)]
 #[derive(Debug)]
@@ -9,11 +9,15 @@ pub struct AtomicTimestamp {
 
 impl AtomicTimestamp {
     pub fn now() -> Self {
-        Self { value: AtomicU64::new(Self::unix_now()) }
+        Self {
+            value: AtomicU64::new(Self::unix_now()),
+        }
     }
 
     pub fn uninitialized() -> Self {
-        Self { value: AtomicU64::new(0) }
+        Self {
+            value: AtomicU64::new(0),
+        }
     }
 
     pub fn set_now(&self) {
@@ -25,6 +29,9 @@ impl AtomicTimestamp {
     }
 
     fn unix_now() -> u64 {
-        SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos() as u64
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos() as u64
     }
 }

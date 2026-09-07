@@ -50,7 +50,7 @@ better_error! {
             path: String,
             reason: std::io::Error
         } => "Failed to decommission matrix file: Path -> {path} | Reason -> {reason}",
-        TransitionFailed { 
+        TransitionFailed {
             requested_state: u32,
             current_state: u32
         } => "Failed to switch state: {requested_state} -> {current_state}",
@@ -86,7 +86,7 @@ better_error! {
 // -------------------------------------------------------------------------------------
 better_error! {
     #[derive(Debug)]
-    pub enum BufferErrors {
+    pub enum AtomicRingbufferErrors {
         TooManyProducers => "Too many threads hanging on the buffer",
         DropBehaviour => "Drop behaviour",
         BufferFull => "The buffer is completely full",
@@ -102,5 +102,34 @@ better_error! {
         AtomicWriteFailed { slot_idx: u32 } => "Failed to write into slot {slot_idx}",
         ArrayFull => "The array is completely full",
         ArrayEmpty => "The array is completely empty",
+    }
+}
+
+better_error! {
+    #[derive(Debug)]
+    pub enum AtomicFSErrors {
+        StateTransitionFailed {
+            state: u32,
+            reason: String
+        } => "Failed to transtion to state {state}: {reason}",
+        MaxRetryReached => "Operation has exceeded the maximum amount of defined retries"
+    }
+    from {
+        Inner(HandlerErrors)
+    }
+}
+
+better_error! {
+    #[derive(Debug)]
+    pub enum AtomicStringErrors {
+        StringTraversalError { reason: String }=> "Failed to traverse string: {reason}",
+        CorruptedState => "Current string is corrupted",
+        AcquireFailed {
+            acq_type: String,
+            reason: String
+        } => "Failed to acquire_{acq_type}: {reason}"
+    }
+    from {
+        Inner(HandlerErrors)
     }
 }
