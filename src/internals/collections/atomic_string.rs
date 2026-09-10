@@ -13,13 +13,13 @@
 //! ```text
 //! [Matrix Block]
 //!     |
-//!     |-> [AtomicString (255 chars)(u32 pointer)]
+//!     |-> [AtomicString (64 chars)(u32 pointer)]
 //!             |
 //!         [Matrix Block]
 //!             |
-//!             |-> [Overflow string (255 chars)(u32 pointer)]
+//!             |-> [Overflow string (64 chars)(u32 pointer)]
 //!                     |
-//!                     ... Up to N overflowned blocks.
+//!                     ... Up to N overflowed blocks.
 //! ```
 //!
 //! The first AtomicString block works as the head for the segment and is never deallocated.
@@ -28,12 +28,12 @@
 //!
 //! New strings that are passed to an existing AtomicString will dinamically allocate new overflow
 //! blocks as needed. This ensures that AtomicStrings doesn't need compile time known sizes and
-//! remains dynamic. Overflow blocks are also limited to 255 chars and will spawn a subsequent
+//! remains dynamic. Overflow blocks are also limited to 64 chars and will spawn a subsequent
 //! chain block if this limit is surpassed, that will be attached to the previous block in the
 //! chain.
 //!
-//! If the string is mutated into a size smaller than the previous iteration, that makes an
-//! overflow useless, this block will be deallocated from the string and its pointer will be zeroed
+//! If the string is mutated into a size smaller than the previous iteration that makes an overflow 
+//! useless, this block will be deallocated from the string and its pointer will be zeroed
 //!
 //! ### Corruption
 //!
@@ -165,7 +165,7 @@ pub struct AtomicString {
 /// to the next block in the chain.
 #[derive(SafeSHM)]
 #[repr(C)]
-pub struct StringChain {
+struct StringChain {
     /// THe char contents of this chain link, also stored in a fixed size array.
     str: [char; CHAR_COUNT],
     /// THe offset to the next link in this string's chain.
@@ -566,6 +566,11 @@ impl AtomicString {
         let as_block = s_handler
             .get_block::<AtomicString>(offset)
             .map_err(|e| AtomicStringErrors::Inner(e))?;
+
+        let header = unsafe { as_block.header() };
+        if header.state.load_if(STATE_STRING, Ordering::Relaxed).is_err() {
+            return Err(AtomicStringErrors::NotAString{ offset: offset });
+        }
 
         let mut str_guard = s_handler
             .read_mut(&as_block)

@@ -37,11 +37,6 @@ better_error! {
 better_error! {
     #[derive(Debug)]
     pub enum HandlerErrors {
-        TypeMismatchError => "The provided type doesn't match the block type tag.",
-        PanicRecovery => "Invalid deref yielded a panic.",
-        AllocationFailed { reason: String } => "Failed to allocate: {reason}",
-        ReservedState { state: u32 } => "State {state} is reserved for matrix ops.",
-        InvalidOffset { offset: u32 } => "Offset {offset} not found.",
         BlockOverflow {
             block_size: usize,
             payload_size: usize
@@ -54,6 +49,11 @@ better_error! {
             requested_state: u32,
             current_state: u32
         } => "Failed to switch state: {requested_state} -> {current_state}",
+        AllocationFailed { reason: String } => "Failed to allocate: {reason}",
+        ReservedState { state: u32 } => "State {state} is reserved for matrix ops.",
+        InvalidOffset { offset: u32 } => "Offset {offset} not found.",
+        TypeMismatchError => "The provided type doesn't match the block type tag.",
+        PanicRecovery => "Invalid deref yielded a panic.",
     }
     from {
         InnerMatrixError(MatrixErrors),
@@ -97,11 +97,11 @@ better_error! {
     #[derive(Debug)]
     pub enum AtomicArrayErrors {
         EmptyIndexError { slot_idx: u32 } => "The index {slot_idx} is empty",
-        NotAnArrayError => "The requested offset is not an AtomicArray",
         BlockedSlotError { slot_idx: u32 } => "The slot {slot_idx} could not be locked",
         AtomicWriteFailed { slot_idx: u32 } => "Failed to write into slot {slot_idx}",
         ArrayFull => "The array is completely full",
         ArrayEmpty => "The array is completely empty",
+        NotAnArray => "The requested offset is not an AtomicArray",
     }
 }
 
@@ -112,7 +112,8 @@ better_error! {
             state: u32,
             reason: String
         } => "Failed to transtion to state {state}: {reason}",
-        MaxRetryReached => "Operation has exceeded the maximum amount of defined retries"
+        MaxRetryReached => "Operation has exceeded the maximum amount of defined retries",
+        NotAString { offset: u32 } => "The offset {offset} is not a fast string",
     }
     from {
         Inner(HandlerErrors)
@@ -122,12 +123,13 @@ better_error! {
 better_error! {
     #[derive(Debug)]
     pub enum AtomicStringErrors {
-        StringTraversalError { reason: String }=> "Failed to traverse string: {reason}",
-        CorruptedState => "Current string is corrupted",
         AcquireFailed {
             acq_type: String,
             reason: String
-        } => "Failed to acquire_{acq_type}: {reason}"
+        } => "Failed to acquire_{acq_type}: {reason}",
+        StringTraversalError { reason: String }=> "Failed to traverse string: {reason}",
+        NotAString { offset: u32 } => "The offset {offset} is not a fast string",
+        CorruptedState => "Current string is corrupted",
     }
     from {
         Inner(HandlerErrors)

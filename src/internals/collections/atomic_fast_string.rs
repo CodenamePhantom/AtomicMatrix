@@ -155,6 +155,11 @@ impl AtomicFastString {
             .get_block::<AtomicFastString>(offset)
             .map_err(|e| AtomicFSErrors::Inner(e))?;
 
+        let header = unsafe { afs_block.header() };
+        if header.state.load_if(FAST_STRING, Ordering::Acquire).is_err() {
+            return Err(AtomicFSErrors::NotAString{ offset: offset });
+        }
+
         let afs_guard = s_handler
             .read(&afs_block)
             .map_err(|e| AtomicFSErrors::Inner(e))?;
@@ -428,6 +433,11 @@ impl ShadowString {
         self.len
     }
 
+    /// Returns a reference to the direct shadow string block.
+    pub fn this_block(&self) -> &Block<str> {
+        &self.this_block
+    }
+
     /// Prints the current shadow string to stdout.
     pub fn print(&self) {
         println!("{}", &*self.str);
@@ -443,30 +453,6 @@ impl StringBuf {
     /// Returns the length of the string value for this StringBuf.
     pub fn len(&self) -> usize {
         return self.len;
-    }
-
-    /// Checks if the string is equal to a provided value.
-    ///
-    /// ### Params
-    /// @value: The string to compare agains the StringBuf
-    ///
-    /// ### Returns
-    /// A bool stating the successful match.
-    pub fn eq(&self, value: &str) -> bool {
-        return self.str.as_ref() == value;
-    }
-
-    /// Checks if the string contains the provided value.
-    ///
-    /// ### Params
-    /// @value: The string to compare agains the StringBuf
-    ///
-    /// ### Returns
-    /// A bool stating the successful match.
-    pub fn contains(&self, value: &str) -> bool {
-        let str = &self.str;
-
-        return str.contains(value);
     }
 
     /// Converts the current iteration of this StringBuf into a [`ShadowString`].
