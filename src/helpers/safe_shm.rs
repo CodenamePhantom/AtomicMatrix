@@ -23,7 +23,7 @@ pub unsafe trait SafeSHM: 'static {}
 /// This marker instead, works as a writing/reading helper that both tells the compiler the type
 /// has been evaluated as safe to be used, and providing anchor functions to generate typed pointers
 /// that doesn't send the compiler into madness.
-pub unsafe trait SafeSHMUnsized {
+pub unsafe trait SafeSHMUnsized: 'static {
     unsafe fn from_raw_parts(ptr: *const u8, byte_len: usize) -> *const Self;
     unsafe fn ptr_to(ptr: *const u8, offset: u32, byte_len: usize) -> *mut Self;
 }

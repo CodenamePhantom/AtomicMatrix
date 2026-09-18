@@ -125,24 +125,19 @@ impl<'a, T: Default + SafeSHM, const N: usize> AtomicRingBuffer<T, N> {
 
         handler_ref.set_state(&block, STATE_RINGBUFFER).ok()?;
 
-        if handler_ref
-            .inline_mut(&block, |mut rb| {
-                *rb = Self {
-                    behaviour,
-                    start: 0,
-                    end: (slots.len() as u32) - 1,
-                    reserved_head: AtomicU32::new(0),
-                    commited_head: AtomicU32::new(0),
-                    slots,
-                    tail: AtomicU32::new(0),
-                    has_message: AtomicBool::new(false),
-                    address: block.header_offset(),
-                };
-            })
-            .is_none()
-        {
-            return None;
-        }
+        handler_ref.inline_mut(&block, |mut rb| {
+            *rb = Self {
+                behaviour,
+                start: 0,
+                end: (slots.len() as u32) - 1,
+                reserved_head: AtomicU32::new(0),
+                commited_head: AtomicU32::new(0),
+                slots,
+                tail: AtomicU32::new(0),
+                has_message: AtomicBool::new(false),
+                address: block.header_offset(),
+            };
+        })?;
 
         let rb_guard = handler_ref.read(&block).ok()?;
         let rb: &'a Self = unsafe { &*(&*rb_guard as *const Self) };

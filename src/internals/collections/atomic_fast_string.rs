@@ -109,27 +109,29 @@ impl AtomicFastString {
             .allocate_marked::<str>(value)
             .map_err(|e| AtomicFSErrors::Inner(e))?;
 
-        let mut afs_block = s_handler
+        let afs_block = s_handler
             .allocate::<AtomicFastString>()
             .map_err(|e| AtomicFSErrors::Inner(e))?;
         let afs_offset = afs_block.header_offset();
-        let afs = AtomicFastString {
-            pointer: AtomicU32::new(str_buf.header_offset()),
-            this_offset: afs_offset,
-        };
 
-        s_handler
-            .write_transition(
-                &mut afs_block,
-                afs,
-                STATE_ALLOCATED,
-                FAST_STRING,
-                Ordering::Release,
-            )
-            .map_err(|e| AtomicFSErrors::StateTransitionFailed {
+        s_handler.set_state(&afs_block, FAST_STRING).map_err(|e| {
+            AtomicFSErrors::StateTransitionFailed {
                 state: FAST_STRING,
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
+
+        if s_handler
+            .inline_mut(&afs_block, |mut afs_ref| {
+                *afs_ref = AtomicFastString {
+                    pointer: AtomicU32::new(str_buf.header_offset()),
+                    this_offset: afs_offset,
+                };
+            })
+            .is_none()
+        {
+            return Err(AtomicFSErrors::NotAString { offset: afs_offset });
+        };
 
         let afs_guard = s_handler
             .read(&afs_block)
@@ -156,8 +158,12 @@ impl AtomicFastString {
             .map_err(|e| AtomicFSErrors::Inner(e))?;
 
         let header = unsafe { afs_block.header() };
-        if header.state.load_if(FAST_STRING, Ordering::Acquire).is_err() {
-            return Err(AtomicFSErrors::NotAString{ offset: offset });
+        if header
+            .state
+            .load_if(FAST_STRING, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(AtomicFSErrors::NotAString { offset: offset });
         }
 
         let afs_guard = s_handler

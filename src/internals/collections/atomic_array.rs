@@ -105,14 +105,9 @@ impl<T: SafeSHM, const N: usize> AtomicArray<T, N> {
             data: UnsafeCell::new(None),
         });
 
-        if handler
-            .inline_mut(&block, |mut arr| {
-                *arr = AtomicArray { slots };
-            })
-            .is_none()
-        {
-            return None;
-        }
+        handler.inline_mut(&block, |mut arr| {
+            *arr = AtomicArray { slots };
+        })?;
 
         let arr_guard = handler.read(&block).unwrap();
         let arr: &Self = unsafe { &*(&*arr_guard as *const Self) };
