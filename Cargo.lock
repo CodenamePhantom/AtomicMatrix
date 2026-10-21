@@ -15,7 +15,7 @@ dependencies = [
 [[package]]
 name = "atomic-matrix-derive"
 version = "0.1.0"
-source = "git+https://github.com/CodenamePhantom/AtomicMatrix-Derive#3f7092a3eae681b667b091233179041456605b47"
+source = "git+https://github.com/CodenamePhantom/AtomicMatrix-Derive#b9d38e74316557aae96a4ada573f0c7020868671"
 dependencies = [
  "quote",
  "syn",
