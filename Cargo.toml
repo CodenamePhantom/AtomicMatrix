@@ -17,4 +17,5 @@ default = []
 atomic-matrix-derive = { git = "https://github.com/CodenamePhantom/AtomicMatrix-Derive"}
 better_result = "0.3"
 memmap2 = "0.9.10"
+getrandom = "0.4.3"
 libc = "0.2.186"

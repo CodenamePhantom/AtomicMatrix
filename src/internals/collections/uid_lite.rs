@@ -7,9 +7,6 @@
 //! requires that all UUIDs follow a contiguous sequence of reclamation stamps, consider using more
 //! robust implementations of UUID.
 
-use std::fs::File;
-use std::io::Read;
-
 /// Generate a new random UUID as a string.
 ///
 /// It extract 16 numbers from /dev/urandom, applies the version 4 mask, the RFC 4122 mask at byte
@@ -19,10 +16,8 @@ use std::io::Read;
 /// The UUID decoded string.
 pub fn generate_uuid() -> String {
     let mut bytes = [0u8; 16];
-    File::open("/dev/urandom")
-        .unwrap()
-        .read_exact(&mut bytes)
-        .unwrap();
+
+    let _ = getrandom::fill(&mut bytes);
 
     bytes[6] = (bytes[6] & 0x0f) | 0x40;
     bytes[8] = (bytes[8] & 0x3f) | 0x80;
