@@ -1122,21 +1122,25 @@ mod tests {
                 let header_ptr =
                     RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
                 handler_arc.matrix().ack(&header_ptr, base_ptr);
-                handler_arc.matrix().coalesce(&header_ptr, base_ptr);
             }
         }
 
-        let mut free_count = 1;
+        let mut free_count = 0;
         let mut current_block = unsafe { handler_arc.get_first() };
-        
+
         loop {
             let header = unsafe { current_block.resolve_header(handler_arc.base_ptr()) };
 
-            if header.next_free.load(Ordering::Acquire) != 0 {
-                let next_offset = header.next_free.load(Ordering::Acquire);
-                current_block = unsafe { handler_arc.matrix().query(next_offset) };
+            let size = header.size.load(Ordering::Acquire);
+            let next_offset = current_block.offset() + size;
+            
 
+            if header.state.load(Ordering::Acquire) == STATE_FREE {
                 free_count += 1;
+            }
+
+            if next_offset <= handler_arc.matrix().sector_end_offset(next_offset) {
+                current_block = unsafe { handler_arc.matrix().query(next_offset) };
             } else {
                 break;
             }
