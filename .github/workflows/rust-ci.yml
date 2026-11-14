@@ -1,8 +1,8 @@
-name: Atomic Matrix CI
+name: Atomic Matrix - Validate
 
 on:
     push:
-        branches: [ "main", "develop" ]
+        branches: [ "main", "dev" ]
     pull_request:
         branches: [ "main" ]
 
@@ -25,3 +25,19 @@ jobs:
 
             - name: Run Standard Tests
               run: cargo test --verbose --lib
+
+    publish:
+        name: Publish to Crates.io
+        needs: build_and_test
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        runs-on: ubuntu-latest
+        steps:
+            - uses: actions/checkout@v4
+
+            - name: Set up Rust
+              uses: dtolnay/rust-toolchain@stable
+
+            - name: Publish crate
+              env:
+                CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+              run: cargo publish
