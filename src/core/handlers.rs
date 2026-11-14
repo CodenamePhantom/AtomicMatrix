@@ -256,7 +256,19 @@ impl MatrixHandler {
     /// A result containing either an empty Ok, or a HandlerErrors.
     pub unsafe fn die(&self) -> Result<(), HandlerErrors> {
         let id = &self.id;
-        let path = format!("/dev/shm/matrix-{}", id);
+        let path_str = if std::env::consts::OS == "windows" {
+            let path = "C:\\ProgramData\\AtomicMatrix\\";
+
+            if !std::fs::exists(path).unwrap() {
+                std::fs::create_dir(path).unwrap();
+            }
+
+            path
+        } else {
+            "/dev/shm/"
+        };
+
+        let path = format!("{}matrix-{}", path_str, id);
 
         match std::fs::remove_file(&path) {
             Ok(_) => {}
@@ -695,6 +707,14 @@ pub trait HandlerFunctions {
         let data_cp = unsafe { std::ptr::read(block.pointer.resolve(self.base_ptr())) };
 
         Ok(data_cp)
+    }
+
+    unsafe fn get_first(&self) -> RelativePtr<u8> {
+        unsafe { return self.matrix().query(METADATA_SPACE) }
+    }
+
+    fn set_first<T>(&self) -> Result<Block<T>, HandlerErrors> {
+        unimplemented!()
     }
 
     /// Locks the block while inside a provided expression scope, giving a reference to the

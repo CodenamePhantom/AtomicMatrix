@@ -187,8 +187,20 @@ impl AtomicMatrix {
     pub fn bootstrap(id: Option<String>, size: usize) -> Result<MatrixHandler, MatrixErrors> {
         let mut retry_count = 0;
 
+        let path_str = if std::env::consts::OS == "windows" {
+            let path = "C:\\ProgramData\\AtomicMatrix\\";
+
+            if !std::fs::exists(path).unwrap() {
+                std::fs::create_dir(path).unwrap();
+            }
+
+            path
+        } else {
+            "/dev/shm/"
+        };
+
         let path_id = id.unwrap_or_else(generate_uuid);
-        let path = format!("/dev/shm/matrix-{}", path_id);
+        let path = format!("{}matrix-{}", path_str, path_id);
         let file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1110,16 +1122,27 @@ mod tests {
                 let header_ptr =
                     RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
                 handler_arc.matrix().ack(&header_ptr, base_ptr);
-                handler_arc.matrix().coalesce(&header_ptr, base_ptr);
             }
         }
 
         let mut free_count = 0;
-        for fl in 0..32 {
-            for sl in 0..8 {
-                if handler_arc.matrix().matrix[fl][sl].load(Ordering::Acquire) != 0 {
-                    free_count += 1;
-                }
+        let mut current_block = unsafe { handler_arc.get_first() };
+
+        loop {
+            let header = unsafe { current_block.resolve_header(handler_arc.base_ptr()) };
+
+            let size = header.size.load(Ordering::Acquire);
+            let next_offset = current_block.offset() + size;
+            
+
+            if header.state.load(Ordering::Acquire) == STATE_FREE {
+                free_count += 1;
+            }
+
+            if next_offset <= handler_arc.matrix().sector_end_offset(next_offset) {
+                current_block = unsafe { handler_arc.matrix().query(next_offset) };
+            } else {
+                break;
             }
         }
 
