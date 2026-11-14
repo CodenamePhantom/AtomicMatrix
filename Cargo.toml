@@ -1,8 +1,8 @@
 [package]
 name = "atomic-matrix"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2024"
-authors = ['Dottsss']
+authors = ['CodenamePhantom']
 description = "A lock-free, high end allocator primitive for high-performance IPC."
 license = "Apache-2.0"
 repository = "https://github.com/CodenamePhantom/AtomicMatrix"
@@ -14,7 +14,7 @@ readme = "README.md"
 default = []
 
 [dependencies]
-atomic-matrix-derive = { git = "https://github.com/CodenamePhantom/AtomicMatrix-Derive"}
+atomic-matrix-derive = "0.1"
 better_result = "0.3"
 memmap2 = "0.9.10"
 getrandom = "0.4.3"

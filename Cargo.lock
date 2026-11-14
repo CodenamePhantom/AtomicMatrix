@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "atomic-matrix"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "atomic-matrix-derive",
  "better_result",
@@ -16,7 +16,8 @@ dependencies = [
 [[package]]
 name = "atomic-matrix-derive"
 version = "0.1.0"
-source = "git+https://github.com/CodenamePhantom/AtomicMatrix-Derive#3f7092a3eae681b667b091233179041456605b47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a97097e26b73593ef2b96dc502dc4d056d6f3cf9f80728a5379d9ab570ea5474"
 dependencies = [
  "quote",
  "syn",
