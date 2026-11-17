@@ -311,19 +311,27 @@ impl AtomicMatrix {
                 if let Ok(offset) = self.remove_free_block(base_ptr, f_fl, f_sl) {
                     let header =
                         unsafe { &mut *(base_ptr.add(offset as usize) as *mut BlockHeader) };
-                    header
+                    //header
+                    //    .state
+                    //    .store(helpers::STATE_ALLOCATED, Ordering::Release);
+
+                    if header
                         .state
-                        .store(helpers::STATE_ALLOCATED, Ordering::Release);
+                        .compare_exchange_weak(STATE_FREE, STATE_ALLOCATED, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+                            continue;
+                        }
 
                     let total_size = header.size.load(Ordering::Acquire);
+                    let aligned_alloc_size = (size + helpers::HEADER_SPACE + 15) & !15;
 
-                    if total_size >= size + helpers::HEADER_SPACE {
-                        let next_off = offset + size + helpers::HEADER_SPACE;
+                    if total_size >= aligned_alloc_size + helpers::HEADER_SPACE {
+                        let next_off = offset + aligned_alloc_size;
+                        debug_assert!(next_off % 16 == 0, "Alignment corrupted at split: {:#x}", next_off);
+
                         let eos = self.sector_end_offset(next_off);
+                        let rem_size = total_size - aligned_alloc_size;
 
-                        let rem_size = total_size - (size + helpers::HEADER_SPACE);
-
-                        if next_off < eos {
+                        if next_off < eos && rem_size >= helpers::HEADER_SPACE {
                             let next_h = unsafe {
                                 &mut *(base_ptr.add(next_off as usize) as *mut BlockHeader)
                             };
@@ -334,18 +342,15 @@ impl AtomicMatrix {
                             next_h.prev_phys.store(offset, Ordering::Release);
                             next_h.next_free.store(0, Ordering::Release);
                             next_h.created_at.set_now();
+
+                            let (r_fl, r_sl) = helpers::find_indices(rem_size);
+                            self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
                         }
 
                         header
                             .size
-                            .store(size + helpers::HEADER_SPACE, Ordering::Release);
+                            .store(aligned_alloc_size, Ordering::Release);
                         fence(Ordering::SeqCst);
-
-                        let (r_fl, r_sl) = helpers::find_indices(rem_size);
-                        self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
-                    } else {
-                        header.state.store(STATE_FREE, Ordering::Release);
-                        return Err(MatrixErrors::InvalidBlock)
                     }
 
                     return Ok(RelativePtr::new(offset + helpers::HEADER_SPACE));
@@ -418,6 +423,15 @@ impl AtomicMatrix {
     pub fn coalesce(&self, ptr: &RelativePtr<BlockHeader>, base_ptr: *const u8) {
         let current_offset = ptr.offset();
         let mut current_header = unsafe { ptr.resolve_mut(base_ptr) };
+
+        if current_header
+            .state
+            .compare_exchange(STATE_ACKED, STATE_COALESCING, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return;
+        }
+
         let mut total_size = current_header.size.swap(0, Ordering::AcqRel);
         if total_size < HEADER_SPACE {
             return;
@@ -441,25 +455,29 @@ impl AtomicMatrix {
                 .swap_if_any(
                     &[STATE_ACKED, STATE_FREE],
                     STATE_COALESCING,
-                    Ordering::Release,
+                    Ordering::AcqRel,
                     Ordering::Relaxed,
                 )
                 .is_ok();
 
             if claimed {
                 let size_to_add = prev_header.size.swap(0, Ordering::Acquire);
-                let (fl, sl) = helpers::find_indices(size_to_add);
-                let _ = self.remove_free_block(base_ptr, fl, sl).is_ok();
-
-                if size_to_add == 0 || prev_phys_offset >= current_offset || size_to_add > self.total_size {
+                if size_to_add == 0 || prev_phys_offset >= current_offset {
                     break;
                 }
+
+                if size_to_add > self.total_size {
+                    break;
+                }
+
+                let (fl, sl) = helpers::find_indices(size_to_add);
 
                 total_size = total_size
                     .checked_add(size_to_add)
                     .expect("TidalRippleCoalescingError");
                 final_offset = prev_phys_offset;
                 current_header = prev_header;
+                let _ = self.remove_free_block(base_ptr, fl, sl).is_ok();
             } else {
                 break;
             }
@@ -607,13 +625,13 @@ impl AtomicMatrix {
             if off == 0 {
                 return Err(MatrixErrors::EmptyBitmapError);
             }
-            let next = unsafe {
-                (*(base_ptr.add(off as usize) as *const BlockHeader))
-                    .next_free
-                    .load(Ordering::Acquire)
-            };
+
+            let header_ptr = unsafe { base_ptr.add(off as usize) as *const BlockHeader };
+            let header = unsafe { &*header_ptr };
+
+            let next = header.next_free.load(Ordering::Acquire);
             if head
-                .compare_exchange(off, next, Ordering::AcqRel, Ordering::Relaxed)
+                .compare_exchange(off, next, Ordering::SeqCst, Ordering::Relaxed)
                 .is_ok()
             {
                 if next == 0 {
@@ -1064,7 +1082,7 @@ mod tests {
         const THREADS: u32 = 8;
 
         let size = memory_scale::custom::mb::<20>();
-        let handler = AtomicMatrix::bootstrap(Some(String::from("f_h_test")), size).unwrap();
+        let handler = AtomicMatrix::bootstrap(None, size).unwrap();
         let handler_arc = Arc::new(handler);
         let barrier = Arc::new(Barrier::new(THREADS as usize));
         let start_time = Instant::now();
@@ -1113,34 +1131,24 @@ mod tests {
 
         let mut total_work = 0u64;
         for h in handles {
-            let (_, thread_ops) = h.join().unwrap();
+            let (remaining, thread_ops) = h.join().unwrap();
             total_work += thread_ops;
+            let base_ptr = handler_arc.base_ptr() as *mut u8;
+
+            for ptr in remaining {
+                let header_ptr =
+                    RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
+                handler_arc.matrix().ack(&header_ptr, base_ptr);
+            }
         }
 
         let mut free_count = 0;
-        let mut prev_block = unsafe { handler_arc.get_first() };
-        let mut current_block = unsafe { handler_arc.get_first() };
 
-        loop {
-            let header = unsafe { current_block.resolve_header(handler_arc.base_ptr()) };
-
-            if header.state.load(Ordering::Acquire) == STATE_FREE {
-                free_count += 1;
-                let next_offset = header.next_free.load(Ordering::Acquire);
-                prev_block = current_block;
-                current_block = unsafe { handler_arc.matrix().query(next_offset) };
-            } else if header.state.load_if_any(&[STATE_ACKED, STATE_COALESCING], Ordering::Acquire).is_ok() {
-                let next_offset = header.next_free.load(Ordering::Acquire);
-                prev_block = current_block;
-                current_block = unsafe { handler_arc.matrix().query(next_offset) };
-            } else {
-                let next_offset = current_block.offset() + header.size.load(Ordering::Acquire);
-                prev_block = current_block;
-                current_block = unsafe { handler_arc.matrix().query(next_offset) };
-            }
-
-            if current_block.offset() > handler_arc.matrix().sector_end_offset(current_block.offset()) {
-                break;
+        for fl in 0..32 {
+            for sl in 0..8 {
+                if handler_arc.matrix().matrix[fl][sl].load(Ordering::Acquire) != 0 {
+                    free_count += 1;
+                }
             }
         }
 
