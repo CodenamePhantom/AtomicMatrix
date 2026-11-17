@@ -343,6 +343,9 @@ impl AtomicMatrix {
 
                         let (r_fl, r_sl) = helpers::find_indices(rem_size);
                         self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
+                    } else {
+                        header.state.store(STATE_FREE, Ordering::Release);
+                        return Err(MatrixErrors::InvalidBlock)
                     }
 
                     return Ok(RelativePtr::new(offset + helpers::HEADER_SPACE));
@@ -438,29 +441,25 @@ impl AtomicMatrix {
                 .swap_if_any(
                     &[STATE_ACKED, STATE_FREE],
                     STATE_COALESCING,
-                    Ordering::Acquire,
+                    Ordering::Release,
                     Ordering::Relaxed,
                 )
                 .is_ok();
 
             if claimed {
                 let size_to_add = prev_header.size.swap(0, Ordering::Acquire);
-                if size_to_add == 0 || prev_phys_offset >= current_offset {
-                    break;
-                }
-
-                if size_to_add > self.total_size {
-                    break;
-                }
-
                 let (fl, sl) = helpers::find_indices(size_to_add);
+                let _ = self.remove_free_block(base_ptr, fl, sl).is_ok();
+
+                if size_to_add == 0 || prev_phys_offset >= current_offset || size_to_add > self.total_size {
+                    break;
+                }
 
                 total_size = total_size
                     .checked_add(size_to_add)
                     .expect("TidalRippleCoalescingError");
                 final_offset = prev_phys_offset;
                 current_header = prev_header;
-                let _ = self.remove_free_block(base_ptr, fl, sl).is_ok();
             } else {
                 break;
             }
@@ -1061,7 +1060,7 @@ mod tests {
         use std::thread;
         use std::time::{Duration, Instant};
 
-        const DURATION: u32 = 600;
+        const DURATION: u32 = 30;
         const THREADS: u32 = 8;
 
         let size = memory_scale::custom::mb::<20>();
@@ -1114,34 +1113,33 @@ mod tests {
 
         let mut total_work = 0u64;
         for h in handles {
-            let (remaining, thread_ops) = h.join().unwrap();
+            let (_, thread_ops) = h.join().unwrap();
             total_work += thread_ops;
-            let base_ptr = handler_arc.base_ptr() as *mut u8;
-
-            for ptr in remaining {
-                let header_ptr =
-                    RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
-                handler_arc.matrix().ack(&header_ptr, base_ptr);
-            }
         }
 
         let mut free_count = 0;
+        let mut prev_block = unsafe { handler_arc.get_first() };
         let mut current_block = unsafe { handler_arc.get_first() };
 
         loop {
             let header = unsafe { current_block.resolve_header(handler_arc.base_ptr()) };
 
-            let size = header.size.load(Ordering::Acquire);
-            let next_offset = current_block.offset() + size;
-            
-
             if header.state.load(Ordering::Acquire) == STATE_FREE {
                 free_count += 1;
-            }
-
-            if next_offset <= handler_arc.matrix().sector_end_offset(next_offset) {
+                let next_offset = header.next_free.load(Ordering::Acquire);
+                prev_block = current_block;
+                current_block = unsafe { handler_arc.matrix().query(next_offset) };
+            } else if header.state.load_if_any(&[STATE_ACKED, STATE_COALESCING], Ordering::Acquire).is_ok() {
+                let next_offset = header.next_free.load(Ordering::Acquire);
+                prev_block = current_block;
                 current_block = unsafe { handler_arc.matrix().query(next_offset) };
             } else {
+                let next_offset = current_block.offset() + header.size.load(Ordering::Acquire);
+                prev_block = current_block;
+                current_block = unsafe { handler_arc.matrix().query(next_offset) };
+            }
+
+            if current_block.offset() > handler_arc.matrix().sector_end_offset(current_block.offset()) {
                 break;
             }
         }

@@ -709,12 +709,53 @@ pub trait HandlerFunctions {
         Ok(data_cp)
     }
 
+    /// Gets the first header on the matrix data segment and return it as a Relative Pointer.
+    ///
+    /// This function will query and return the first header regardless of its state, or if it even
+    /// exists in fact, so it should be used with care.
+    ///
+    /// ### Returns
+    ///
+    /// A RelativePtr<u8> for the very first data segment on the matrix.
     unsafe fn get_first(&self) -> RelativePtr<u8> {
         unsafe { return self.matrix().query(METADATA_SPACE) }
     }
 
-    fn set_first<T>(&self) -> Result<Block<T>, HandlerErrors> {
-        unimplemented!()
+    /// Try to set the first header on the matrix to an specific data shape and claim it as used.
+    ///
+    /// If the data cannot be fitted into this segment, or the segment is already in use, it will
+    /// fail to claim the block and return an error.
+    /// 
+    /// ### Returns
+    /// 
+    /// Either a block pointer for the first data segment on the matrix, or an HandlerErrors.
+    fn try_set_first<T>(&self) -> Result<Block<T>, HandlerErrors> {
+        let tag = type_tag::make::<T>();
+
+        let ptr = unsafe { self.matrix().query(METADATA_SPACE) };
+        let header = unsafe { ptr.resolve_header(self.base_ptr()) };
+
+        if header
+            .state
+            .compare_exchange_weak(
+                STATE_FREE,
+                STATE_ALLOCATED,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_ok()
+        {
+            unsafe {
+                *(self.base_ptr().add(ptr.offset() as usize) as *mut u64) = tag;
+            }
+
+            return Ok(Block::from_offset(ptr.offset(), self.base_ptr() as usize));
+        } else {
+            return Err(HandlerErrors::AllocationFailed {
+                reason: "Failed to transition first block into ALLOCATED on this thread/process."
+                    .into(),
+            });
+        }
     }
 
     /// Locks the block while inside a provided expression scope, giving a reference to the
