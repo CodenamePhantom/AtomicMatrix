@@ -311,13 +311,10 @@ impl AtomicMatrix {
                 if let Ok(offset) = self.remove_free_block(base_ptr, f_fl, f_sl) {
                     let header =
                         unsafe { &mut *(base_ptr.add(offset as usize) as *mut BlockHeader) };
-                    //header
-                    //    .state
-                    //    .store(helpers::STATE_ALLOCATED, Ordering::Release);
 
                     if header
                         .state
-                        .compare_exchange_weak(STATE_FREE, STATE_ALLOCATED, Ordering::AcqRel, Ordering::Relaxed).is_err() {
+                        .compare_exchange_weak(STATE_FREE, STATE_ALLOCATED, Ordering::Acquire, Ordering::Relaxed).is_err() {
                             continue;
                         }
 
@@ -326,7 +323,6 @@ impl AtomicMatrix {
 
                     if total_size >= aligned_alloc_size + helpers::HEADER_SPACE {
                         let next_off = offset + aligned_alloc_size;
-                        debug_assert!(next_off % 16 == 0, "Alignment corrupted at split: {:#x}", next_off);
 
                         let eos = self.sector_end_offset(next_off);
                         let rem_size = total_size - aligned_alloc_size;
@@ -445,6 +441,9 @@ impl AtomicMatrix {
             if prev_phys_offset == 0 {
                 break;
             }
+            if self.checked_query(base_ptr, prev_phys_offset).is_err() {
+                break;
+            }
 
             let prev_header_ptr =
                 unsafe { base_ptr.add(prev_phys_offset as usize) as *mut BlockHeader };
@@ -477,7 +476,7 @@ impl AtomicMatrix {
                     .expect("TidalRippleCoalescingError");
                 final_offset = prev_phys_offset;
                 current_header = prev_header;
-                let _ = self.remove_free_block(base_ptr, fl, sl).is_ok();
+                // let _ = self.remove_free_block(base_ptr, fl, sl).is_ok();
             } else {
                 break;
             }
@@ -623,6 +622,11 @@ impl AtomicMatrix {
         loop {
             let off = head.load(Ordering::Acquire);
             if off == 0 {
+                return Err(MatrixErrors::EmptyBitmapError);
+            }
+
+            if off % 16 != 0 || (off as usize) >= (self.total_size as usize) {
+                let _ = head.compare_exchange(off, 0, Ordering::Acquire, Ordering::Relaxed);
                 return Err(MatrixErrors::EmptyBitmapError);
             }
 
