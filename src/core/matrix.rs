@@ -317,15 +317,14 @@ impl AtomicMatrix {
                         .store(helpers::STATE_ALLOCATED, Ordering::Release);
 
                     let total_size = header.size.load(Ordering::Acquire);
-                    let aligned_alloc_size = (size + helpers::HEADER_SPACE + 15) & !15;
 
-                    if total_size >= aligned_alloc_size {
-                        let next_off = offset + aligned_alloc_size;
+                    if total_size >= size + helpers::HEADER_SPACE {
+                        let next_off = offset + size + helpers::HEADER_SPACE;
 
                         let eos = self.sector_end_offset(next_off);
-                        let rem_size = total_size - aligned_alloc_size;
+                        let rem_size = total_size - (size + helpers::HEADER_SPACE);
 
-                        if next_off < eos && rem_size >= helpers::HEADER_SPACE {
+                        if next_off < eos {
                             let next_h = unsafe {
                                 &mut *(base_ptr.add(next_off as usize) as *mut BlockHeader)
                             };
@@ -349,16 +348,16 @@ impl AtomicMatrix {
                             }
                         }
 
-                        header.size.store(aligned_alloc_size, Ordering::Release);
-
-                        return Ok(RelativePtr::new(offset + helpers::HEADER_SPACE));
-                    } else {
-                        header.state.store(STATE_FREE, Ordering::Release);
-                        self.insert_free_block(base_ptr, offset, fl, sl);
+                        header
+                            .size
+                            .store(size + helpers::HEADER_SPACE, Ordering::Release);
+                        fence(Ordering::SeqCst);
                     }
+
+                    return Ok(RelativePtr::new(offset + helpers::HEADER_SPACE));
                 }
+                std::hint::spin_loop();
             }
-            std::hint::spin_loop();
         }
         Err(MatrixErrors::OutOfMemory)
     }
@@ -425,11 +424,14 @@ impl AtomicMatrix {
     pub fn coalesce(&self, ptr: &RelativePtr<BlockHeader>, base_ptr: *const u8) {
         let current_offset = ptr.offset();
         let mut current_header = unsafe { ptr.resolve_mut(base_ptr) };
-        let mut total_size = current_header.size.swap(0, Ordering::AcqRel);
-
-        if total_size < HEADER_SPACE {
+        if current_header
+            .state
+            .compare_exchange(STATE_ACKED, STATE_COALESCING, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             return;
         }
+        let mut total_size = current_header.size.swap(0, Ordering::AcqRel);
 
         let mut final_offset = current_offset;
 
@@ -440,11 +442,23 @@ impl AtomicMatrix {
                 break;
             }
 
+            assert!(
+                prev_phys_offset % 16 == 0,
+                "bad prev_phys {prev_phys_offset:#x} read from header at {final_offset:#x}"
+            );           
             let prev_header_ptr =
                 unsafe { base_ptr.add(prev_phys_offset as usize) as *mut BlockHeader };
             let prev_header = unsafe { &mut *prev_header_ptr };
+            if prev_header.signature == 0xdead_dead {
+                break;
+            }
+            assert_eq!(
+                prev_header.signature,
+                helpers::HEADER_SIGNATURE,
+                "stale prev_phys {prev_phys_offset:#x} from block {final_offset:#x}"
+            );
 
-            let claimed = prev_header
+            if prev_header
                 .state
                 .swap_if_any(
                     &[STATE_ACKED, STATE_FREE],
@@ -452,9 +466,8 @@ impl AtomicMatrix {
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 )
-                .is_ok();
-
-            if claimed {
+                .is_ok()
+            {
                 let size_to_add = prev_header.size.swap(0, Ordering::Acquire);
                 if size_to_add == 0 || prev_phys_offset >= current_offset {
                     prev_header.state.store(STATE_FREE, Ordering::Release);
@@ -470,6 +483,8 @@ impl AtomicMatrix {
                     .checked_add(size_to_add)
                     .expect("TidalRippleCoalescingError");
                 final_offset = prev_phys_offset;
+                #[cfg(debug_assertions)]
+                { current_header.signature = 0xdead_dead; }
                 current_header = prev_header;
             } else {
                 break;
@@ -618,22 +633,15 @@ impl AtomicMatrix {
             if off == 0 {
                 return Err(MatrixErrors::EmptyBitmapError);
             }
-
-            //if off % 16 != 0 || (off as usize) >= (self.total_size as usize) {
-            //    return Err(MatrixErrors::MisalignedHeader);
-            //}
-
-            let header_ptr = unsafe { base_ptr.add(off as usize) as *const BlockHeader };
-            let header = unsafe { &*header_ptr };
-
-            let next = header.next_free.load(Ordering::Acquire);
+            let next = unsafe {
+                (*(base_ptr.add(off as usize) as *const BlockHeader))
+                    .next_free
+                    .load(Ordering::Acquire)
+            };
             if head
                 .compare_exchange(off, next, Ordering::AcqRel, Ordering::Relaxed)
-                .is_err()
+                .is_ok()
             {
-                std::hint::spin_loop();
-                continue;
-            } else {
                 if next == 0 {
                     self.sl_bitmaps[fl as usize].fetch_and(!(1 << sl), Ordering::Release);
                     if self.sl_bitmaps[fl as usize].load(Ordering::Acquire) == 0 {
@@ -642,6 +650,7 @@ impl AtomicMatrix {
                 }
                 return Ok(off);
             }
+            std::hint::spin_loop();
         }
     }
 
@@ -984,6 +993,7 @@ mod tests {
         //
         // May God help us all at this moment.
 
+        use std::collections::HashSet;
         use std::sync::{Arc, Barrier};
         use std::thread;
 
@@ -1039,15 +1049,7 @@ mod tests {
         }
 
         let total_obtained = all_offsets.len();
-        let mut unique_offsets = Vec::<u32>::new();
-
-        for item in all_offsets {
-            if unique_offsets.contains(&item) {
-                continue;
-            } else {
-                unique_offsets.push(item);
-            }
-        }
+        let unique_offsets: HashSet<_> = all_offsets.into_iter().collect();
 
         // We allow for a 0.5% failure marging, as this stress test does not account for deallocations.
         let success_percentage = ((thread_count * allocs_per_second) as f64) * 0.995;
