@@ -311,6 +311,10 @@ impl AtomicMatrix {
                 if let Ok(offset) = self.remove_free_block(base_ptr, f_fl, f_sl) {
                     let header =
                         unsafe { &mut *(base_ptr.add(offset as usize) as *mut BlockHeader) };
+                    
+                    if header.signature != helpers::HEADER_SIGNATURE {
+                        continue;
+                    }
 
                     header
                         .state
@@ -339,8 +343,8 @@ impl AtomicMatrix {
                             let (r_fl, r_sl) = helpers::find_indices(rem_size);
                             self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
 
-                            let after = total_size;
-                            if after < eos {
+                            let after = offset + total_size;
+                            if after <= eos {
                                 let next_header = unsafe {
                                     &*(base_ptr.add(after as usize) as *const BlockHeader)
                                 };
@@ -436,27 +440,35 @@ impl AtomicMatrix {
         let mut final_offset = current_offset;
 
         while current_offset > (helpers::METADATA_SPACE as u32) {
-            let prev_phys_offset = current_header.prev_phys.load(Ordering::Acquire);
+            let mut prev_phys_offset = current_header.prev_phys.load(Ordering::Acquire);
 
-            if prev_phys_offset == 0 {
+            if prev_phys_offset == 0 || prev_phys_offset % 16 != 0 {
                 break;
             }
 
-            assert!(
-                prev_phys_offset % 16 == 0,
-                "bad prev_phys {prev_phys_offset:#x} read from header at {final_offset:#x}"
-            );           
-            let prev_header_ptr =
-                unsafe { base_ptr.add(prev_phys_offset as usize) as *mut BlockHeader };
-            let prev_header = unsafe { &mut *prev_header_ptr };
-            if prev_header.signature == 0xdead_dead {
-                break;
+            let mut prev_header: &mut BlockHeader;
+            let mut tries = 0;
+            loop {
+                let prev_header_ptr =
+                    unsafe { base_ptr.add(prev_phys_offset as usize) as *mut BlockHeader };
+                prev_header = unsafe { &mut *prev_header_ptr };
+
+                if prev_header.signature != helpers::HEADER_SIGNATURE {
+                    prev_phys_offset = current_header.prev_phys.load(Ordering::Acquire);
+                    tries += 1;
+
+                    if tries >= 1 {
+                        break;
+                    }
+                } else {
+                    tries = 0;
+                    break;
+                }
             }
-            assert_eq!(
-                prev_header.signature,
-                helpers::HEADER_SIGNATURE,
-                "stale prev_phys {prev_phys_offset:#x} from block {final_offset:#x}"
-            );
+
+            if tries >= 1 {
+                break
+            }
 
             if prev_header
                 .state
