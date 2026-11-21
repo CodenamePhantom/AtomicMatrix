@@ -256,7 +256,7 @@ macro_rules! impl_atomic_extensions {
                 success_ordering: Ordering,
                 fail_ordering: Ordering,
             ) -> Result<$value, $value> {
-                self.fetch_update(success_ordering, fail_ordering, |cur| {
+                self.try_update(success_ordering, fail_ordering, |cur| {
                     (cur != forbidden).then_some(new_value)
                 })
             }
@@ -268,7 +268,7 @@ macro_rules! impl_atomic_extensions {
                 success_ordering: Ordering,
                 fail_ordering: Ordering,
             ) -> Result<$value, $value> {
-                self.fetch_update(success_ordering, fail_ordering, |cur| {
+                self.try_update(success_ordering, fail_ordering, |cur| {
                     (cur == target).then_some(new_value)
                 })
             }
@@ -280,7 +280,7 @@ macro_rules! impl_atomic_extensions {
                 success_ordering: Ordering,
                 fail_ordering: Ordering,
             ) -> Result<$value, $value> {
-                self.fetch_update(success_ordering, fail_ordering, |cur| {
+                self.try_update(success_ordering, fail_ordering, |cur| {
                     (!forbidden_list.contains(&cur)).then_some(new_value)
                 })
             }
@@ -292,7 +292,7 @@ macro_rules! impl_atomic_extensions {
                 success_ordering: Ordering,
                 fail_ordering: Ordering,
             ) -> Result<$value, $value> {
-                self.fetch_update(success_ordering, fail_ordering, |cur| {
+                self.try_update(success_ordering, fail_ordering, |cur| {
                     (target_list.contains(&cur)).then_some(new_value)
                 })
             }
@@ -304,7 +304,7 @@ macro_rules! impl_atomic_extensions {
                 success_ordering: Ordering,
                 fail_ordering: Ordering,
             ) -> bool {
-                self.fetch_update(success_ordering, fail_ordering, |cur| {
+                self.try_update(success_ordering, fail_ordering, |cur| {
                     (cur != forbidden).then_some(new_value)
                 })
                 .is_ok()
@@ -317,7 +317,7 @@ macro_rules! impl_atomic_extensions {
                 success_ordering: Ordering,
                 fail_ordering: Ordering,
             ) -> bool {
-                self.fetch_update(success_ordering, fail_ordering, |cur| {
+                self.try_update(success_ordering, fail_ordering, |cur| {
                     (cur == target).then_some(new_value)
                 })
                 .is_ok()
@@ -330,7 +330,7 @@ macro_rules! impl_atomic_extensions {
                 success_ordering: Ordering,
                 fail_ordering: Ordering,
             ) -> bool {
-                self.fetch_update(success_ordering, fail_ordering, |cur| {
+                self.try_update(success_ordering, fail_ordering, |cur| {
                     (!forbidden_list.contains(&cur)).then_some(new_value)
                 })
                 .is_ok()
@@ -343,7 +343,7 @@ macro_rules! impl_atomic_extensions {
                 success_ordering: Ordering,
                 fail_ordering: Ordering,
             ) -> bool {
-                self.fetch_update(success_ordering, fail_ordering, |cur| {
+                self.try_update(success_ordering, fail_ordering, |cur| {
                     (target_list.contains(&cur)).then_some(new_value)
                 })
                 .is_ok()

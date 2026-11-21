@@ -256,17 +256,7 @@ impl MatrixHandler {
     /// A result containing either an empty Ok, or a HandlerErrors.
     pub unsafe fn die(&self) -> Result<(), HandlerErrors> {
         let id = &self.id;
-        let path_str = if std::env::consts::OS == "windows" {
-            let path = "C:\\ProgramData\\AtomicMatrix\\";
-
-            if !std::fs::exists(path).unwrap() {
-                std::fs::create_dir(path).unwrap();
-            }
-
-            path
-        } else {
-            "/dev/shm/"
-        };
+        let path_str = helpers::generate_sys_path();
 
         let path = format!("{}matrix-{}", path_str, id);
 
@@ -823,9 +813,8 @@ pub trait HandlerFunctions {
                     retry_count += 1;
                     if retry_count >= 512 {
                         return None;
-                    } else {
-                        continue;
                     }
+                    continue;
                 }
             }
         }

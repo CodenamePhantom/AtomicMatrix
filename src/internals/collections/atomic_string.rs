@@ -32,7 +32,7 @@
 //! chain block if this limit is surpassed, that will be attached to the previous block in the
 //! chain.
 //!
-//! If the string is mutated into a size smaller than the previous iteration that makes an overflow 
+//! If the string is mutated into a size smaller than the previous iteration that makes an overflow
 //! useless, this block will be deallocated from the string and its pointer will be zeroed
 //!
 //! ### Corruption
@@ -126,9 +126,13 @@ const STRING_CHAIN: u32 = 900_001;
 /// How many chars will be stored per chain link
 const CHAR_COUNT: usize = 64;
 
+/// Communication flags between the caller defined closure and the method executor.
 enum ClosureFlags {
+    /// Signals the executor to break the execution of the closure.
     Break,
+    /// Signals the executor an error was encountered when running the closure.
     Error(String),
+    /// Signals the executor the next offset to return as context to the closure.
     Next(u32),
 }
 
@@ -208,7 +212,7 @@ impl AtomicString {
     #[inline]
     fn reader_decrease(&self) {
         self.readers
-            .fetch_update(Ordering::Release, Ordering::Acquire, |mut v| {
+            .try_update(Ordering::Release, Ordering::Acquire, |mut v| {
                 let agreement = self.agreement.load(Ordering::Acquire);
                 v -= 1;
 
@@ -568,8 +572,12 @@ impl AtomicString {
             .map_err(|e| AtomicStringErrors::Inner(e))?;
 
         let header = unsafe { as_block.header() };
-        if header.state.load_if(STATE_STRING, Ordering::Relaxed).is_err() {
-            return Err(AtomicStringErrors::NotAString{ offset: offset });
+        if header
+            .state
+            .load_if(STATE_STRING, Ordering::Relaxed)
+            .is_err()
+        {
+            return Err(AtomicStringErrors::NotAString { offset: offset });
         }
 
         let mut str_guard = s_handler

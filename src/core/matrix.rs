@@ -79,6 +79,7 @@ pub mod helpers {
     ///
     /// # Returns
     /// A tuple of `(fl, sl)` indices.
+    #[inline]
     pub fn find_indices(size: u32) -> (u32, u32) {
         if size < 128 {
             (0, (size / 16).min(7))
@@ -87,6 +88,23 @@ pub mod helpers {
             let sl = ((size >> (fl - 3)) & 0x7).min(7);
             (fl.min(31), sl)
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn generate_sys_path<'a>() -> &'a str {
+        let path_str = if std::env::consts::OS == "windows" {
+            let path = "C:\\ProgramData\\AtomicMatrix\\";
+
+            if !std::fs::exists(path).unwrap() {
+                std::fs::create_dir(path).unwrap();
+            }
+
+            path
+        } else {
+            "/dev/shm/"
+        };
+
+        return path_str;
     }
 }
 
@@ -187,17 +205,7 @@ impl AtomicMatrix {
     pub fn bootstrap(id: Option<String>, size: usize) -> Result<MatrixHandler, MatrixErrors> {
         let mut retry_count = 0;
 
-        let path_str = if std::env::consts::OS == "windows" {
-            let path = "C:\\ProgramData\\AtomicMatrix\\";
-
-            if !std::fs::exists(path).unwrap() {
-                std::fs::create_dir(path).unwrap();
-            }
-
-            path
-        } else {
-            "/dev/shm/"
-        };
+        let path_str = helpers::generate_sys_path();
 
         let path_id = id.unwrap_or_else(generate_uuid);
         let path = format!("{}matrix-{}", path_str, path_id);
@@ -264,11 +272,11 @@ impl AtomicMatrix {
             init_guard.store(helpers::SYS_READY, Ordering::SeqCst);
         } else {
             while init_guard.load(Ordering::Acquire) != helpers::SYS_READY {
+                retry_count += 1;
+                std::hint::spin_loop();
+
                 if retry_count >= 512 {
                     return Err(MatrixErrors::MatrixAttachingError);
-                } else {
-                    retry_count += 1;
-                    std::hint::spin_loop();
                 }
             }
         }
@@ -311,7 +319,7 @@ impl AtomicMatrix {
                 if let Ok(offset) = self.remove_free_block(base_ptr, f_fl, f_sl) {
                     let header =
                         unsafe { &mut *(base_ptr.add(offset as usize) as *mut BlockHeader) };
-                    
+
                     if header.signature != helpers::HEADER_SIGNATURE {
                         continue;
                     }
@@ -321,12 +329,13 @@ impl AtomicMatrix {
                         .store(helpers::STATE_ALLOCATED, Ordering::Release);
 
                     let total_size = header.size.load(Ordering::Acquire);
+                    let base_block_size = size + helpers::HEADER_SPACE;
 
-                    if total_size >= size + helpers::HEADER_SPACE {
-                        let next_off = offset + size + helpers::HEADER_SPACE;
+                    if total_size >= base_block_size {
+                        let next_off = offset + base_block_size;
 
                         let eos = self.sector_end_offset(next_off);
-                        let rem_size = total_size - (size + helpers::HEADER_SPACE);
+                        let rem_size = total_size - base_block_size;
 
                         if next_off < eos {
                             let next_h = unsafe {
@@ -403,21 +412,6 @@ impl AtomicMatrix {
     /// Tries to merge neighbouring blocks to the left until the end of the matrix is
     /// reached or the neighbour block is not ACKED/FREE.
     ///
-    /// This is the elegant implementation of the Kinetic Coalescence processes. It
-    /// receives the initial block that will start the ripple, and traverse the matrix
-    /// to the left (monotonicity guard). If any race conditions are met in the middle
-    /// (another coalescing just start, or a module just claimed this block), it will
-    /// stop the coalescing and move on (permissive healing).
-    ///
-    /// Then it tries to update the next neighbour previous physical offset metadata to
-    /// the start of the new free block. If this exchange fails due to end of sector, or
-    /// just claimed blocks, it will skip this marking in hopes that when this block is
-    /// eventually coalesced, it will passivelly merge backwards with the ripple and fix
-    /// the marking on its header by himself (horizon boundary).
-    ///
-    /// This three core implementations together composes the Propagation Principle of
-    /// Atomic Coalescence and enables the matrix to have such high throughput speeds.
-    ///
     /// ### Params:
     /// @ptr: The relative pointer of the block to coalesce. \
     /// @base_ptr: The offset from the start of the SHM segment.
@@ -430,7 +424,12 @@ impl AtomicMatrix {
         let mut current_header = unsafe { ptr.resolve_mut(base_ptr) };
         if current_header
             .state
-            .compare_exchange(STATE_ACKED, STATE_COALESCING, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange(
+                STATE_ACKED,
+                STATE_COALESCING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_err()
         {
             return;
@@ -467,7 +466,7 @@ impl AtomicMatrix {
             }
 
             if tries >= 1 {
-                break
+                break;
             }
 
             if prev_header
@@ -481,12 +480,7 @@ impl AtomicMatrix {
                 .is_ok()
             {
                 let size_to_add = prev_header.size.swap(0, Ordering::Acquire);
-                if size_to_add == 0 || prev_phys_offset >= current_offset {
-                    prev_header.state.store(STATE_FREE, Ordering::Release);
-                    break;
-                }
-
-                if size_to_add > self.total_size {
+                if size_to_add == 0 || prev_phys_offset >= current_offset || size_to_add > total_size {
                     prev_header.state.store(STATE_FREE, Ordering::Release);
                     break;
                 }
@@ -495,8 +489,6 @@ impl AtomicMatrix {
                     .checked_add(size_to_add)
                     .expect("TidalRippleCoalescingError");
                 final_offset = prev_phys_offset;
-                #[cfg(debug_assertions)]
-                { current_header.signature = 0xdead_dead; }
                 current_header = prev_header;
             } else {
                 break;
