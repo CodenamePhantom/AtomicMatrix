@@ -74,7 +74,7 @@ impl<'a> Iterator for Looper {
                 // we'll do this by iterating backwards through all previous blocks until we find one that has the info.
                 // Scratch that. We try to move forward by header size until one matches maybe? Have to test both
                 let prev_ptr = matrix.checked_query(self.handler_ref.base_ptr(), *prev_offset).unwrap();
-                let prev_h = unsafe { prev_ptr.resolve_header(self.handler_ref.base_ptr()) };
+                let _prev_h = unsafe { prev_ptr.resolve_header(self.handler_ref.base_ptr()) };
                 return None
             },
             Err(_) => panic!("Something went very wrong here.")
@@ -138,7 +138,7 @@ impl<'a> LoopWindow {
     /// Returns a reference to the current record data typed as T.
     pub fn view_data_as<T>(&self) -> type_guard::TypeGuard<T> {
         let block = Block::<T>::from_offset(self.rel_ptr.offset(), self.handler.base_ptr() as usize);
-        let res = unsafe { self.handler.read(&block).unwrap() };
+        let res = self.handler.read(&block).unwrap();
 
         res
     }

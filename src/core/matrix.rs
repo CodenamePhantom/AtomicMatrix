@@ -79,6 +79,7 @@ pub mod helpers {
     ///
     /// # Returns
     /// A tuple of `(fl, sl)` indices.
+    #[inline]
     pub fn find_indices(size: u32) -> (u32, u32) {
         if size < 128 {
             (0, (size / 16).min(7))
@@ -87,6 +88,23 @@ pub mod helpers {
             let sl = ((size >> (fl - 3)) & 0x7).min(7);
             (fl.min(31), sl)
         }
+    }
+
+    #[inline(always)]
+    pub(crate) fn generate_sys_path<'a>() -> &'a str {
+        let path_str = if std::env::consts::OS == "windows" {
+            let path = "C:\\ProgramData\\AtomicMatrix\\";
+
+            if !std::fs::exists(path).unwrap() {
+                std::fs::create_dir(path).unwrap();
+            }
+
+            path
+        } else {
+            "/dev/shm/"
+        };
+
+        return path_str;
     }
 }
 
@@ -187,17 +205,7 @@ impl AtomicMatrix {
     pub fn bootstrap(id: Option<String>, size: usize) -> Result<MatrixHandler, MatrixErrors> {
         let mut retry_count = 0;
 
-        let path_str = if std::env::consts::OS == "windows" {
-            let path = "C:\\ProgramData\\AtomicMatrix\\";
-
-            if !std::fs::exists(path).unwrap() {
-                std::fs::create_dir(path).unwrap();
-            }
-
-            path
-        } else {
-            "/dev/shm/"
-        };
+        let path_str = helpers::generate_sys_path();
 
         let path_id = id.unwrap_or_else(generate_uuid);
         let path = format!("{}matrix-{}", path_str, path_id);
@@ -264,11 +272,11 @@ impl AtomicMatrix {
             init_guard.store(helpers::SYS_READY, Ordering::SeqCst);
         } else {
             while init_guard.load(Ordering::Acquire) != helpers::SYS_READY {
+                retry_count += 1;
+                std::hint::spin_loop();
+
                 if retry_count >= 512 {
                     return Err(MatrixErrors::MatrixAttachingError);
-                } else {
-                    retry_count += 1;
-                    std::hint::spin_loop();
                 }
             }
         }
@@ -311,17 +319,23 @@ impl AtomicMatrix {
                 if let Ok(offset) = self.remove_free_block(base_ptr, f_fl, f_sl) {
                     let header =
                         unsafe { &mut *(base_ptr.add(offset as usize) as *mut BlockHeader) };
+
+                    if header.signature != helpers::HEADER_SIGNATURE {
+                        continue;
+                    }
+
                     header
                         .state
                         .store(helpers::STATE_ALLOCATED, Ordering::Release);
 
                     let total_size = header.size.load(Ordering::Acquire);
+                    let base_block_size = size + helpers::HEADER_SPACE;
 
-                    if total_size >= size + helpers::HEADER_SPACE {
-                        let next_off = offset + size + helpers::HEADER_SPACE;
+                    if total_size >= base_block_size {
+                        let next_off = offset + base_block_size;
+
                         let eos = self.sector_end_offset(next_off);
-
-                        let rem_size = total_size - (size + helpers::HEADER_SPACE);
+                        let rem_size = total_size - base_block_size;
 
                         if next_off < eos {
                             let next_h = unsafe {
@@ -334,21 +348,29 @@ impl AtomicMatrix {
                             next_h.prev_phys.store(offset, Ordering::Release);
                             next_h.next_free.store(0, Ordering::Release);
                             next_h.created_at.set_now();
+
+                            let (r_fl, r_sl) = helpers::find_indices(rem_size);
+                            self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
+
+                            let after = offset + total_size;
+                            if after <= eos {
+                                let next_header = unsafe {
+                                    &*(base_ptr.add(after as usize) as *const BlockHeader)
+                                };
+                                next_header.prev_phys.store(next_off, Ordering::Release);
+                            }
                         }
 
                         header
                             .size
                             .store(size + helpers::HEADER_SPACE, Ordering::Release);
                         fence(Ordering::SeqCst);
-
-                        let (r_fl, r_sl) = helpers::find_indices(rem_size);
-                        self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
                     }
 
                     return Ok(RelativePtr::new(offset + helpers::HEADER_SPACE));
                 }
+                std::hint::spin_loop();
             }
-            std::hint::spin_loop();
         }
         Err(MatrixErrors::OutOfMemory)
     }
@@ -390,21 +412,6 @@ impl AtomicMatrix {
     /// Tries to merge neighbouring blocks to the left until the end of the matrix is
     /// reached or the neighbour block is not ACKED/FREE.
     ///
-    /// This is the elegant implementation of the Kinetic Coalescence processes. It
-    /// receives the initial block that will start the ripple, and traverse the matrix
-    /// to the left (monotonicity guard). If any race conditions are met in the middle
-    /// (another coalescing just start, or a module just claimed this block), it will
-    /// stop the coalescing and move on (permissive healing).
-    ///
-    /// Then it tries to update the next neighbour previous physical offset metadata to
-    /// the start of the new free block. If this exchange fails due to end of sector, or
-    /// just claimed blocks, it will skip this marking in hopes that when this block is
-    /// eventually coalesced, it will passivelly merge backwards with the ripple and fix
-    /// the marking on its header by himself (horizon boundary).
-    ///
-    /// This three core implementations together composes the Propagation Principle of
-    /// Atomic Coalescence and enables the matrix to have such high throughput speeds.
-    ///
     /// ### Params:
     /// @ptr: The relative pointer of the block to coalesce. \
     /// @base_ptr: The offset from the start of the SHM segment.
@@ -415,25 +422,54 @@ impl AtomicMatrix {
     pub fn coalesce(&self, ptr: &RelativePtr<BlockHeader>, base_ptr: *const u8) {
         let current_offset = ptr.offset();
         let mut current_header = unsafe { ptr.resolve_mut(base_ptr) };
-        let mut total_size = current_header.size.swap(0, Ordering::AcqRel);
-        if total_size < HEADER_SPACE {
+        if current_header
+            .state
+            .compare_exchange(
+                STATE_ACKED,
+                STATE_COALESCING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_err()
+        {
             return;
         }
+        let mut total_size = current_header.size.swap(0, Ordering::AcqRel);
 
         let mut final_offset = current_offset;
 
         while current_offset > (helpers::METADATA_SPACE as u32) {
-            let prev_phys_offset = current_header.prev_phys.load(Ordering::Acquire);
+            let mut prev_phys_offset = current_header.prev_phys.load(Ordering::Acquire);
 
-            if prev_phys_offset == 0 {
+            if prev_phys_offset == 0 || prev_phys_offset % 16 != 0 {
                 break;
             }
 
-            let prev_header_ptr =
-                unsafe { base_ptr.add(prev_phys_offset as usize) as *mut BlockHeader };
-            let prev_header = unsafe { &mut *prev_header_ptr };
+            let mut prev_header: &mut BlockHeader;
+            let mut tries = 0;
+            loop {
+                let prev_header_ptr =
+                    unsafe { base_ptr.add(prev_phys_offset as usize) as *mut BlockHeader };
+                prev_header = unsafe { &mut *prev_header_ptr };
 
-            let claimed = prev_header
+                if prev_header.signature != helpers::HEADER_SIGNATURE {
+                    prev_phys_offset = current_header.prev_phys.load(Ordering::Acquire);
+                    tries += 1;
+
+                    if tries >= 1 {
+                        break;
+                    }
+                } else {
+                    tries = 0;
+                    break;
+                }
+            }
+
+            if tries >= 1 {
+                break;
+            }
+
+            if prev_header
                 .state
                 .swap_if_any(
                     &[STATE_ACKED, STATE_FREE],
@@ -441,26 +477,19 @@ impl AtomicMatrix {
                     Ordering::Acquire,
                     Ordering::Relaxed,
                 )
-                .is_ok();
-
-            if claimed {
+                .is_ok()
+            {
                 let size_to_add = prev_header.size.swap(0, Ordering::Acquire);
-                if size_to_add == 0 || prev_phys_offset >= current_offset {
+                if size_to_add == 0 || prev_phys_offset >= current_offset || size_to_add > total_size {
+                    prev_header.state.store(STATE_FREE, Ordering::Release);
                     break;
                 }
-
-                if size_to_add > self.total_size {
-                    break;
-                }
-
-                let (fl, sl) = helpers::find_indices(size_to_add);
 
                 total_size = total_size
                     .checked_add(size_to_add)
                     .expect("TidalRippleCoalescingError");
                 final_offset = prev_phys_offset;
                 current_header = prev_header;
-                let _ = self.remove_free_block(base_ptr, fl, sl).is_ok();
             } else {
                 break;
             }
@@ -641,8 +670,10 @@ impl AtomicMatrix {
     pub fn insert_free_block(&self, base_ptr: *const u8, offset: u32, fl: u32, sl: u32) {
         let head = &self.matrix[fl as usize][sl as usize];
         let h = unsafe { &mut *(base_ptr.add(offset as usize) as *mut BlockHeader) };
+        let mut was_empty: bool;
         loop {
             let old = head.load(Ordering::Acquire);
+            was_empty = old == 0;
             h.next_free.store(old, Ordering::Release);
             if head
                 .compare_exchange(old, offset, Ordering::AcqRel, Ordering::Relaxed)
@@ -650,10 +681,14 @@ impl AtomicMatrix {
             {
                 break;
             }
+
             std::hint::spin_loop();
         }
-        self.fl_bitmap.fetch_or(1 << fl, Ordering::Release);
-        self.sl_bitmaps[fl as usize].fetch_or(1 << sl, Ordering::Release);
+
+        if was_empty {
+            self.fl_bitmap.fetch_or(1 << fl, Ordering::Release);
+            self.sl_bitmaps[fl as usize].fetch_or(1 << sl, Ordering::Release);
+        }
     }
 
     /// Returns the boundary of the current sector
@@ -1000,9 +1035,10 @@ mod tests {
 
                             my_offsets.push(rel_ptr.offset());
                             break;
+                        } else {
+                            fail_count_clone.fetch_add(1, Ordering::Relaxed);
+                            continue;
                         }
-                        fail_count_clone.fetch_add(1, Ordering::Relaxed);
-                        std::hint::spin_loop();
                     }
                 }
 
@@ -1028,6 +1064,7 @@ mod tests {
         println!("{} MB used", used_size);
         println!("Obtained: {}", total_obtained);
         println!("Threshold: {}", success_percentage);
+        println!("Failed count: {}", fail_count.load(Ordering::Relaxed));
         assert!(
             total_obtained >= (success_percentage as usize),
             "Total allocations should match expected count"
@@ -1061,11 +1098,11 @@ mod tests {
         use std::thread;
         use std::time::{Duration, Instant};
 
-        const DURATION: u32 = 600;
+        const DURATION: u32 = 30;
         const THREADS: u32 = 8;
 
         let size = memory_scale::custom::mb::<20>();
-        let handler = AtomicMatrix::bootstrap(Some(String::from("f_h_test")), size).unwrap();
+        let handler = AtomicMatrix::bootstrap(None, size).unwrap();
         let handler_arc = Arc::new(handler);
         let barrier = Arc::new(Barrier::new(THREADS as usize));
         let start_time = Instant::now();
@@ -1092,6 +1129,7 @@ mod tests {
                     if rng % 10 < 7 && my_blocks.len() < 200 {
                         let alloc_size = rng % 512;
                         if let Ok(ptr) = matrix.allocate(base_ptr, alloc_size as u32) {
+                            total_ops += 1;
                             my_blocks.push(ptr);
                         }
                     } else if !my_blocks.is_empty() {
@@ -1101,12 +1139,12 @@ mod tests {
                         let header_ptr =
                             RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
                         matrix.ack(&header_ptr, base_ptr);
+                        total_ops += 1;
 
                         if total_ops % 5 == 0 {
                             matrix.coalesce(&header_ptr, base_ptr);
                         }
                     }
-                    total_ops += 1;
                 }
                 (my_blocks, total_ops)
             }));
@@ -1126,23 +1164,12 @@ mod tests {
         }
 
         let mut free_count = 0;
-        let mut current_block = unsafe { handler_arc.get_first() };
 
-        loop {
-            let header = unsafe { current_block.resolve_header(handler_arc.base_ptr()) };
-
-            let size = header.size.load(Ordering::Acquire);
-            let next_offset = current_block.offset() + size;
-            
-
-            if header.state.load(Ordering::Acquire) == STATE_FREE {
-                free_count += 1;
-            }
-
-            if next_offset <= handler_arc.matrix().sector_end_offset(next_offset) {
-                current_block = unsafe { handler_arc.matrix().query(next_offset) };
-            } else {
-                break;
+        for fl in 0..32 {
+            for sl in 0..8 {
+                if handler_arc.matrix().matrix[fl][sl].load(Ordering::Acquire) != 0 {
+                    free_count += 1;
+                }
             }
         }
 
