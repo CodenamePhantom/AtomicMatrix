@@ -331,7 +331,7 @@ impl AtomicMatrix {
                     let total_size = header.size.load(Ordering::Acquire);
                     let base_block_size = size + helpers::HEADER_SPACE;
 
-                    if total_size >= base_block_size {
+                    if total_size > base_block_size {
                         let next_off = offset + base_block_size;
 
                         let eos = self.sector_end_offset(next_off);
@@ -353,7 +353,7 @@ impl AtomicMatrix {
                             self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
 
                             let after = offset + total_size;
-                            if after <= eos {
+                            if after < eos {
                                 let next_header = unsafe {
                                     &*(base_ptr.add(after as usize) as *const BlockHeader)
                                 };
@@ -369,8 +369,8 @@ impl AtomicMatrix {
 
                     return Ok(RelativePtr::new(offset + helpers::HEADER_SPACE));
                 }
-                std::hint::spin_loop();
             }
+            std::hint::spin_loop();
         }
         Err(MatrixErrors::OutOfMemory)
     }
@@ -420,7 +420,6 @@ impl AtomicMatrix {
     /// TidalRippleContentionError: Two coalescing ripples executing simultaneously on
     /// the same blocks.
     pub fn coalesce(&self, ptr: &RelativePtr<BlockHeader>, base_ptr: *const u8) {
-        let current_offset = ptr.offset();
         let mut current_header = unsafe { ptr.resolve_mut(base_ptr) };
         if current_header
             .state
@@ -436,9 +435,9 @@ impl AtomicMatrix {
         }
         let mut total_size = current_header.size.swap(0, Ordering::AcqRel);
 
-        let mut final_offset = current_offset;
+        let mut final_offset = ptr.offset();
 
-        while current_offset > (helpers::METADATA_SPACE as u32) {
+        while final_offset > (helpers::METADATA_SPACE as u32) {
             let mut prev_phys_offset = current_header.prev_phys.load(Ordering::Acquire);
 
             if prev_phys_offset == 0 || prev_phys_offset % 16 != 0 {
@@ -480,8 +479,9 @@ impl AtomicMatrix {
                 .is_ok()
             {
                 let size_to_add = prev_header.size.swap(0, Ordering::Acquire);
-                if size_to_add == 0 || prev_phys_offset >= current_offset || size_to_add > total_size {
+                if size_to_add == 0 || prev_phys_offset >= final_offset || size_to_add > self.total_size {
                     prev_header.state.store(STATE_FREE, Ordering::Release);
+                    prev_header.size.store(size_to_add, Ordering::Release);
                     break;
                 }
 
@@ -882,14 +882,12 @@ mod tests {
             let ptr_e = matrix.allocate(base_ptr, 64).unwrap();
 
             let h_b = ptr_b.resolve_header(base_ptr);
-            let rel_c = RelativePtr::<BlockHeader>::new(ptr_c.offset() - helpers::HEADER_SPACE);
-            let rel_d = RelativePtr::<BlockHeader>::new(ptr_d.offset() - helpers::HEADER_SPACE);
+            let rel_c = RelativePtr::<BlockHeader>::new(ptr_c.offset() - HEADER_SPACE);
+            let rel_d = RelativePtr::<BlockHeader>::new(ptr_d.offset() - HEADER_SPACE);
 
             h_b.state.store(helpers::STATE_FREE, Ordering::Release);
             matrix.ack(&rel_c, base_ptr);
             matrix.ack(&rel_d, base_ptr);
-
-            matrix.coalesce(&rel_d, base_ptr);
 
             let h_a = ptr_a.resolve_header(base_ptr);
             assert_eq!(h_a.state.load(Ordering::Acquire), helpers::STATE_ALLOCATED);
@@ -898,7 +896,7 @@ mod tests {
             assert_eq!(h_merged.state.load(Ordering::Acquire), helpers::STATE_FREE);
             assert_eq!(
                 h_merged.size.load(Ordering::Acquire),
-                64 * 3 + 3 * helpers::HEADER_SPACE
+                (64 + HEADER_SPACE) * 3
             );
 
             let h_e = ptr_e.resolve_header(base_ptr);
