@@ -337,28 +337,28 @@ impl AtomicMatrix {
                         let eos = self.sector_end_offset(next_off);
                         let rem_size = total_size - base_block_size;
 
-                        if next_off < eos {
-                            let next_h = unsafe {
-                                &mut *(base_ptr.add(next_off as usize) as *mut BlockHeader)
-                            };
-
-                            next_h.signature = helpers::HEADER_SIGNATURE;
-                            next_h.size.store(rem_size, Ordering::Release);
-                            next_h.state.store(helpers::STATE_FREE, Ordering::Release);
-                            next_h.prev_phys.store(offset, Ordering::Release);
-                            next_h.next_free.store(0, Ordering::Release);
-                            next_h.created_at.set_now();
-
-                            let (r_fl, r_sl) = helpers::find_indices(rem_size);
-                            self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
-
-                            let after = offset + total_size;
-                            if after < eos {
-                                let next_header = unsafe {
-                                    &*(base_ptr.add(after as usize) as *const BlockHeader)
+                        if rem_size >= helpers::HEADER_SPACE * 2 {
+                            if next_off < eos {
+                                let next_h = unsafe {
+                                    &mut *(base_ptr.add(next_off as usize) as *mut BlockHeader)
                                 };
-                                next_header.prev_phys.store(next_off, Ordering::Release);
+
+                                next_h.signature = helpers::HEADER_SIGNATURE;
+                                next_h.size.store(rem_size, Ordering::Release);
+                                next_h.state.store(helpers::STATE_FREE, Ordering::Release);
+                                next_h.prev_phys.store(offset, Ordering::Release);
+                                next_h.next_free.store(0, Ordering::Release);
+                                next_h.created_at.set_now();
+
+                                let (r_fl, r_sl) = helpers::find_indices(rem_size);
+                                self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
                             }
+                        }
+                        let after = offset + total_size;
+                        if after < eos {
+                            let next_header =
+                                unsafe { &*(base_ptr.add(after as usize) as *const BlockHeader) };
+                            next_header.prev_phys.store(next_off, Ordering::Release);
                         }
 
                         header
@@ -479,7 +479,10 @@ impl AtomicMatrix {
                 .is_ok()
             {
                 let size_to_add = prev_header.size.swap(0, Ordering::Acquire);
-                if size_to_add == 0 || prev_phys_offset >= final_offset || size_to_add > self.total_size {
+                if size_to_add == 0
+                    || prev_phys_offset >= final_offset
+                    || size_to_add > self.total_size
+                {
                     prev_header.state.store(STATE_FREE, Ordering::Release);
                     prev_header.size.store(size_to_add, Ordering::Release);
                     break;
