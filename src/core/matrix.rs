@@ -331,11 +331,17 @@ impl AtomicMatrix {
                     let total_size = header.size.load(Ordering::Acquire);
                     let base_block_size = size + helpers::HEADER_SPACE;
 
+                    // This part is a bit tricky. We compare the requested size to the total size of
+                    // the segment acquired from remove_free_block. If the requested size is smaller
+                    // than the provided segment, we try to split it into two, but only if the remaining
+                    // segment fits into the minimum allowed block space. If it doesn't, we don't split
+                    // and update the values to store the full segment size as this block size, and this
+                    // block offset as the next offset to be updated into the next physical neighbor
                     if total_size > base_block_size {
-                        let next_off = offset + base_block_size;
-
+                        let mut next_off = offset + base_block_size;
                         let eos = self.sector_end_offset(next_off);
                         let rem_size = total_size - base_block_size;
+                        let final_allocation_size;
 
                         if rem_size >= helpers::HEADER_SPACE * 2 {
                             if next_off < eos {
@@ -353,7 +359,13 @@ impl AtomicMatrix {
                                 let (r_fl, r_sl) = helpers::find_indices(rem_size);
                                 self.insert_free_block(base_ptr, next_off, r_fl, r_sl);
                             }
+
+                            final_allocation_size = base_block_size
+                        } else {
+                            final_allocation_size = total_size;
+                            next_off = offset;
                         }
+
                         let after = offset + total_size;
                         if after < eos {
                             let next_header =
@@ -363,7 +375,7 @@ impl AtomicMatrix {
 
                         header
                             .size
-                            .store(size + helpers::HEADER_SPACE, Ordering::Release);
+                            .store(final_allocation_size, Ordering::Release);
                         fence(Ordering::SeqCst);
                     }
 
@@ -1181,7 +1193,7 @@ mod tests {
         println!("Num of threads: {}", THREADS);
         println!("Total operations: {}", total_work);
         println!(
-            "Throughput: {:.2} Mop/s",
+            "Throughput: {:.2} Million ops/s",
             (total_work as f64) / (DURATION as f64) / 1_000_000.0
         );
         println!("Final free fragments: {}", free_count);
