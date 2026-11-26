@@ -373,9 +373,7 @@ impl AtomicMatrix {
                             next_header.prev_phys.store(next_off, Ordering::Release);
                         }
 
-                        header
-                            .size
-                            .store(final_allocation_size, Ordering::Release);
+                        header.size.store(final_allocation_size, Ordering::Release);
                         fence(Ordering::SeqCst);
                     }
 
@@ -652,6 +650,14 @@ impl AtomicMatrix {
             if off == 0 {
                 return Err(MatrixErrors::EmptyBitmapError);
             }
+
+            let signature =
+                unsafe { std::ptr::read_unaligned(base_ptr.add(off as usize) as *const u32) };
+            if off % 16 != 0 || signature != helpers::HEADER_SIGNATURE {
+                head.store(0, Ordering::Release);
+                return Err(MatrixErrors::MisalignedHeader);
+            }
+
             let next = unsafe {
                 (*(base_ptr.add(off as usize) as *const BlockHeader))
                     .next_free
@@ -1141,6 +1147,7 @@ mod tests {
 
                     if rng % 10 < 7 && my_blocks.len() < 200 {
                         let alloc_size = rng % 512;
+
                         if let Ok(ptr) = matrix.allocate(base_ptr, alloc_size as u32) {
                             total_ops += 1;
                             my_blocks.push(ptr);
@@ -1151,6 +1158,7 @@ mod tests {
 
                         let header_ptr =
                             RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
+
                         matrix.ack(&header_ptr, base_ptr);
                         total_ops += 1;
 
@@ -1159,19 +1167,23 @@ mod tests {
                         }
                     }
                 }
+
                 (my_blocks, total_ops)
             }));
         }
 
         let mut total_work = 0u64;
+
         for h in handles {
             let (remaining, thread_ops) = h.join().unwrap();
             total_work += thread_ops;
+
             let base_ptr = handler_arc.base_ptr() as *mut u8;
 
             for ptr in remaining {
                 let header_ptr =
                     RelativePtr::<BlockHeader>::new(ptr.offset() - helpers::HEADER_SPACE);
+
                 handler_arc.matrix().ack(&header_ptr, base_ptr);
             }
         }
@@ -1187,6 +1199,7 @@ mod tests {
         }
 
         let entrophy_percentage = ((free_count as f64) / (total_work as f64)) * 100.0;
+
         let mops = (total_work as f64) / (DURATION as f64) / 1_000_000.0;
 
         println!("Endurance Results (Duration of {} seconds)", DURATION);
