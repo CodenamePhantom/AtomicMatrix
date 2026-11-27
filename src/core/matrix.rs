@@ -444,10 +444,9 @@ impl AtomicMatrix {
             return;
         }
         let mut total_size = current_header.size.swap(0, Ordering::AcqRel);
-
         let mut final_offset = ptr.offset();
 
-        while final_offset > (helpers::METADATA_SPACE as u32) {
+        'outer: while final_offset > (helpers::METADATA_SPACE as u32) {
             let mut prev_phys_offset = current_header.prev_phys.load(Ordering::Acquire);
 
             if prev_phys_offset == 0 || prev_phys_offset % 16 != 0 {
@@ -465,17 +464,12 @@ impl AtomicMatrix {
                     prev_phys_offset = current_header.prev_phys.load(Ordering::Acquire);
                     tries += 1;
 
-                    if tries >= 1 {
-                        break;
+                    if tries >= 2 {
+                        break 'outer;
                     }
                 } else {
-                    tries = 0;
                     break;
                 }
-            }
-
-            if tries >= 1 {
-                break;
             }
 
             if prev_header
@@ -498,9 +492,7 @@ impl AtomicMatrix {
                     break;
                 }
 
-                total_size = total_size
-                    .checked_add(size_to_add)
-                    .expect("TidalRippleCoalescingError");
+                total_size += size_to_add;
                 final_offset = prev_phys_offset;
                 current_header = prev_header;
             } else {
@@ -653,9 +645,9 @@ impl AtomicMatrix {
 
             let signature =
                 unsafe { std::ptr::read_unaligned(base_ptr.add(off as usize) as *const u32) };
-            if off % 16 != 0 || signature != helpers::HEADER_SIGNATURE {
+            if signature != helpers::HEADER_SIGNATURE {
                 head.store(0, Ordering::Release);
-                return Err(MatrixErrors::MisalignedHeader);
+                return Err(MatrixErrors::StaleBitmapEntry);
             }
 
             let next = unsafe {
