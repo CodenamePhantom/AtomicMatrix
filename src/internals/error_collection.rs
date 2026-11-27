@@ -31,6 +31,7 @@ better_error! {
         OutOfBounds => "The requested offset lies out of the AtomicMatrix bounds",
         InvalidBlock => "The block requested is in an invalid state, or doesn't exist",
         MisalignedHeader => "The offset provided is not aligned within header constraints",
+        StaleBitmapEntry => "The bitmap entry acquired from the matrix is stale"
     }
 }
 
